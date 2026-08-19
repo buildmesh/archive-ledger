@@ -196,13 +196,15 @@ The following extensions apply to `archive-ledger`:
 
 - No optional application guide is activated. A CLI being usable by AI agents does not by itself
   make this an agent-native application.
-- The current event-stream and schema specifications are
-  [docs/specs/2026-07-06-event-stream.md](docs/specs/2026-07-06-event-stream.md),
-  [docs/specs/2026-07-06-schema-design-decisions.md](docs/specs/2026-07-06-schema-design-decisions.md),
-  and [docs/specs/2026-07-06-schema.md](docs/specs/2026-07-06-schema.md). Read them when work touches
-  canonical events, projections, persistence, archive identity, or storage safety.
-- Documents under `docs/plans/` are historical unless the user explicitly activates one. Do not
-  treat their checklists, required skills, or per-task commit instructions as the current workflow.
+- The current product, event-stream, schema, and implementation specifications are
+  [docs/specs/2026-08-19-product.md](docs/specs/2026-08-19-product.md),
+  [docs/specs/2026-08-19-event-stream.md](docs/specs/2026-08-19-event-stream.md),
+  [docs/specs/2026-08-19-schema.md](docs/specs/2026-08-19-schema.md), and
+  [docs/plans/2026-08-19-mvp-implementation.md](docs/plans/2026-08-19-mvp-implementation.md).
+  Read the relevant documents when work touches user workflows, canonical events, projections,
+  persistence, archive identity, integrity, risk evaluation, or storage safety.
+- Documents under `docs/plans/` are historical unless they are explicitly named as current above
+  or the user activates one. Do not infer workflow requirements from any other historical plan.
 
 <!-- END PROJECT-SPECIFIC -->
 
