@@ -17,6 +17,10 @@ fn complete_scan_and_atomic_missing_activation_scale_gate() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(500_000);
     let temp = TempDir::new().unwrap();
+    let canonical_temp = std::env::var_os("ARCHIVE_LEDGER_SCAN_CANONICAL_PARENT")
+        .map(TempDir::new_in)
+        .transpose()
+        .unwrap();
     let fixture = temp.path().join("fixture");
     fs::create_dir(&fixture).unwrap();
     let files_per_directory = 1_000;
@@ -34,7 +38,10 @@ fn complete_scan_and_atomic_missing_activation_scale_gate() {
     let fixture_elapsed = fixture_started.elapsed();
 
     let store = EventStore::open_or_create(
-        temp.path().join("canonical"),
+        canonical_temp.as_ref().map_or_else(
+            || temp.path().join("canonical"),
+            |temp| temp.path().to_owned(),
+        ),
         EventStoreConfig {
             rollover_events: 100_000,
             ..EventStoreConfig::default()

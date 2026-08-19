@@ -234,6 +234,9 @@ CREATE TABLE path_observations (
     modified_time_utc_ms INTEGER,
     PRIMARY KEY (file_ref_id, location_id, observed_path_encoding, observed_path_bytes)
 );
+CREATE INDEX path_observations_location_path ON path_observations(
+    location_id, observed_path_encoding, observed_path_bytes, file_ref_id
+);
 
 CREATE TABLE copy_claims (
     copy_claim_id TEXT PRIMARY KEY,
@@ -337,8 +340,12 @@ CREATE TABLE scan_missing_candidates (
 CREATE INDEX scan_candidates_scan_seq ON scan_missing_candidates(scan_id, candidate_event_seq);
 CREATE INDEX scan_candidates_file_ref ON scan_missing_candidates(file_ref_id) WHERE file_ref_id IS NOT NULL;
 CREATE INDEX scan_candidates_copy_claim ON scan_missing_candidates(copy_claim_id) WHERE copy_claim_id IS NOT NULL;
-CREATE INDEX scan_candidates_scan_file ON scan_missing_candidates(scan_id, candidate_kind, file_ref_id) WHERE file_ref_id IS NOT NULL;
-CREATE INDEX scan_candidates_scan_copy ON scan_missing_candidates(scan_id, candidate_kind, copy_claim_id) WHERE copy_claim_id IS NOT NULL;
+CREATE INDEX scan_candidates_scan_file ON scan_missing_candidates(
+    scan_id, candidate_kind, file_ref_id, candidate_event_seq
+) WHERE file_ref_id IS NOT NULL;
+CREATE INDEX scan_candidates_scan_copy ON scan_missing_candidates(
+    scan_id, candidate_kind, copy_claim_id, candidate_event_seq
+) WHERE copy_claim_id IS NOT NULL;
 
 CREATE TABLE risk_domains (
     risk_domain_id TEXT PRIMARY KEY,
@@ -396,6 +403,9 @@ CREATE INDEX job_items_file_ref ON job_items(file_ref_id) WHERE file_ref_id IS N
 CREATE INDEX job_items_copy_claim ON job_items(copy_claim_id) WHERE copy_claim_id IS NOT NULL;
 CREATE INDEX job_items_location ON job_items(location_id) WHERE location_id IS NOT NULL;
 CREATE INDEX job_items_scan_path ON job_items(job_id, item_type, path_encoding, path_bytes) WHERE item_type = 'scan_seen';
+CREATE INDEX job_items_scan_missing_path ON job_items(
+    job_id, path_encoding, path_bytes, item_type, item_key
+) WHERE item_type IN ('scan_missing_path', 'scan_missing_copy');
 
 CREATE TABLE operation_outcomes (
     operation_key TEXT PRIMARY KEY,

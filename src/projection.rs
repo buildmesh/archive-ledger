@@ -754,65 +754,125 @@ impl ProjectionDb {
                 "missing-target batch limit must be greater than zero".to_owned(),
             ));
         }
-        let connection = self.open_connection()?;
+        let mut connection = self.open_connection()?;
+        if after.is_none() {
+            let transaction = connection
+                .transaction()
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            transaction
+                .execute(
+                    "DELETE FROM job_items
+                     WHERE job_id = ?1
+                       AND item_type IN ('scan_missing_path', 'scan_missing_copy')",
+                    [job_id],
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            transaction
+                .execute(
+                    "INSERT INTO job_items(
+                        job_item_id, job_id, item_type, item_key, file_ref_id,
+                        path_bytes, path_encoding, path_display, status, updated_time_utc_ms
+                     )
+                     SELECT 'scan-missing-path:' || ?2 || ':' || p.file_ref_id,
+                            ?2, 'scan_missing_path', p.file_ref_id, p.file_ref_id,
+                            p.observed_path_bytes, p.observed_path_encoding,
+                            p.observed_path_display, 'pending',
+                            (SELECT started_time_utc_ms FROM scan_runs WHERE scan_id = ?1)
+                     FROM path_observations p
+                     JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                     WHERE f.collection_id = ?3 AND f.path_state = 'active'
+                       AND p.location_id = ?4 AND p.state = 'present'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM job_items seen
+                           WHERE seen.job_id = ?2 AND seen.item_type = 'scan_seen'
+                             AND seen.path_encoding = p.observed_path_encoding
+                             AND seen.path_bytes = p.observed_path_bytes
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_missing_candidates candidate
+                           WHERE candidate.scan_id = ?1
+                             AND candidate.candidate_kind = 'path'
+                             AND candidate.file_ref_id = p.file_ref_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM json_each(?5) x
+                           WHERE upper(hex(p.observed_path_bytes)) = json_extract(x.value, '$.hex')
+                              OR upper(hex(p.observed_path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+                       )",
+                    params![scan_id, job_id, collection_id, location_id, exclusions_json],
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            // Keep copy_claims as the outer loop. With a regular JOIN, SQLite
+            // may scan every location path against every copy before applying
+            // the path equality, which becomes quadratic on large locations.
+            transaction
+                .execute(
+                    "INSERT INTO job_items(
+                        job_item_id, job_id, item_type, item_key, copy_claim_id,
+                        path_bytes, path_encoding, path_display, status, updated_time_utc_ms
+                     )
+                     SELECT DISTINCT 'scan-missing-copy:' || ?2 || ':' || c.copy_claim_id,
+                            ?2, 'scan_missing_copy', c.copy_claim_id, c.copy_claim_id,
+                            c.relative_path_bytes, c.relative_path_encoding,
+                            c.relative_path_display, 'pending',
+                            (SELECT started_time_utc_ms FROM scan_runs WHERE scan_id = ?1)
+                     FROM copy_claims c
+                     CROSS JOIN path_observations p
+                       ON p.location_id = c.location_id
+                      AND p.observed_path_encoding = c.relative_path_encoding
+                      AND p.observed_path_bytes = c.relative_path_bytes
+                     JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                     WHERE f.collection_id = ?3 AND f.path_state = 'active'
+                       AND c.location_id = ?4 AND c.state IN ('present', 'corrupt', 'unknown')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM job_items seen
+                           WHERE seen.job_id = ?2 AND seen.item_type = 'scan_seen'
+                             AND seen.path_encoding = c.relative_path_encoding
+                             AND seen.path_bytes = c.relative_path_bytes
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_missing_candidates candidate
+                           WHERE candidate.scan_id = ?1
+                             AND candidate.candidate_kind = 'copy'
+                             AND candidate.copy_claim_id = c.copy_claim_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM json_each(?5) x
+                           WHERE upper(hex(c.relative_path_bytes)) = json_extract(x.value, '$.hex')
+                              OR upper(hex(c.relative_path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+                       )",
+                    params![scan_id, job_id, collection_id, location_id, exclusions_json],
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&self.path, source))?;
+        }
         let mut statement = connection
             .prepare(
-                "WITH targets(kind, target_id, file_ref_id, copy_claim_id, path_encoding, path_bytes, path_display) AS (
-                    SELECT 'path', p.file_ref_id, p.file_ref_id, NULL,
-                           p.observed_path_encoding, p.observed_path_bytes, p.observed_path_display
-                    FROM path_observations p
-                    JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-                    WHERE f.collection_id = ?3 AND f.path_state = 'active'
-                      AND p.location_id = ?4 AND p.state = 'present'
-                    UNION ALL
-                    SELECT DISTINCT 'copy', c.copy_claim_id, NULL, c.copy_claim_id,
-                           c.relative_path_encoding, c.relative_path_bytes, c.relative_path_display
-                    FROM copy_claims c
-                    JOIN path_observations p
-                      ON p.location_id = c.location_id
-                     AND p.observed_path_encoding = c.relative_path_encoding
-                     AND p.observed_path_bytes = c.relative_path_bytes
-                    JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-                    WHERE f.collection_id = ?3 AND f.path_state = 'active'
-                      AND c.location_id = ?4 AND c.state IN ('present', 'corrupt', 'unknown')
-                 )
-                 SELECT kind, target_id, file_ref_id, copy_claim_id,
+                "SELECT CASE item_type
+                            WHEN 'scan_missing_path' THEN 'path' ELSE 'copy' END AS kind,
+                        item_key, file_ref_id, copy_claim_id,
                         path_encoding, path_bytes, path_display
-                 FROM targets t
-                 WHERE NOT EXISTS (
-                    SELECT 1 FROM job_items j
-                    WHERE j.job_id = ?2 AND j.item_type = 'scan_seen'
-                      AND j.path_encoding = t.path_encoding AND j.path_bytes = t.path_bytes
-                 )
-                   AND NOT EXISTS (
-                    SELECT 1 FROM scan_missing_candidates c
-                    WHERE c.scan_id = ?1 AND c.candidate_kind = t.kind
-                      AND ((t.kind = 'path' AND c.file_ref_id = t.target_id)
-                        OR (t.kind = 'copy' AND c.copy_claim_id = t.target_id))
-                 )
-                   AND NOT EXISTS (
-                    SELECT 1 FROM json_each(?5) x
-                    WHERE upper(hex(t.path_bytes)) = json_extract(x.value, '$.hex')
-                       OR upper(hex(t.path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
-                 )
-                   AND (?6 IS NULL
-                     OR t.path_encoding > ?6
-                     OR (t.path_encoding = ?6 AND t.path_bytes > ?7)
-                     OR (t.path_encoding = ?6 AND t.path_bytes = ?7 AND t.kind > ?8)
-                     OR (t.path_encoding = ?6 AND t.path_bytes = ?7 AND t.kind = ?8
-                         AND t.target_id > ?9))
-                 ORDER BY path_encoding, path_bytes, kind, target_id
-                 LIMIT ?10",
+                 FROM job_items
+                 WHERE job_id = ?1
+                   AND item_type IN ('scan_missing_path', 'scan_missing_copy')
+                   AND (?2 IS NULL
+                     OR path_encoding > ?2
+                     OR (path_encoding = ?2 AND path_bytes > ?3)
+                     OR (path_encoding = ?2 AND path_bytes = ?3
+                         AND item_type > 'scan_missing_' || ?4)
+                     OR (path_encoding = ?2 AND path_bytes = ?3
+                         AND item_type = 'scan_missing_' || ?4
+                         AND item_key > ?5))
+                 ORDER BY path_encoding, path_bytes, item_type, item_key
+                 LIMIT ?6",
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
         let rows = statement
             .query_map(
                 params![
-                    scan_id,
                     job_id,
-                    collection_id,
-                    location_id,
-                    exclusions_json,
                     after.map(|cursor| cursor.path_encoding.as_str()),
                     after.map(|cursor| cursor.path_bytes.as_slice()),
                     after.map(|cursor| cursor.kind.as_str()),

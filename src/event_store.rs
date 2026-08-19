@@ -132,7 +132,8 @@ impl EventStoreConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventReferences {
     pub job_id: Option<String>,
     pub object_id: Option<String>,
@@ -143,7 +144,8 @@ pub struct EventReferences {
     pub site_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventRequest {
     pub event_type: String,
     pub payload: Value,

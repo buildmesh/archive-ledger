@@ -1,14 +1,18 @@
 //! Bounded, read-only filesystem scans with fail-closed coverage semantics.
 
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::discovery::{
     encode_relative_path, modified_time_ms, DiscoveredFile, DiscoveryError, DiscoveryItem,
@@ -193,6 +197,128 @@ pub struct LocationScanner<'a> {
     exclusions_hash: String,
 }
 
+struct ScanEventSpool {
+    path: PathBuf,
+    writer: Option<BufWriter<File>>,
+    batches: u64,
+}
+
+impl ScanEventSpool {
+    fn create(database_path: &Path) -> Result<Self> {
+        let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+        let path = parent.join(format!(
+            ".archive-ledger-scan-{}.jsonl.tmp",
+            Ulid::new().to_string().to_ascii_lowercase()
+        ));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&path)
+            .map_err(|source| io_error("create scan event spool", &path, source))?;
+        Ok(Self {
+            path,
+            writer: Some(BufWriter::new(file)),
+            batches: 0,
+        })
+    }
+
+    fn write_batch(&mut self, events: &[EventRequest]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            ScanError::InvalidConfig("scan event spool is already finalized".to_owned())
+        })?;
+        serde_json::to_writer(&mut *writer, events).map_err(|error| {
+            ScanError::InvalidConfig(format!("serialize scan event spool: {error}"))
+        })?;
+        writer
+            .write_all(b"\n")
+            .map_err(|source| io_error("write scan event spool", &self.path, source))?;
+        self.batches += 1;
+        Ok(())
+    }
+
+    fn publish(&mut self, store: &EventStore) -> Result<()> {
+        let Some(mut writer) = self.writer.take() else {
+            return Err(ScanError::InvalidConfig(
+                "scan event spool was already published".to_owned(),
+            ));
+        };
+        writer
+            .flush()
+            .map_err(|source| io_error("flush scan event spool", &self.path, source))?;
+        drop(writer);
+        if self.batches == 0 {
+            return Ok(());
+        }
+
+        self.validate()?;
+        let reader = File::open(&self.path)
+            .map(BufReader::new)
+            .map_err(|source| io_error("open scan event spool", &self.path, source))?;
+        let mut lines = reader.lines();
+        let mut spool_error = None;
+        let batches = std::iter::from_fn(|| match lines.next() {
+            Some(Ok(line)) => match serde_json::from_str::<Vec<EventRequest>>(&line) {
+                Ok(events) => Some(events),
+                Err(error) => {
+                    spool_error = Some(ScanError::InvalidConfig(format!(
+                        "parse scan event spool: {error}"
+                    )));
+                    None
+                }
+            },
+            Some(Err(source)) => {
+                spool_error = Some(io_error("read scan event spool", &self.path, source));
+                None
+            }
+            None => None,
+        });
+        store.append_batches(batches)?;
+        if let Some(error) = spool_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        let reader = File::open(&self.path)
+            .map(BufReader::new)
+            .map_err(|source| io_error("open scan event spool", &self.path, source))?;
+        let mut batches = 0_u64;
+        for line in reader.lines() {
+            let line =
+                line.map_err(|source| io_error("read scan event spool", &self.path, source))?;
+            let events = serde_json::from_str::<Vec<EventRequest>>(&line).map_err(|error| {
+                ScanError::InvalidConfig(format!("parse scan event spool: {error}"))
+            })?;
+            if events.is_empty() {
+                return Err(ScanError::InvalidConfig(
+                    "scan event spool contains an empty batch".to_owned(),
+                ));
+            }
+            batches += 1;
+        }
+        if batches != self.batches {
+            return Err(ScanError::InvalidConfig(format!(
+                "scan event spool contains {batches} batches, expected {}",
+                self.batches
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ScanEventSpool {
+    fn drop(&mut self) {
+        drop(self.writer.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl<'a> LocationScanner<'a> {
     pub fn new(
         store: &'a EventStore,
@@ -373,6 +499,7 @@ impl<'a> LocationScanner<'a> {
                 });
             }
         };
+        let mut spool = ScanEventSpool::create(self.projection.path())?;
         let mut session = self.projection.open_scan_session()?;
         let mut summary = ScanSummary::default();
         let mut pending_events = Vec::new();
@@ -384,7 +511,15 @@ impl<'a> LocationScanner<'a> {
             match item {
                 DiscoveryItem::File(file) => {
                     if limit.is_some_and(|limit| processed_files >= limit) {
-                        self.flush(&mut session, &mut pending_events, &mut pending_seen)?;
+                        self.flush_to_spool(
+                            &mut spool,
+                            &mut session,
+                            &mut pending_events,
+                            &mut pending_seen,
+                        )?;
+                        drop(session);
+                        spool.publish(self.store)?;
+                        self.projection.apply(self.store)?;
                         return Ok(ScanResult {
                             status: ScanStatus::Interrupted,
                             summary,
@@ -458,12 +593,24 @@ impl<'a> LocationScanner<'a> {
                 }
             }
             if pending_seen.len() >= self.config.batch_entries {
-                self.flush(&mut session, &mut pending_events, &mut pending_seen)?;
+                self.flush_to_spool(
+                    &mut spool,
+                    &mut session,
+                    &mut pending_events,
+                    &mut pending_seen,
+                )?;
             }
         }
         let first_namespace = discovery.namespace_fingerprint();
-        self.flush(&mut session, &mut pending_events, &mut pending_seen)?;
+        self.flush_to_spool(
+            &mut spool,
+            &mut session,
+            &mut pending_events,
+            &mut pending_seen,
+        )?;
         drop(session);
+        spool.publish(self.store)?;
+        self.projection.apply(self.store)?;
 
         let (new_paths, changed_paths) =
             self.projection.scan_change_counts(&self.config.scan_id)?;
@@ -601,15 +748,16 @@ impl<'a> LocationScanner<'a> {
         Ok(coverage_partial)
     }
 
-    fn flush(
+    fn flush_to_spool(
         &self,
+        spool: &mut ScanEventSpool,
         session: &mut ScanProjectionSession,
         events: &mut Vec<EventRequest>,
         seen: &mut Vec<ScanSeenPath>,
     ) -> Result<()> {
         if !events.is_empty() {
-            self.store.append_batch(std::mem::take(events))?;
-            self.projection.apply(self.store)?;
+            let events = std::mem::take(events);
+            spool.write_batch(&events)?;
         }
         session.mark_seen(&self.config.job_id, seen, now_utc_ms()?)?;
         seen.clear();
