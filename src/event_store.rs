@@ -248,6 +248,45 @@ pub struct VerificationReport {
     pub checkpoints: Vec<Checkpoint>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EventCursor {
+    pub applied_seq: u64,
+    pub applied_event_hash: Option<String>,
+    pub segment_first_seq: Option<u64>,
+    pub next_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionedEvent {
+    pub record: EventRecord,
+    pub segment_first_seq: u64,
+    pub next_offset: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventReadStats {
+    pub segments_opened: u64,
+    pub lines_read: u64,
+    pub events_returned: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventBatch {
+    pub events: Vec<PositionedEvent>,
+    pub next_cursor: EventCursor,
+    pub eof: bool,
+    pub stats: EventReadStats,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppendStats {
+    pub batches: u64,
+    pub events_appended: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct Layout {
     root: PathBuf,
@@ -346,12 +385,17 @@ impl EventStore {
         sync_directory(&layout.manifest_dir)?;
         sync_directory(&layout.checkpoint_dir)?;
 
-        Ok(Self {
+        let store = Self {
             layout,
             config,
             #[cfg(test)]
             fault: std::sync::Mutex::new(None),
-        })
+        };
+        store.with_writer_lock(|| {
+            let _ = store.complete_pending_checkpoint_locked()?;
+            Ok(())
+        })?;
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -366,24 +410,83 @@ impl EventStore {
     }
 
     pub fn append_batch(&self, requests: Vec<EventRequest>) -> Result<Vec<EventRecord>> {
-        if requests.is_empty() {
-            return Err(EventStoreError::InvalidInput(
-                "an append batch must contain at least one event".to_owned(),
-            ));
-        }
-        if requests
-            .iter()
-            .any(|request| request.event_type == "checkpoint_created")
-        {
-            return Err(EventStoreError::InvalidInput(
-                "checkpoint_created may only be emitted by create_checkpoint".to_owned(),
-            ));
-        }
+        validate_public_batch(&requests)?;
 
         self.with_writer_lock(|| {
             let _ = self.complete_pending_checkpoint_locked()?;
             self.append_batch_locked(requests, false)
         })
+    }
+
+    pub fn append_batches<I>(&self, batches: I) -> Result<AppendStats>
+    where
+        I: IntoIterator<Item = Vec<EventRequest>>,
+    {
+        self.with_writer_lock(|| {
+            let _ = self.complete_pending_checkpoint_locked()?;
+            let mut state = self.inspect_writer_state(true)?;
+            if state
+                .open
+                .as_ref()
+                .is_some_and(|open| open.event_count >= self.config.rollover_events)
+            {
+                self.close_open_segment(&mut state)?;
+            }
+            let mut stats = AppendStats::default();
+            for requests in batches {
+                validate_public_batch(&requests)?;
+                let records = self.append_batch_to_state(&mut state, requests, false)?;
+                if let Some(first) = records.first() {
+                    stats.first_seq.get_or_insert(first.envelope.seq);
+                }
+                if let Some(last) = records.last() {
+                    stats.last_seq = Some(last.envelope.seq);
+                }
+                stats.batches += 1;
+                stats.events_appended += u64::try_from(records.len()).map_err(|_| {
+                    EventStoreError::InvalidLayout("append count exceeds u64".to_owned())
+                })?;
+            }
+            if stats.batches == 0 {
+                return Err(EventStoreError::InvalidInput(
+                    "append_batches requires at least one batch".to_owned(),
+                ));
+            }
+            Ok(stats)
+        })
+    }
+
+    pub fn read_batch(
+        &self,
+        cursor: &EventCursor,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<EventBatch> {
+        if max_events == 0 || max_bytes == 0 {
+            return Err(EventStoreError::InvalidInput(
+                "event and byte batch limits must be greater than zero".to_owned(),
+            ));
+        }
+        if cursor.applied_seq == 0 {
+            if cursor.applied_event_hash.is_some()
+                || cursor.segment_first_seq.is_some()
+                || cursor.next_offset != 0
+            {
+                return Err(EventStoreError::InvalidInput(
+                    "an empty cursor cannot contain a hash or segment position".to_owned(),
+                ));
+            }
+        } else if cursor
+            .applied_event_hash
+            .as_deref()
+            .is_none_or(|hash| !is_blake3_identifier(hash))
+        {
+            return Err(EventStoreError::InvalidInput(
+                "a non-empty cursor requires a valid applied event hash".to_owned(),
+            ));
+        }
+
+        self.with_reader_lock(|| self.read_batch_locked(cursor, max_events, max_bytes))
     }
 
     pub fn create_checkpoint(&self) -> Result<Checkpoint> {
@@ -417,6 +520,28 @@ impl EventStore {
         }
     }
 
+    fn with_reader_lock<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.layout.lock_path)
+            .map_err(|source| io_error("open reader lock", &self.layout.lock_path, source))?;
+        FileExt::lock_shared(&lock_file)
+            .map_err(|source| io_error("acquire reader lock", &self.layout.lock_path, source))?;
+
+        let result = action();
+        let unlock_result = FileExt::unlock(&lock_file)
+            .map_err(|source| io_error("release reader lock", &self.layout.lock_path, source));
+
+        match (result, unlock_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
     #[cfg(test)]
     fn inject_once(&self, point: FaultPoint) {
         *self.fault.lock().expect("fault mutex poisoned") = Some(point);
@@ -440,6 +565,23 @@ impl EventStore {
 
 fn create_dir_all(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|source| io_error("create directory", path, source))
+}
+
+fn validate_public_batch(requests: &[EventRequest]) -> Result<()> {
+    if requests.is_empty() {
+        return Err(EventStoreError::InvalidInput(
+            "an append batch must contain at least one event".to_owned(),
+        ));
+    }
+    if requests
+        .iter()
+        .any(|request| request.event_type == "checkpoint_created")
+    {
+        return Err(EventStoreError::InvalidInput(
+            "checkpoint_created may only be emitted by create_checkpoint".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn segment_filename(first_seq: u64) -> String {
@@ -776,7 +918,286 @@ struct WriterState {
     previous_event_hash: Option<String>,
 }
 
+#[derive(Debug)]
+struct StreamSegment {
+    first_seq: u64,
+    path: PathBuf,
+    manifest: Option<SegmentManifest>,
+}
+
 impl EventStore {
+    fn stream_segments(&self) -> Result<Vec<StreamSegment>> {
+        let segments = list_canonical_files(
+            &self.layout.event_dir,
+            parse_segment_filename,
+            "event segment",
+        )?;
+        let manifest_paths = list_canonical_files(
+            &self.layout.manifest_dir,
+            parse_manifest_filename,
+            "segment manifest",
+        )?;
+        for first_seq in manifest_paths.keys() {
+            if !segments.contains_key(first_seq) {
+                return Err(EventStoreError::InvalidLayout(format!(
+                    "manifest for sequence {first_seq} has no segment"
+                )));
+            }
+        }
+
+        let mut result = Vec::with_capacity(segments.len());
+        let mut expected_first_seq = 1_u64;
+        let segment_count = segments.len();
+        for (index, (first_seq, segment_path)) in segments.into_iter().enumerate() {
+            if first_seq != expected_first_seq {
+                return Err(EventStoreError::InvalidLayout(format!(
+                    "expected segment starting at {expected_first_seq}, found {first_seq}"
+                )));
+            }
+            let manifest = if let Some(manifest_path) = manifest_paths.get(&first_seq) {
+                let manifest: SegmentManifest = read_json(manifest_path, "manifest")?;
+                self.validate_manifest_shape(&manifest, manifest_path, &segment_path, first_seq)?;
+                expected_first_seq = manifest.last_seq.checked_add(1).ok_or_else(|| {
+                    EventStoreError::InvalidLayout("event sequence overflow".to_owned())
+                })?;
+                Some(manifest)
+            } else {
+                if index + 1 != segment_count {
+                    return Err(EventStoreError::InvalidLayout(format!(
+                        "non-tail segment {first_seq} lacks a manifest"
+                    )));
+                }
+                None
+            };
+            result.push(StreamSegment {
+                first_seq,
+                path: segment_path,
+                manifest,
+            });
+        }
+        Ok(result)
+    }
+
+    fn read_batch_locked(
+        &self,
+        cursor: &EventCursor,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<EventBatch> {
+        let segments = self.stream_segments()?;
+        let target_seq = cursor
+            .applied_seq
+            .checked_add(1)
+            .ok_or_else(|| EventStoreError::InvalidLayout("event sequence overflow".to_owned()))?;
+        let mut first_index = segments.len();
+        for (index, segment) in segments.iter().enumerate() {
+            let can_contain_target = segment
+                .manifest
+                .as_ref()
+                .map_or(target_seq >= segment.first_seq, |manifest| {
+                    target_seq >= segment.first_seq && target_seq <= manifest.last_seq
+                });
+            if can_contain_target {
+                first_index = index;
+                break;
+            }
+            if segment
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| target_seq == manifest.last_seq.saturating_add(1))
+                && index + 1 == segments.len()
+            {
+                first_index = segments.len();
+            }
+        }
+
+        let mut batch = EventBatch {
+            events: Vec::with_capacity(max_events.min(1024)),
+            next_cursor: cursor.clone(),
+            eof: true,
+            stats: EventReadStats::default(),
+        };
+        if cursor.applied_seq > 0 && first_index > 0 {
+            let previous_segment = &segments[first_index - 1];
+            if let Some(manifest) = &previous_segment.manifest {
+                if manifest.last_seq == cursor.applied_seq
+                    && cursor.applied_event_hash.as_deref()
+                        != Some(manifest.last_event_hash.as_str())
+                {
+                    return Err(EventStoreError::HashChain {
+                        path: previous_segment.path.clone(),
+                        line: manifest.event_count,
+                        message: "stream cursor hash does not match preceding manifest".to_owned(),
+                    });
+                }
+            }
+        }
+        let mut returned_bytes = 0_usize;
+        let mut previous_manifest_hash: Option<&str> = if first_index == 0 {
+            None
+        } else {
+            segments[first_index - 1]
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.last_event_hash.as_str())
+        };
+
+        for segment in segments.iter().skip(first_index) {
+            let use_cursor_offset = cursor.segment_first_seq == Some(segment.first_seq)
+                && cursor.next_offset > 0
+                && target_seq > segment.first_seq;
+            let start_offset = if use_cursor_offset {
+                cursor.next_offset
+            } else {
+                0
+            };
+            let mut expected_seq = if use_cursor_offset {
+                target_seq
+            } else {
+                segment.first_seq
+            };
+            let mut previous_hash = if use_cursor_offset {
+                cursor.applied_event_hash.clone()
+            } else {
+                previous_manifest_hash.map(ToOwned::to_owned)
+            };
+
+            let mut file = File::open(&segment.path)
+                .map_err(|source| io_error("open segment for streaming", &segment.path, source))?;
+            if start_offset > 0 {
+                let length = file
+                    .metadata()
+                    .map_err(|source| io_error("read segment metadata", &segment.path, source))?
+                    .len();
+                if start_offset > length {
+                    return Err(EventStoreError::InvalidLayout(format!(
+                        "stream cursor offset {start_offset} exceeds {} bytes in {}",
+                        length,
+                        segment.path.display()
+                    )));
+                }
+                file.seek(SeekFrom::Start(start_offset - 1))
+                    .map_err(|source| {
+                        io_error("seek before stream cursor", &segment.path, source)
+                    })?;
+                let mut preceding = [0_u8; 1];
+                file.read_exact(&mut preceding).map_err(|source| {
+                    io_error("read before stream cursor", &segment.path, source)
+                })?;
+                if preceding[0] != b'\n' {
+                    return Err(EventStoreError::InvalidLayout(format!(
+                        "stream cursor does not point to an event boundary in {}",
+                        segment.path.display()
+                    )));
+                }
+            }
+            file.seek(SeekFrom::Start(start_offset))
+                .map_err(|source| io_error("seek stream cursor", &segment.path, source))?;
+            let mut reader = BufReader::new(file);
+            let mut raw_line = Vec::new();
+            let mut offset = start_offset;
+            batch.stats.segments_opened += 1;
+
+            loop {
+                raw_line.clear();
+                let bytes_read = reader
+                    .read_until(b'\n', &mut raw_line)
+                    .map_err(|source| io_error("stream segment", &segment.path, source))?;
+                if bytes_read == 0 {
+                    break;
+                }
+                batch.stats.lines_read += 1;
+                if !raw_line.ends_with(b"\n") {
+                    return Err(EventStoreError::InvalidEvent {
+                        path: segment.path.clone(),
+                        line: expected_seq.saturating_sub(segment.first_seq) + 1,
+                        message: "event line is not newline terminated".to_owned(),
+                    });
+                }
+                let line = &raw_line[..raw_line.len() - 1];
+                if line.len() > self.config.max_event_bytes {
+                    return Err(EventStoreError::InvalidEvent {
+                        path: segment.path.clone(),
+                        line: expected_seq.saturating_sub(segment.first_seq) + 1,
+                        message: format!("event exceeds {} bytes", self.config.max_event_bytes),
+                    });
+                }
+                let line_number = expected_seq.saturating_sub(segment.first_seq) + 1;
+                let envelope = parse_event_line(&segment.path, line_number, line)?;
+                validate_event(
+                    &segment.path,
+                    line_number,
+                    &envelope,
+                    expected_seq,
+                    previous_hash.as_deref(),
+                )?;
+                let hash = event_hash(line);
+                let next_offset = offset
+                    .checked_add(u64::try_from(bytes_read).map_err(|_| {
+                        EventStoreError::InvalidLayout("stream offset exceeds u64".to_owned())
+                    })?)
+                    .ok_or_else(|| {
+                        EventStoreError::InvalidLayout("stream offset overflow".to_owned())
+                    })?;
+
+                if envelope.seq == cursor.applied_seq
+                    && cursor.applied_event_hash.as_deref() != Some(hash.as_str())
+                {
+                    return Err(EventStoreError::HashChain {
+                        path: segment.path.clone(),
+                        line: line_number,
+                        message: "stream cursor hash does not match canonical event".to_owned(),
+                    });
+                }
+                if envelope.seq > cursor.applied_seq {
+                    if !batch.events.is_empty()
+                        && returned_bytes.saturating_add(raw_line.len()) > max_bytes
+                    {
+                        batch.eof = false;
+                        return Ok(batch);
+                    }
+                    returned_bytes = returned_bytes.saturating_add(raw_line.len());
+                    batch.next_cursor = EventCursor {
+                        applied_seq: envelope.seq,
+                        applied_event_hash: Some(hash.clone()),
+                        segment_first_seq: Some(segment.first_seq),
+                        next_offset,
+                    };
+                    batch.events.push(PositionedEvent {
+                        record: EventRecord {
+                            envelope,
+                            event_hash: hash.clone(),
+                        },
+                        segment_first_seq: segment.first_seq,
+                        next_offset,
+                    });
+                    batch.stats.events_returned += 1;
+                    if batch.events.len() == max_events {
+                        batch.eof = false;
+                        return Ok(batch);
+                    }
+                }
+
+                offset = next_offset;
+                previous_hash = Some(hash);
+                expected_seq = expected_seq.checked_add(1).ok_or_else(|| {
+                    EventStoreError::InvalidLayout("event sequence overflow".to_owned())
+                })?;
+            }
+
+            if let Some(manifest) = &segment.manifest {
+                if expected_seq != manifest.last_seq.saturating_add(1) {
+                    return Err(EventStoreError::InvalidManifest {
+                        path: self.layout.manifest_path(segment.first_seq),
+                        message: "streamed event count does not match manifest range".to_owned(),
+                    });
+                }
+                previous_manifest_hash = Some(manifest.last_event_hash.as_str());
+            }
+        }
+        Ok(batch)
+    }
+
     fn inspect_writer_state(&self, recover_tail: bool) -> Result<WriterState> {
         let segments = list_canonical_files(
             &self.layout.event_dir,
@@ -1047,10 +1468,6 @@ impl EventStore {
         requests: Vec<EventRequest>,
         force_close_after: bool,
     ) -> Result<Vec<EventRecord>> {
-        for request in &requests {
-            self.validate_request(request)?;
-        }
-
         let mut state = self.inspect_writer_state(true)?;
         if state
             .open
@@ -1059,7 +1476,18 @@ impl EventStore {
         {
             self.close_open_segment(&mut state)?;
         }
+        self.append_batch_to_state(&mut state, requests, force_close_after)
+    }
 
+    fn append_batch_to_state(
+        &self,
+        state: &mut WriterState,
+        requests: Vec<EventRequest>,
+        force_close_after: bool,
+    ) -> Result<Vec<EventRecord>> {
+        for request in &requests {
+            self.validate_request(request)?;
+        }
         let mut prepared = Vec::with_capacity(requests.len());
         let mut prepared_seq = state.next_seq;
         let mut prepared_previous_hash = state.previous_event_hash.clone();
@@ -1138,15 +1566,15 @@ impl EventStore {
             });
 
             if open.event_count == self.config.rollover_events {
-                self.close_open_segment(&mut state)?;
+                self.close_open_segment(state)?;
             }
         }
 
         if state.open.is_some() {
             if force_close_after {
-                self.close_open_segment(&mut state)?;
+                self.close_open_segment(state)?;
             } else {
-                self.sync_open_segment(&mut state)?;
+                self.sync_open_segment(state)?;
             }
         }
         Ok(records)
@@ -1533,17 +1961,9 @@ impl EventStore {
         }
         let payload = parse_checkpoint_event(&record)?;
         let final_path = self.layout.checkpoint_path(&payload.checkpoint_id);
-        let verified = self.verify_locked(false)?;
-        let matching_record = verified
-            .checkpoint_events
-            .iter()
-            .find(|candidate| candidate.envelope.event_id == record.envelope.event_id)
-            .ok_or_else(|| EventStoreError::InvalidCheckpoint {
-                path: final_path.clone(),
-                message: "pending checkpoint event was not found during verification".to_owned(),
-            })?;
-        let checkpoint = build_checkpoint(&verified.report, matching_record)?;
         if final_path.exists() {
+            let report = report_from_closed_state(&state);
+            let checkpoint = build_checkpoint(&report, &record)?;
             let existing: Checkpoint = read_json(&final_path, "checkpoint")?;
             if existing != checkpoint {
                 return Err(EventStoreError::InvalidCheckpoint {
@@ -1554,6 +1974,17 @@ impl EventStore {
             sync_directory(&self.layout.checkpoint_dir)?;
             return Ok(None);
         }
+
+        let verified = self.verify_locked(false)?;
+        let matching_record = verified
+            .checkpoint_events
+            .iter()
+            .find(|candidate| candidate.envelope.event_id == record.envelope.event_id)
+            .ok_or_else(|| EventStoreError::InvalidCheckpoint {
+                path: final_path.clone(),
+                message: "pending checkpoint event was not found during verification".to_owned(),
+            })?;
+        let checkpoint = build_checkpoint(&verified.report, matching_record)?;
         self.publish_checkpoint(&checkpoint)?;
         Ok(Some(checkpoint))
     }
@@ -1705,6 +2136,26 @@ fn checkpoint_segments_through(
         });
     }
     Ok(result)
+}
+
+fn report_from_closed_state(state: &WriterState) -> VerificationReport {
+    VerificationReport {
+        stream_id: STREAM_ID.to_owned(),
+        last_seq: state.next_seq.saturating_sub(1),
+        last_event_hash: state.previous_event_hash.clone(),
+        segments: state
+            .closed
+            .iter()
+            .map(|manifest| VerifiedSegment {
+                segment_file: manifest.segment_file.clone(),
+                first_seq: manifest.first_seq,
+                last_seq: Some(manifest.last_seq),
+                event_count: manifest.event_count,
+                manifest: Some(manifest.clone()),
+            })
+            .collect(),
+        checkpoints: Vec::new(),
+    }
 }
 
 fn build_checkpoint(report: &VerificationReport, record: &EventRecord) -> Result<Checkpoint> {
@@ -1975,9 +2426,10 @@ mod tests {
         file.write_all(br#"{"v":1"#).unwrap();
         file.sync_all().unwrap();
 
-        let second = store.append(request(2)).unwrap();
+        let reopened = open_store(&temp, 10);
+        let second = reopened.append(request(2)).unwrap();
         assert_eq!(second.envelope.seq, 2);
-        let report = store.verify().unwrap();
+        let report = reopened.verify().unwrap();
         assert_eq!(report.last_seq, 2);
         let text = fs::read_to_string(path).unwrap();
         assert_eq!(text.lines().count(), 2);
@@ -1995,10 +2447,11 @@ mod tests {
         file.set_len(len - 1).unwrap();
         file.sync_all().unwrap();
 
-        let second = store.append(request(2)).unwrap();
+        let reopened = open_store(&temp, 10);
+        let second = reopened.append(request(2)).unwrap();
         assert_eq!(second.envelope.seq, 2);
         assert_eq!(second.envelope.previous_event_hash, Some(first.event_hash));
-        assert_eq!(store.verify().unwrap().last_seq, 2);
+        assert_eq!(reopened.verify().unwrap().last_seq, 2);
         assert!(fs::read(path).unwrap().ends_with(b"\n"));
     }
 
@@ -2013,7 +2466,7 @@ mod tests {
         value["seq"] = json!(99);
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
-        let error = store.append(request(2)).unwrap_err();
+        let error = EventStore::open_or_create(temp.path(), config(10)).unwrap_err();
         assert_eq!(error.code(), "event_hash_chain_failure");
         assert!(!fs::read(path).unwrap().ends_with(b"\n"));
     }
@@ -2281,5 +2734,86 @@ mod tests {
         sequences.sort_unstable();
         assert_eq!(sequences, (1..=100).collect::<Vec<_>>());
         assert_eq!(first.verify().unwrap().last_seq, 100);
+    }
+
+    #[test]
+    fn streaming_batches_resume_from_the_exact_file_offset() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp, 1_000);
+        append_range(&store, 0, 100);
+
+        let initial = store
+            .read_batch(&EventCursor::default(), 1_000, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(initial.events.len(), 100);
+        assert!(initial.eof);
+
+        store.append(request(100)).unwrap();
+        let tail = store
+            .read_batch(&initial.next_cursor, 10, 1024 * 1024)
+            .unwrap();
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0].record.envelope.seq, 101);
+        assert_eq!(tail.stats.segments_opened, 1);
+        assert_eq!(tail.stats.lines_read, 1);
+        assert!(tail.eof);
+    }
+
+    #[test]
+    fn multi_batch_writer_reuses_state_across_rollovers() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp, 2);
+        let stats = store
+            .append_batches([
+                vec![request(1)],
+                vec![request(2), request(3)],
+                vec![request(4), request(5)],
+            ])
+            .unwrap();
+        assert_eq!(stats.batches, 3);
+        assert_eq!(stats.events_appended, 5);
+        assert_eq!(stats.first_seq, Some(1));
+        assert_eq!(stats.last_seq, Some(5));
+        let report = store.verify().unwrap();
+        assert_eq!(report.last_seq, 5);
+        assert_eq!(report.segments.len(), 3);
+        assert!(report.segments[0].manifest.is_some());
+        assert!(report.segments[1].manifest.is_some());
+        assert!(report.segments[2].manifest.is_none());
+    }
+
+    #[test]
+    fn streaming_uses_manifests_to_skip_wholly_applied_segments() {
+        let temp = TempDir::new().unwrap();
+        let store = open_store(&temp, 2);
+        append_range(&store, 0, 6);
+
+        let prefix = store
+            .read_batch(&EventCursor::default(), 4, 1024 * 1024)
+            .unwrap();
+        assert_eq!(prefix.next_cursor.applied_seq, 4);
+        let suffix = store
+            .read_batch(&prefix.next_cursor, 10, 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            suffix
+                .events
+                .iter()
+                .map(|event| event.record.envelope.seq)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert_eq!(suffix.stats.segments_opened, 1);
+        assert_eq!(suffix.stats.lines_read, 2);
+
+        let mut damaged_cursor = prefix.next_cursor;
+        damaged_cursor.applied_event_hash = Some(format!("blake3:{}", "0".repeat(64)));
+        assert_eq!(
+            store
+                .read_batch(&damaged_cursor, 10, 1024 * 1024)
+                .unwrap_err()
+                .code(),
+            "event_hash_chain_failure"
+        );
     }
 }
