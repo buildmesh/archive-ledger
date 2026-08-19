@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
+use fs2::available_space;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::discovery::{EncodedPath, PathEncoding};
 use crate::event_store::{
     EventCursor, EventReadStats, EventRecord, EventStore, EventStoreError, PositionedEvent,
 };
@@ -67,6 +69,9 @@ pub enum ProjectionError {
     #[error("invalid annex import topology: {0}")]
     InvalidAnnexTopology(String),
 
+    #[error("invalid scan state: {0}")]
+    InvalidScan(String),
+
     #[error("rebuilt database failed integrity_check: {0}")]
     IntegrityCheck(String),
 }
@@ -84,6 +89,7 @@ impl ProjectionError {
             Self::DuplicateOperationKey { .. } => "duplicate_operation_key",
             Self::InvalidCursor(_) => "invalid_projection_cursor",
             Self::InvalidAnnexTopology(_) => "invalid_annex_topology",
+            Self::InvalidScan(_) => "invalid_scan_state",
             Self::IntegrityCheck(_) => "sqlite_integrity_failure",
         }
     }
@@ -156,6 +162,89 @@ pub struct ApplyStats {
     pub lines_read: u64,
     pub caught_up: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationFreshness {
+    pub location_id: String,
+    pub latest_scan_id: Option<String>,
+    pub latest_scan_status: Option<String>,
+    pub last_complete_scan_id: Option<String>,
+    pub last_complete_scan_time_utc_ms: Option<u64>,
+    pub scan_error_count: u64,
+    pub device_id: Option<String>,
+    pub device_status: Option<String>,
+    pub device_identity_state: Option<String>,
+    pub expected_availability: String,
+    pub latest_mount_status: Option<String>,
+    pub availability: String,
+    pub last_device_checkin_time_utc_ms: Option<u64>,
+    pub last_fingerprint_status: Option<String>,
+    pub uncertainty: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanKnownEntry {
+    pub file_ref_id: String,
+    pub copy_claim_id: Option<String>,
+    pub path_state: String,
+    pub copy_state: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub modified_time_utc_ms: Option<u64>,
+    pub has_effective_missing_candidate: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanMissingTarget {
+    pub kind: String,
+    pub target_id: String,
+    pub file_ref_id: Option<String>,
+    pub copy_claim_id: Option<String>,
+    pub path: EncodedPath,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanMissingCursor {
+    path_encoding: String,
+    path_bytes: Vec<u8>,
+    kind: String,
+    target_id: String,
+}
+
+impl ScanMissingTarget {
+    pub(crate) fn cursor(&self) -> ScanMissingCursor {
+        ScanMissingCursor {
+            path_encoding: self.path.encoding.as_str().to_owned(),
+            path_bytes: self.path.bytes.clone(),
+            kind: self.kind.clone(),
+            target_id: self.target_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanSeenPath {
+    pub item_key: String,
+    pub path: EncodedPath,
+    pub file_ref_id: Option<String>,
+    pub copy_claim_id: Option<String>,
+}
+
+pub(crate) struct ScanProjectionSession {
+    connection: Connection,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ScanCompletionManifest {
+    pub observations_count: u64,
+    pub observations_digest: String,
+    pub missing_candidate_count: u64,
+    pub missing_candidate_digest: String,
+    pub missing_path_count: u64,
+}
+
+const COMPLETION_MIN_FREE_BYTES: u64 = 8 * 1024 * 1024;
+const COMPLETION_ESTIMATED_BYTES_PER_ROW: u64 = 256;
 
 #[derive(Debug, Clone)]
 pub struct ProjectionDb {
@@ -447,6 +536,474 @@ impl ProjectionDb {
             .map_err(|source| sqlite_error(&self.path, source))
     }
 
+    pub(crate) fn validate_scan_topology(
+        &self,
+        collection_id: &str,
+        location_id: &str,
+        device_id: &str,
+        archive_root_id: &str,
+    ) -> Result<()> {
+        let connection = self.open_connection()?;
+        let valid: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM collections c
+                    JOIN locations l ON l.location_id = ?2
+                    JOIN archive_roots r ON r.archive_root_id = l.archive_root_id
+                    JOIN devices d ON d.device_id = l.device_id
+                    WHERE c.collection_id = ?1 AND c.status = 'active'
+                      AND l.kind = 'filesystem' AND l.status = 'active'
+                      AND r.status = 'active' AND d.status = 'active'
+                      AND l.device_id = ?3 AND r.device_id = ?3
+                      AND l.archive_root_id = ?4
+                      AND d.identity_state != 'conflict'
+                 )",
+                params![collection_id, location_id, device_id, archive_root_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if !valid {
+            return Err(ProjectionError::InvalidScan(format!(
+                "collection {collection_id} and location {location_id} do not match active root {archive_root_id} and device {device_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_scan_scope_available(
+        &self,
+        scan_id: &str,
+        job_id: &str,
+        location_id: &str,
+        collection_id: &str,
+        scope_json: &str,
+        exclusions_hash: &str,
+    ) -> Result<()> {
+        let connection = self.open_connection()?;
+        let existing: Option<(String, String, String, String, String)> = connection
+            .query_row(
+                "SELECT COALESCE(job_id, ''), location_id, collection_id, scope_json, exclusions_hash
+                 FROM scan_runs WHERE scan_id = ?1",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if let Some(existing) = existing {
+            if existing
+                != (
+                    job_id.to_owned(),
+                    location_id.to_owned(),
+                    collection_id.to_owned(),
+                    scope_json.to_owned(),
+                    exclusions_hash.to_owned(),
+                )
+            {
+                return Err(ProjectionError::InvalidScan(format!(
+                    "scan {scan_id} cannot resume with changed job, source, scope, or exclusions"
+                )));
+            }
+        }
+        let conflicting: Option<String> = connection
+            .query_row(
+                "SELECT scan_id FROM scan_runs
+                 WHERE location_id = ?1 AND collection_id = ?2 AND scope_json = ?3
+                   AND status = 'running' AND scan_id != ?4",
+                params![location_id, collection_id, scope_json, scan_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if let Some(conflicting) = conflicting {
+            return Err(ProjectionError::InvalidScan(format!(
+                "scan {conflicting} is already running for this scope"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scan_run_status(&self, scan_id: &str) -> Result<Option<String>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT status FROM scan_runs WHERE scan_id = ?1",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn scan_has_interleaved_events(&self, scan_id: &str) -> Result<bool> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM scan_runs s
+                    JOIN events e ON e.seq > s.started_event_seq
+                    JOIN file_refs f ON f.file_ref_id = e.file_ref_id
+                    WHERE s.scan_id = ?1
+                      AND e.event_type IN ('path_observed', 'copy_observed')
+                      AND e.location_id = s.location_id
+                      AND f.collection_id = s.collection_id
+                      AND COALESCE(json_extract(e.payload_json, '$.scan_id'), '') != s.scan_id
+                 )",
+                [scan_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn scan_change_counts(&self, scan_id: &str) -> Result<(u64, u64)> {
+        let connection = self.open_connection()?;
+        let (new_paths, changed_paths): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN p.first_seen_event_id = e.event_id THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN p.first_seen_event_id != e.event_id THEN 1 ELSE 0 END), 0)
+                 FROM events e
+                 JOIN path_observations p
+                   ON p.file_ref_id = e.file_ref_id AND p.location_id = e.location_id
+                  AND p.last_seen_event_id = e.event_id
+                 WHERE e.event_type = 'path_observed'
+                   AND json_extract(e.payload_json, '$.scan_id') = ?1",
+                [scan_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok((
+            u64::try_from(new_paths).unwrap_or(0),
+            u64::try_from(changed_paths).unwrap_or(0),
+        ))
+    }
+
+    pub(crate) fn prepare_scan_job(
+        &self,
+        job_id: &str,
+        scan_id: &str,
+        params_json: &str,
+        now_utc_ms: u64,
+    ) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "INSERT INTO jobs(
+                    job_id, job_type, status, created_time_utc_ms, started_time_utc_ms,
+                    params_json, input_version
+                 ) VALUES (?1, 'scan', 'running', ?3, ?3, ?4, ?2)
+                 ON CONFLICT(job_id) DO UPDATE SET
+                    status = CASE WHEN jobs.status = 'running' THEN 'running' ELSE jobs.status END",
+                params![
+                    job_id,
+                    scan_id,
+                    i64::try_from(now_utc_ms).map_err(|_| ProjectionError::InvalidScan(
+                        "scan time exceeds SQLite integer range".to_owned()
+                    ))?,
+                    params_json,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let actual: String = connection
+            .query_row(
+                "SELECT input_version FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if actual != scan_id {
+            return Err(ProjectionError::InvalidScan(format!(
+                "job {job_id} belongs to scan {actual}, not {scan_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_scan_seen(&self, job_id: &str) -> Result<()> {
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "DELETE FROM job_items WHERE job_id = ?1 AND item_type = 'scan_seen'",
+                [job_id],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
+    pub(crate) fn open_scan_session(&self) -> Result<ScanProjectionSession> {
+        Ok(ScanProjectionSession {
+            connection: self.open_connection()?,
+            path: self.path.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_missing_targets_after(
+        &self,
+        scan_id: &str,
+        job_id: &str,
+        collection_id: &str,
+        location_id: &str,
+        exclusions_json: &str,
+        after: Option<&ScanMissingCursor>,
+        limit: usize,
+    ) -> Result<Vec<ScanMissingTarget>> {
+        if limit == 0 {
+            return Err(ProjectionError::InvalidScan(
+                "missing-target batch limit must be greater than zero".to_owned(),
+            ));
+        }
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "WITH targets(kind, target_id, file_ref_id, copy_claim_id, path_encoding, path_bytes, path_display) AS (
+                    SELECT 'path', p.file_ref_id, p.file_ref_id, NULL,
+                           p.observed_path_encoding, p.observed_path_bytes, p.observed_path_display
+                    FROM path_observations p
+                    JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                    WHERE f.collection_id = ?3 AND f.path_state = 'active'
+                      AND p.location_id = ?4 AND p.state = 'present'
+                    UNION ALL
+                    SELECT DISTINCT 'copy', c.copy_claim_id, NULL, c.copy_claim_id,
+                           c.relative_path_encoding, c.relative_path_bytes, c.relative_path_display
+                    FROM copy_claims c
+                    JOIN path_observations p
+                      ON p.location_id = c.location_id
+                     AND p.observed_path_encoding = c.relative_path_encoding
+                     AND p.observed_path_bytes = c.relative_path_bytes
+                    JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                    WHERE f.collection_id = ?3 AND f.path_state = 'active'
+                      AND c.location_id = ?4 AND c.state IN ('present', 'corrupt', 'unknown')
+                 )
+                 SELECT kind, target_id, file_ref_id, copy_claim_id,
+                        path_encoding, path_bytes, path_display
+                 FROM targets t
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM job_items j
+                    WHERE j.job_id = ?2 AND j.item_type = 'scan_seen'
+                      AND j.path_encoding = t.path_encoding AND j.path_bytes = t.path_bytes
+                 )
+                   AND NOT EXISTS (
+                    SELECT 1 FROM scan_missing_candidates c
+                    WHERE c.scan_id = ?1 AND c.candidate_kind = t.kind
+                      AND ((t.kind = 'path' AND c.file_ref_id = t.target_id)
+                        OR (t.kind = 'copy' AND c.copy_claim_id = t.target_id))
+                 )
+                   AND NOT EXISTS (
+                    SELECT 1 FROM json_each(?5) x
+                    WHERE upper(hex(t.path_bytes)) = json_extract(x.value, '$.hex')
+                       OR upper(hex(t.path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+                 )
+                   AND (?6 IS NULL
+                     OR t.path_encoding > ?6
+                     OR (t.path_encoding = ?6 AND t.path_bytes > ?7)
+                     OR (t.path_encoding = ?6 AND t.path_bytes = ?7 AND t.kind > ?8)
+                     OR (t.path_encoding = ?6 AND t.path_bytes = ?7 AND t.kind = ?8
+                         AND t.target_id > ?9))
+                 ORDER BY path_encoding, path_bytes, kind, target_id
+                 LIMIT ?10",
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    scan_id,
+                    job_id,
+                    collection_id,
+                    location_id,
+                    exclusions_json,
+                    after.map(|cursor| cursor.path_encoding.as_str()),
+                    after.map(|cursor| cursor.path_bytes.as_slice()),
+                    after.map(|cursor| cursor.kind.as_str()),
+                    after.map(|cursor| cursor.target_id.as_str()),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    let encoding: String = row.get(4)?;
+                    let bytes: Vec<u8> = row.get(5)?;
+                    let display: String = row.get(6)?;
+                    Ok(ScanMissingTarget {
+                        kind: row.get(0)?,
+                        target_id: row.get(1)?,
+                        file_ref_id: row.get(2)?,
+                        copy_claim_id: row.get(3)?,
+                        path: EncodedPath {
+                            encoding: parse_path_encoding(&encoding)?,
+                            bytes,
+                            display,
+                        },
+                    })
+                },
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn scan_completion_manifest(&self, scan_id: &str) -> Result<ScanCompletionManifest> {
+        let connection = self.open_connection()?;
+        scan_completion_manifest(&connection, scan_id)
+            .map_err(|error| map_transaction_error(&self.path, error))
+    }
+
+    pub(crate) fn preflight_scan_completion(
+        &self,
+        manifest: &ScanCompletionManifest,
+    ) -> Result<()> {
+        let connection = self.open_connection()?;
+        let page_size: i64 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let page_size = u64::try_from(page_size).map_err(|_| {
+            ProjectionError::InvalidScan("SQLite reported an invalid page size".to_owned())
+        })?;
+        let rows = manifest
+            .observations_count
+            .saturating_add(manifest.missing_candidate_count);
+        let row_bytes = rows.saturating_mul(COMPLETION_ESTIMATED_BYTES_PER_ROW);
+        let page_margin = page_size.saturating_mul(64);
+        let required = COMPLETION_MIN_FREE_BYTES.max(row_bytes.saturating_add(page_margin));
+        let parent = parent_directory(&self.path);
+        let available = available_space(parent)
+            .map_err(|source| io_error("check free space for scan completion", parent, source))?;
+        if available < required {
+            return Err(ProjectionError::InvalidScan(format!(
+                "scan completion needs an estimated {required} bytes free beside the SQLite database, but only {available} bytes are available"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_scan_job(
+        &self,
+        job_id: &str,
+        status: &str,
+        progress_json: &str,
+        now_utc_ms: u64,
+    ) -> Result<()> {
+        let connection = self.open_connection()?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute(
+                "UPDATE jobs SET status = ?2, progress_json = ?3, finished_time_utc_ms = ?4
+                 WHERE job_id = ?1",
+                params![
+                    job_id,
+                    status,
+                    progress_json,
+                    i64::try_from(now_utc_ms).map_err(|_| ProjectionError::InvalidScan(
+                        "scan time exceeds SQLite integer range".to_owned()
+                    ))?,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute("DELETE FROM job_items WHERE job_id = ?1", [job_id])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
+    pub fn location_freshness(&self, location_id: &str) -> Result<LocationFreshness> {
+        let connection = self.open_connection()?;
+        let mut freshness = connection
+            .query_row(
+                "SELECT l.location_id, l.device_id, d.status, d.identity_state,
+                        l.expected_availability, mount.status,
+                        d.last_checkin_time_utc_ms, d.last_fingerprint_status,
+                        latest.scan_id, latest.status, latest.error_count,
+                        complete.scan_id, complete.finished_time_utc_ms
+                 FROM locations l
+                 LEFT JOIN devices d ON d.device_id = l.device_id
+                 LEFT JOIN device_mounts mount ON mount.mount_id = (
+                    SELECT m.mount_id FROM device_mounts m WHERE m.device_id = l.device_id
+                    ORDER BY m.observed_time_utc_ms DESC, m.mount_id DESC LIMIT 1
+                 )
+                 LEFT JOIN scan_runs latest ON latest.scan_id = (
+                    SELECT s.scan_id FROM scan_runs s WHERE s.location_id = l.location_id
+                    ORDER BY COALESCE(s.finished_time_utc_ms, s.started_time_utc_ms) DESC,
+                             s.started_event_seq DESC LIMIT 1
+                 )
+                 LEFT JOIN scan_runs complete ON complete.scan_id = (
+                    SELECT s.scan_id FROM scan_runs s
+                    WHERE s.location_id = l.location_id AND s.status = 'complete'
+                    ORDER BY s.finished_time_utc_ms DESC, s.started_event_seq DESC LIMIT 1
+                 )
+                 WHERE l.location_id = ?1",
+                [location_id],
+                |row| {
+                    Ok(LocationFreshness {
+                        location_id: row.get(0)?,
+                        device_id: row.get(1)?,
+                        device_status: row.get(2)?,
+                        device_identity_state: row.get(3)?,
+                        expected_availability: row.get(4)?,
+                        latest_mount_status: row.get(5)?,
+                        availability: "unknown".to_owned(),
+                        last_device_checkin_time_utc_ms: optional_u64(row.get(6)?)?,
+                        last_fingerprint_status: row.get(7)?,
+                        latest_scan_id: row.get(8)?,
+                        latest_scan_status: row.get(9)?,
+                        scan_error_count: u64::try_from(
+                            row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0),
+                        )
+                        .unwrap_or(0),
+                        last_complete_scan_id: row.get(11)?,
+                        last_complete_scan_time_utc_ms: optional_u64(row.get(12)?)?,
+                        uncertainty: Vec::new(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))?
+            .ok_or_else(|| {
+                ProjectionError::InvalidScan(format!("unknown location {location_id}"))
+            })?;
+        freshness.availability = match freshness.latest_mount_status.as_deref() {
+            Some("mounted") if freshness.last_fingerprint_status.as_deref() == Some("match") => {
+                "online"
+            }
+            Some("unmounted") if freshness.expected_availability == "offline" => "expected_offline",
+            Some("unmounted") => "unexpectedly_absent",
+            _ => "unknown",
+        }
+        .to_owned();
+        if freshness.last_complete_scan_id.is_none() {
+            freshness
+                .uncertainty
+                .push("never_completely_scanned".to_owned());
+        }
+        if freshness
+            .latest_scan_status
+            .as_deref()
+            .is_some_and(|status| status != "complete")
+        {
+            freshness
+                .uncertainty
+                .push("latest_scan_incomplete".to_owned());
+        }
+        if freshness.device_id.is_some() && freshness.last_device_checkin_time_utc_ms.is_none() {
+            freshness
+                .uncertainty
+                .push("device_never_checked_in".to_owned());
+        }
+        if freshness
+            .last_fingerprint_status
+            .as_deref()
+            .is_some_and(|status| status != "match")
+        {
+            freshness
+                .uncertainty
+                .push("device_identity_unconfirmed".to_owned());
+        }
+        Ok(freshness)
+    }
+
     pub fn apply(&self, event_store: &EventStore) -> Result<ApplyStats> {
         self.apply_internal(event_store, None)
     }
@@ -606,6 +1163,121 @@ impl ProjectionDb {
             .map_err(|source| io_error("open rebuilt database for sync", &self.path, source))?
             .sync_all()
             .map_err(|source| io_error("sync rebuilt database", &self.path, source))
+    }
+}
+
+impl ScanProjectionSession {
+    pub(crate) fn known_entry(
+        &self,
+        scan_id: &str,
+        collection_id: &str,
+        location_id: &str,
+        path: &EncodedPath,
+    ) -> Result<Option<ScanKnownEntry>> {
+        self.connection
+            .prepare_cached(
+                "SELECT p.file_ref_id, c.copy_claim_id, p.state, c.state,
+                        p.observed_size_bytes, p.modified_time_utc_ms,
+                        EXISTS(
+                            SELECT 1 FROM scan_missing_candidates m
+                            WHERE m.scan_id = ?5 AND m.location_id = p.location_id
+                              AND m.path_encoding = p.observed_path_encoding
+                              AND m.path_bytes = p.observed_path_bytes
+                              AND ((m.candidate_kind = 'path' AND m.file_ref_id = p.file_ref_id
+                                    AND m.candidate_event_seq > last_path_event.seq)
+                                OR (m.candidate_kind = 'copy' AND m.copy_claim_id = c.copy_claim_id
+                                    AND m.candidate_event_seq > c.state_event_seq))
+                        )
+                 FROM path_observations p
+                 JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                 JOIN events last_path_event ON last_path_event.event_id = p.last_seen_event_id
+                 LEFT JOIN copy_claims c
+                   ON c.location_id = p.location_id
+                  AND c.relative_path_encoding = p.observed_path_encoding
+                  AND c.relative_path_bytes = p.observed_path_bytes
+                  AND c.state != 'superseded'
+                 WHERE f.collection_id = ?1 AND f.path_state = 'active'
+                   AND p.location_id = ?2 AND p.observed_path_encoding = ?3
+                   AND p.observed_path_bytes = ?4",
+            )
+            .and_then(|mut statement| {
+                statement.query_row(
+                    params![
+                        collection_id,
+                        location_id,
+                        path.encoding.as_str(),
+                        path.bytes,
+                        scan_id,
+                    ],
+                    |row| {
+                        Ok(ScanKnownEntry {
+                            file_ref_id: row.get(0)?,
+                            copy_claim_id: row.get(1)?,
+                            path_state: row.get(2)?,
+                            copy_state: row.get(3)?,
+                            size_bytes: optional_u64(row.get(4)?)?,
+                            modified_time_utc_ms: optional_u64(row.get(5)?)?,
+                            has_effective_missing_candidate: row.get(6)?,
+                        })
+                    },
+                )
+            })
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn mark_seen(
+        &mut self,
+        job_id: &str,
+        paths: &[ScanSeenPath],
+        now_utc_ms: u64,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let time = i64::try_from(now_utc_ms).map_err(|_| {
+            ProjectionError::InvalidScan("scan time exceeds SQLite integer range".to_owned())
+        })?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        {
+            let mut statement = transaction
+                .prepare_cached(
+                    "INSERT INTO job_items(
+                    job_item_id, job_id, item_type, item_key, file_ref_id, copy_claim_id,
+                    path_bytes, path_encoding, path_display, status, updated_time_utc_ms
+                 ) VALUES (?2, ?1, 'scan_seen', ?2, ?3, ?4, ?5, ?6, ?7, 'complete', ?8)
+                 ON CONFLICT(job_id, item_type, item_key) DO UPDATE SET
+                    file_ref_id = excluded.file_ref_id,
+                    copy_claim_id = excluded.copy_claim_id,
+                    path_bytes = excluded.path_bytes,
+                    path_encoding = excluded.path_encoding,
+                    path_display = excluded.path_display,
+                    status = 'complete',
+                    updated_time_utc_ms = excluded.updated_time_utc_ms",
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            for path in paths {
+                statement
+                    .execute(params![
+                        job_id,
+                        path.item_key,
+                        path.file_ref_id,
+                        path.copy_claim_id,
+                        path.path.bytes,
+                        path.path.encoding.as_str(),
+                        path.path.display,
+                        time,
+                    ])
+                    .map_err(|source| sqlite_error(&self.path, source))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
     }
 }
 
@@ -780,6 +1452,33 @@ fn nonempty_meta(connection: &Connection, key: &str) -> rusqlite::Result<Option<
         .filter(|value| !value.is_empty()))
 }
 
+fn optional_u64(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_path_encoding(value: &str) -> rusqlite::Result<PathEncoding> {
+    match value {
+        "utf8" => Ok(PathEncoding::Utf8),
+        "unix_bytes" => Ok(PathEncoding::UnixBytes),
+        "windows_utf16le" => Ok(PathEncoding::WindowsUtf16Le),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown path encoding {value}").into(),
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OperationOutcomePayload {
     operation_key: String,
@@ -943,6 +1642,65 @@ struct CopyVerifiedPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeviceCheckedInPayload {
+    device_id: String,
+    fingerprint_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceMountObservedPayload {
+    mount_id: String,
+    device_id: String,
+    mount_root_uri: String,
+    status: String,
+    fingerprint_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanStartedPayload {
+    scan_id: String,
+    location_id: String,
+    collection_id: String,
+    device_id: String,
+    archive_root_id: String,
+    fingerprint_status: String,
+    logical_prefix: Option<LosslessPathPayload>,
+    coverage_version: u64,
+    scope_json: Value,
+    exclusions_json: Value,
+    exclusions_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanMissingCandidatePayload {
+    scan_id: String,
+    file_ref_id: Option<String>,
+    copy_claim_id: Option<String>,
+    location_id: String,
+    path: LosslessPathPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanCompletedPayload {
+    scan_id: String,
+    status: String,
+    coverage_version: u64,
+    scope_json: Value,
+    exclusions_hash: String,
+    observations_count: u64,
+    observations_digest: Option<String>,
+    missing_candidate_count: u64,
+    missing_candidate_digest: Option<String>,
+    files_seen: u64,
+    bytes_seen: u64,
+    new_paths: u64,
+    changed_paths: u64,
+    unchanged_paths: u64,
+    error_count: u64,
+    error_summary: Value,
+}
+
+#[derive(Debug, Deserialize)]
 struct AnnexImportStartedPayload {
     import_id: String,
     repo_path: LosslessPathPayload,
@@ -1083,6 +1841,12 @@ fn project_semantic_event(
         "path_observed" => project_path_observation(transaction, record),
         "copy_observed" => project_copy_claim(transaction, record),
         "copy_verified" => project_copy_verification(transaction, record),
+        "device_checked_in" => project_device_checked_in(transaction, record),
+        "device_mount_observed" => project_device_mount_observed(transaction, record),
+        "scan_started" => project_scan_started(transaction, record),
+        "path_missing_candidate" => project_scan_missing_candidate(transaction, record, "path"),
+        "copy_missing_candidate" => project_scan_missing_candidate(transaction, record, "copy"),
+        "scan_completed" => project_scan_completed(transaction, record),
         "annex_import_started" => project_annex_import_started(transaction, record),
         "annex_import_completed" => project_annex_import_completed(transaction, record),
         _ => Ok(()),
@@ -1501,6 +2265,692 @@ fn project_copy_verification(
         ],
     )?;
     Ok(())
+}
+
+fn project_device_checked_in(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: DeviceCheckedInPayload = payload(record)?;
+    if !matches!(
+        value.fingerprint_status.as_str(),
+        "match" | "unavailable" | "mismatch"
+    ) {
+        return Err(invalid_payload(record, "invalid fingerprint_status"));
+    }
+    let changed = transaction.execute(
+        "UPDATE devices SET
+            identity_state = CASE
+                WHEN ?4 = 'mismatch' THEN 'conflict' ELSE identity_state END,
+            last_checkin_event_id = ?2,
+            last_checkin_time_utc_ms = ?3,
+            last_fingerprint_match_time_utc_ms = CASE
+                WHEN ?4 = 'match' THEN ?3 ELSE last_fingerprint_match_time_utc_ms END,
+            last_fingerprint_status = ?4
+         WHERE device_id = ?1 AND status = 'active'",
+        params![
+            value.device_id,
+            record.envelope.event_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            value.fingerprint_status,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(invalid_payload(
+            record,
+            "device check-in names no active device",
+        ));
+    }
+    Ok(())
+}
+
+fn project_device_mount_observed(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: DeviceMountObservedPayload = payload(record)?;
+    if !matches!(value.status.as_str(), "mounted" | "unmounted" | "mismatch")
+        || !matches!(
+            value.fingerprint_status.as_str(),
+            "match" | "unavailable" | "mismatch"
+        )
+    {
+        return Err(invalid_payload(record, "invalid device mount state"));
+    }
+    let device_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM devices WHERE device_id = ?1)",
+        [&value.device_id],
+        |row| row.get(0),
+    )?;
+    if !device_exists {
+        return Err(invalid_payload(record, "device mount names no device"));
+    }
+    transaction.execute(
+        "INSERT INTO device_mounts(
+            mount_id, device_id, host_id, mount_root_uri, status,
+            fingerprint_status, observed_time_utc_ms, observed_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            value.mount_id,
+            value.device_id,
+            record.envelope.host_id,
+            value.mount_root_uri,
+            value.status,
+            value.fingerprint_status,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            record.envelope.event_id,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE devices SET
+            identity_state = CASE
+                WHEN ?2 = 'mismatch' THEN 'conflict' ELSE identity_state END,
+            last_fingerprint_match_time_utc_ms = CASE
+                WHEN ?2 = 'match' THEN ?3 ELSE last_fingerprint_match_time_utc_ms END,
+            last_fingerprint_status = ?2
+         WHERE device_id = ?1",
+        params![
+            value.device_id,
+            value.fingerprint_status,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_scan_started(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ScanStartedPayload = payload(record)?;
+    let logical_prefix = value
+        .logical_prefix
+        .as_ref()
+        .map(|path| path.bytes(record))
+        .transpose()?;
+    let scope_json = serde_json::to_string(&value.scope_json)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    let exclusions_json = serde_json::to_string(&value.exclusions_json)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    if !matches!(value.fingerprint_status.as_str(), "match" | "unavailable") {
+        return Err(invalid_payload(
+            record,
+            "scan start requires a non-conflicting device fingerprint",
+        ));
+    }
+    if record.envelope.location_id.as_deref() != Some(value.location_id.as_str())
+        || record.envelope.device_id.as_deref() != Some(value.device_id.as_str())
+    {
+        return Err(invalid_payload(
+            record,
+            "scan start envelope does not match its location and device",
+        ));
+    }
+    let topology_valid: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM collections c
+            JOIN locations l ON l.location_id = ?2
+            JOIN archive_roots r ON r.archive_root_id = l.archive_root_id
+            JOIN devices d ON d.device_id = l.device_id
+            WHERE c.collection_id = ?1 AND c.status = 'active'
+              AND l.kind = 'filesystem' AND l.status = 'active'
+              AND r.status = 'active' AND d.status = 'active'
+              AND l.device_id = ?3 AND r.device_id = ?3
+              AND l.archive_root_id = ?4
+              AND d.identity_state != 'conflict'
+         )",
+        params![
+            value.collection_id,
+            value.location_id,
+            value.device_id,
+            value.archive_root_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if !topology_valid {
+        return Err(invalid_payload(
+            record,
+            "scan start does not name an active, consistent scan topology",
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO scan_runs(
+            scan_id, job_id, location_id, collection_id,
+            logical_prefix_bytes, logical_prefix_encoding, logical_prefix_display,
+            status, started_time_utc_ms, started_event_seq, coverage_version,
+            scope_json, exclusions_json, exclusions_hash, error_summary_json,
+            started_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, ?9, ?10,
+                   ?11, ?12, ?13, '{}', ?14)",
+        params![
+            value.scan_id,
+            record.envelope.job_id,
+            value.location_id,
+            value.collection_id,
+            logical_prefix,
+            value
+                .logical_prefix
+                .as_ref()
+                .map(|path| path.encoding.as_str()),
+            value
+                .logical_prefix
+                .as_ref()
+                .map(|path| path.display.as_str()),
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            sql_integer(record.envelope.seq, "seq", record)?,
+            sql_integer(value.coverage_version, "coverage_version", record)?,
+            scope_json,
+            exclusions_json,
+            value.exclusions_hash,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_scan_missing_candidate(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+    kind: &str,
+) -> std::result::Result<(), BatchError> {
+    let value: ScanMissingCandidatePayload = payload(record)?;
+    if (kind == "path" && value.file_ref_id.is_none())
+        || (kind == "copy" && value.copy_claim_id.is_none())
+    {
+        return Err(invalid_payload(
+            record,
+            "missing candidate lacks its target ID",
+        ));
+    }
+    let running: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM scan_runs
+            WHERE scan_id = ?1 AND location_id = ?2 AND status = 'running'
+         )",
+        params![value.scan_id, value.location_id],
+        |row| row.get(0),
+    )?;
+    if !running {
+        return Err(invalid_payload(
+            record,
+            "missing candidate has no running scan",
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO scan_missing_candidates(
+            candidate_event_id, candidate_event_seq, candidate_event_hash, scan_id,
+            candidate_kind, file_ref_id, copy_claim_id, location_id,
+            path_bytes, path_encoding
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            record.envelope.event_id,
+            sql_integer(record.envelope.seq, "seq", record)?,
+            record.event_hash,
+            value.scan_id,
+            kind,
+            value.file_ref_id,
+            value.copy_claim_id,
+            value.location_id,
+            value.path.bytes(record)?,
+            value.path.encoding,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_scan_completed(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ScanCompletedPayload = payload(record)?;
+    if !matches!(
+        value.status.as_str(),
+        "complete" | "partial" | "failed" | "cancelled"
+    ) {
+        return Err(invalid_payload(record, "invalid scan completion status"));
+    }
+    let (
+        location_id,
+        collection_id,
+        started_event_seq,
+        coverage_version,
+        scope_json,
+        exclusions_json,
+        exclusions_hash,
+    ): (String, String, i64, i64, String, String, String) = transaction
+        .query_row(
+            "SELECT location_id, collection_id, started_event_seq, coverage_version,
+                    scope_json, exclusions_json, exclusions_hash
+             FROM scan_runs WHERE scan_id = ?1 AND status = 'running'",
+            [&value.scan_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| invalid_payload(record, "scan completion has no running start"))?;
+    let declared_scope = serde_json::to_string(&value.scope_json)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    if coverage_version != sql_integer(value.coverage_version, "coverage_version", record)?
+        || scope_json != declared_scope
+        || exclusions_hash != value.exclusions_hash
+    {
+        return Err(invalid_payload(
+            record,
+            "scan completion coverage does not match its start",
+        ));
+    }
+    let interleaved = if value.status == "complete" {
+        transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM events e
+                JOIN file_refs f ON f.file_ref_id = e.file_ref_id
+                WHERE e.seq > ?1 AND e.seq < ?2
+                  AND e.event_type IN ('path_observed', 'copy_observed')
+                  AND e.location_id = ?3 AND f.collection_id = ?4
+                  AND COALESCE(json_extract(e.payload_json, '$.scan_id'), '') != ?5
+             )",
+            params![
+                started_event_seq,
+                sql_integer(record.envelope.seq, "seq", record)?,
+                location_id,
+                collection_id,
+                value.scan_id,
+            ],
+            |row| row.get(0),
+        )?
+    } else {
+        false
+    };
+    if interleaved {
+        let mut error_summary = value.error_summary.clone();
+        if let Value::Object(summary) = &mut error_summary {
+            let count = summary
+                .get("concurrent_changes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            summary.insert("concurrent_changes".to_owned(), Value::from(count));
+            summary.insert("completion_downgraded".to_owned(), Value::from(true));
+        }
+        return project_incomplete_scan(
+            transaction,
+            record,
+            &value,
+            "partial",
+            value.error_count.saturating_add(1),
+            &error_summary,
+        );
+    }
+
+    if value.status != "complete" {
+        if value.observations_count != 0
+            || value.observations_digest.is_some()
+            || value.missing_candidate_count != 0
+            || value.missing_candidate_digest.is_some()
+        {
+            return Err(invalid_payload(
+                record,
+                "an incomplete scan cannot activate missing candidates",
+            ));
+        }
+        return project_incomplete_scan(
+            transaction,
+            record,
+            &value,
+            &value.status,
+            value.error_count,
+            &value.error_summary,
+        );
+    }
+
+    let error_summary = serde_json::to_string(&value.error_summary)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+
+    let actual = scan_completion_manifest(transaction, &value.scan_id)?;
+    if actual.observations_count != value.observations_count
+        || digest_option(&actual.observations_digest, actual.observations_count)
+            != value.observations_digest.as_deref()
+        || actual.missing_candidate_count != value.missing_candidate_count
+        || digest_option(
+            &actual.missing_candidate_digest,
+            actual.missing_candidate_count,
+        ) != value.missing_candidate_digest.as_deref()
+    {
+        return Err(invalid_payload(record, "scan completion manifest mismatch"));
+    }
+
+    let missing_paths = transaction.execute(
+        "UPDATE path_observations AS p SET
+            state = 'missing',
+            last_seen_event_id = (
+                SELECT c.candidate_event_id FROM scan_missing_candidates c
+                WHERE c.scan_id = ?1 AND c.candidate_kind = 'path'
+                  AND c.file_ref_id = p.file_ref_id
+                  AND c.location_id = p.location_id
+                  AND c.path_encoding = p.observed_path_encoding
+                  AND c.path_bytes = p.observed_path_bytes
+                  AND c.candidate_event_seq > COALESCE((
+                      SELECT e.seq FROM events e WHERE e.event_id = p.last_seen_event_id
+                  ), 0)
+                ORDER BY c.candidate_event_seq DESC LIMIT 1
+            ),
+            last_seen_time_utc_ms = ?2
+         WHERE EXISTS (
+            SELECT 1 FROM scan_missing_candidates c
+            WHERE c.scan_id = ?1 AND c.candidate_kind = 'path'
+              AND c.file_ref_id = p.file_ref_id AND c.location_id = p.location_id
+              AND c.path_encoding = p.observed_path_encoding
+              AND c.path_bytes = p.observed_path_bytes
+              AND c.candidate_event_seq > COALESCE((
+                  SELECT e.seq FROM events e WHERE e.event_id = p.last_seen_event_id
+              ), 0)
+         )",
+        params![
+            value.scan_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE copy_claims AS c SET
+            state = 'missing',
+            state_event_seq = (
+                SELECT MAX(m.candidate_event_seq) FROM scan_missing_candidates m
+                WHERE m.scan_id = ?1 AND m.candidate_kind = 'copy'
+                  AND m.copy_claim_id = c.copy_claim_id
+                  AND m.candidate_event_seq > c.state_event_seq
+            ),
+            last_seen_event_id = (
+                SELECT m.candidate_event_id FROM scan_missing_candidates m
+                WHERE m.scan_id = ?1 AND m.candidate_kind = 'copy'
+                  AND m.copy_claim_id = c.copy_claim_id
+                  AND m.candidate_event_seq > c.state_event_seq
+                ORDER BY m.candidate_event_seq DESC LIMIT 1
+            ),
+            last_seen_time_utc_ms = ?2
+         WHERE EXISTS (
+            SELECT 1 FROM scan_missing_candidates m
+            WHERE m.scan_id = ?1 AND m.candidate_kind = 'copy'
+              AND m.copy_claim_id = c.copy_claim_id
+              AND m.candidate_event_seq > c.state_event_seq
+         )",
+        params![
+            value.scan_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE scan_missing_candidates SET activated = 1 WHERE scan_id = ?1",
+        [&value.scan_id],
+    )?;
+    transaction.execute(
+        "UPDATE path_observations AS p SET last_complete_scan_id = ?1
+         WHERE p.location_id = ?2 AND p.state = 'present'
+           AND EXISTS (
+             SELECT 1 FROM file_refs f
+             WHERE f.file_ref_id = p.file_ref_id AND f.collection_id = ?3
+               AND f.path_state = 'active'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM json_each(?4) x
+             WHERE upper(hex(p.observed_path_bytes)) = json_extract(x.value, '$.hex')
+                OR upper(hex(p.observed_path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+           )",
+        params![value.scan_id, location_id, collection_id, exclusions_json],
+    )?;
+    transaction.execute(
+        "UPDATE copy_claims AS c SET last_complete_scan_id = ?1
+         WHERE c.location_id = ?2 AND c.state IN ('present', 'corrupt', 'unknown')
+           AND EXISTS (
+             SELECT 1 FROM path_observations p
+             JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+             WHERE p.location_id = c.location_id
+               AND p.observed_path_encoding = c.relative_path_encoding
+               AND p.observed_path_bytes = c.relative_path_bytes
+               AND f.collection_id = ?3 AND f.path_state = 'active'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM json_each(?4) x
+             WHERE upper(hex(c.relative_path_bytes)) = json_extract(x.value, '$.hex')
+                OR upper(hex(c.relative_path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+           )",
+        params![value.scan_id, location_id, collection_id, exclusions_json],
+    )?;
+
+    transaction.execute(
+        "UPDATE scan_runs SET
+            status = 'complete', finished_time_utc_ms = ?2,
+            observations_count = ?3, observations_digest = ?4,
+            missing_candidate_count = ?5, missing_candidate_digest = ?6,
+            files_seen = ?7, bytes_seen = ?8, new_paths = ?9,
+            changed_paths = ?10, missing_paths = ?11, unchanged_paths = ?12,
+            error_count = ?13, error_summary_json = ?14, finished_event_id = ?15
+         WHERE scan_id = ?1",
+        params![
+            value.scan_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            sql_integer(value.observations_count, "observations_count", record)?,
+            value.observations_digest,
+            sql_integer(
+                value.missing_candidate_count,
+                "missing_candidate_count",
+                record
+            )?,
+            value.missing_candidate_digest,
+            sql_integer(value.files_seen, "files_seen", record)?,
+            sql_integer(value.bytes_seen, "bytes_seen", record)?,
+            sql_integer(value.new_paths, "new_paths", record)?,
+            sql_integer(value.changed_paths, "changed_paths", record)?,
+            i64::try_from(missing_paths).unwrap_or(i64::MAX),
+            sql_integer(value.unchanged_paths, "unchanged_paths", record)?,
+            sql_integer(value.error_count, "error_count", record)?,
+            error_summary,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_incomplete_scan(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+    value: &ScanCompletedPayload,
+    status: &str,
+    error_count: u64,
+    error_summary: &Value,
+) -> std::result::Result<(), BatchError> {
+    let error_summary = serde_json::to_string(error_summary)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    transaction.execute(
+        "UPDATE scan_runs SET
+            status = ?2, finished_time_utc_ms = ?3,
+            observations_count = 0, observations_digest = NULL,
+            missing_candidate_count = 0, missing_candidate_digest = NULL,
+            files_seen = ?4, bytes_seen = ?5, new_paths = ?6,
+            changed_paths = ?7, missing_paths = 0, unchanged_paths = ?8,
+            error_count = ?9, error_summary_json = ?10, finished_event_id = ?11
+         WHERE scan_id = ?1",
+        params![
+            value.scan_id,
+            status,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            sql_integer(value.files_seen, "files_seen", record)?,
+            sql_integer(value.bytes_seen, "bytes_seen", record)?,
+            sql_integer(value.new_paths, "new_paths", record)?,
+            sql_integer(value.changed_paths, "changed_paths", record)?,
+            sql_integer(value.unchanged_paths, "unchanged_paths", record)?,
+            sql_integer(error_count, "error_count", record)?,
+            error_summary,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn digest_option(digest: &str, count: u64) -> Option<&str> {
+    (count != 0).then_some(digest)
+}
+
+fn scan_completion_manifest(
+    connection: &Connection,
+    scan_id: &str,
+) -> std::result::Result<ScanCompletionManifest, BatchError> {
+    let (location_id, collection_id, started_event_seq, exclusions_json): (
+        String,
+        String,
+        i64,
+        String,
+    ) = connection
+        .query_row(
+            "SELECT location_id, collection_id, started_event_seq, exclusions_json
+             FROM scan_runs WHERE scan_id = ?1 AND status = 'running'",
+            [scan_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            BatchError::Projection(ProjectionError::InvalidScan(format!(
+                "scan {scan_id} is not running"
+            )))
+        })?;
+
+    let mut candidate_count = 0_u64;
+    let mut missing_path_count = 0_u64;
+    let mut candidate_hasher = blake3::Hasher::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT m.candidate_event_hash, m.candidate_kind,
+                    CASE WHEN m.candidate_kind = 'path' THEN EXISTS (
+                        SELECT 1 FROM path_observations p
+                        JOIN events last_event ON last_event.event_id = p.last_seen_event_id
+                        WHERE p.file_ref_id = m.file_ref_id
+                          AND p.location_id = m.location_id
+                          AND p.observed_path_encoding = m.path_encoding
+                          AND p.observed_path_bytes = m.path_bytes
+                          AND m.candidate_event_seq > last_event.seq
+                    ) ELSE 0 END
+             FROM scan_missing_candidates m
+             WHERE m.scan_id = ?1 ORDER BY m.candidate_event_seq",
+        )?;
+        let rows = statement.query_map([scan_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (hash, kind, effective) = row?;
+            hash_piece(&mut candidate_hasher, hash.as_bytes());
+            candidate_count += 1;
+            if kind == "path" && effective {
+                missing_path_count += 1;
+            }
+        }
+    }
+
+    let mut observation_count = 0_u64;
+    let mut observation_hasher = blake3::Hasher::new();
+    {
+        let mut statement = connection.prepare(
+            "WITH covered(kind, target_id, path_encoding, path_bytes) AS (
+                SELECT 'path', p.file_ref_id, p.observed_path_encoding, p.observed_path_bytes
+                FROM path_observations p
+                JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                JOIN events first_event ON first_event.event_id = p.first_seen_event_id
+                JOIN events last_event ON last_event.event_id = p.last_seen_event_id
+                WHERE p.location_id = ?1 AND f.collection_id = ?2
+                  AND f.path_state = 'active' AND p.state = 'present'
+                  AND (first_event.seq <= ?3 OR json_extract(last_event.payload_json, '$.scan_id') = ?4)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM scan_missing_candidates m
+                    WHERE m.scan_id = ?4 AND m.candidate_kind = 'path'
+                      AND m.file_ref_id = p.file_ref_id AND m.location_id = p.location_id
+                      AND m.path_encoding = p.observed_path_encoding
+                      AND m.path_bytes = p.observed_path_bytes
+                      AND m.candidate_event_seq > last_event.seq
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM json_each(?5) x
+                    WHERE upper(hex(p.observed_path_bytes)) = json_extract(x.value, '$.hex')
+                       OR upper(hex(p.observed_path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+                  )
+                UNION ALL
+                SELECT DISTINCT 'copy', c.copy_claim_id, c.relative_path_encoding, c.relative_path_bytes
+                FROM copy_claims c
+                JOIN path_observations p
+                  ON p.location_id = c.location_id
+                 AND p.observed_path_encoding = c.relative_path_encoding
+                 AND p.observed_path_bytes = c.relative_path_bytes
+                JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                JOIN events first_event ON first_event.event_id = c.first_seen_event_id
+                JOIN events last_event ON last_event.event_id = c.last_seen_event_id
+                WHERE c.location_id = ?1 AND f.collection_id = ?2
+                  AND f.path_state = 'active' AND c.state IN ('present', 'corrupt', 'unknown')
+                  AND (first_event.seq <= ?3 OR json_extract(last_event.payload_json, '$.scan_id') = ?4)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM scan_missing_candidates m
+                    WHERE m.scan_id = ?4 AND m.candidate_kind = 'copy'
+                      AND m.copy_claim_id = c.copy_claim_id
+                      AND m.candidate_event_seq > c.state_event_seq
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM json_each(?5) x
+                    WHERE upper(hex(c.relative_path_bytes)) = json_extract(x.value, '$.hex')
+                       OR upper(hex(c.relative_path_bytes)) LIKE json_extract(x.value, '$.hex') || '2F%'
+                  )
+             )
+             SELECT kind, target_id, path_encoding, path_bytes FROM covered
+             ORDER BY path_encoding, path_bytes, kind, target_id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                location_id,
+                collection_id,
+                started_event_seq,
+                scan_id,
+                exclusions_json
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (kind, target_id, encoding, path) = row?;
+            hash_piece(&mut observation_hasher, kind.as_bytes());
+            hash_piece(&mut observation_hasher, target_id.as_bytes());
+            hash_piece(&mut observation_hasher, encoding.as_bytes());
+            hash_piece(&mut observation_hasher, &path);
+            observation_count += 1;
+        }
+    }
+    Ok(ScanCompletionManifest {
+        observations_count: observation_count,
+        observations_digest: observation_hasher.finalize().to_hex().to_string(),
+        missing_candidate_count: candidate_count,
+        missing_candidate_digest: candidate_hasher.finalize().to_hex().to_string(),
+        missing_path_count,
+    })
+}
+
+fn hash_piece(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }
 
 fn project_annex_import_started(

@@ -4,6 +4,7 @@ pub mod annex;
 pub mod discovery;
 pub mod event_store;
 pub mod projection;
+pub mod scan;
 
 pub use annex::{
     AnnexImportConfig, AnnexImportError, AnnexImportResult, AnnexImportStatus, AnnexImporter,
@@ -11,7 +12,7 @@ pub use annex::{
 };
 pub use discovery::{
     DiscoveredFile, DiscoveryError, DiscoveryItem, DiscoveryStats, EncodedPath, FileDiscovery,
-    PathEncoding,
+    NamespaceFingerprint, PathEncoding,
 };
 pub use event_store::{
     AppendStats, Checkpoint, CheckpointSegment, EventBatch, EventCursor, EventEnvelope,
@@ -19,6 +20,7 @@ pub use event_store::{
     EventStoreError, PositionedEvent, SegmentManifest, VerificationReport, VerifiedSegment,
 };
 pub use projection::{
-    ApplyStats, ProjectionConfig, ProjectionDb, ProjectionError, ProjectionStatus,
-    SUPPORTED_EVENT_TYPES,
+    ApplyStats, LocationFreshness, ProjectionConfig, ProjectionDb, ProjectionError,
+    ProjectionStatus, SUPPORTED_EVENT_TYPES,
 };
+pub use scan::{LocationScanner, ScanConfig, ScanError, ScanResult, ScanStatus, ScanSummary};

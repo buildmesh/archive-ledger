@@ -84,7 +84,11 @@ fn discovery_projection_checkpoint_and_rebuild_scale_gate() {
                 }
                 DiscoveryItem::Symlink(_)
                 | DiscoveryItem::Special(_)
+                | DiscoveryItem::Excluded(_)
                 | DiscoveryItem::FilesystemBoundary(_) => {}
+                DiscoveryItem::ConcurrentChange(path) => {
+                    panic!("fixture changed during discovery at {path:?}")
+                }
             }
         }
         (!batch.is_empty()).then_some(batch)

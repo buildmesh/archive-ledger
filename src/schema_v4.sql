@@ -337,6 +337,8 @@ CREATE TABLE scan_missing_candidates (
 CREATE INDEX scan_candidates_scan_seq ON scan_missing_candidates(scan_id, candidate_event_seq);
 CREATE INDEX scan_candidates_file_ref ON scan_missing_candidates(file_ref_id) WHERE file_ref_id IS NOT NULL;
 CREATE INDEX scan_candidates_copy_claim ON scan_missing_candidates(copy_claim_id) WHERE copy_claim_id IS NOT NULL;
+CREATE INDEX scan_candidates_scan_file ON scan_missing_candidates(scan_id, candidate_kind, file_ref_id) WHERE file_ref_id IS NOT NULL;
+CREATE INDEX scan_candidates_scan_copy ON scan_missing_candidates(scan_id, candidate_kind, copy_claim_id) WHERE copy_claim_id IS NOT NULL;
 
 CREATE TABLE risk_domains (
     risk_domain_id TEXT PRIMARY KEY,
@@ -393,6 +395,7 @@ CREATE INDEX job_items_object ON job_items(object_id) WHERE object_id IS NOT NUL
 CREATE INDEX job_items_file_ref ON job_items(file_ref_id) WHERE file_ref_id IS NOT NULL;
 CREATE INDEX job_items_copy_claim ON job_items(copy_claim_id) WHERE copy_claim_id IS NOT NULL;
 CREATE INDEX job_items_location ON job_items(location_id) WHERE location_id IS NOT NULL;
+CREATE INDEX job_items_scan_path ON job_items(job_id, item_type, path_encoding, path_bytes) WHERE item_type = 'scan_seen';
 
 CREATE TABLE operation_outcomes (
     operation_key TEXT PRIMARY KEY,
