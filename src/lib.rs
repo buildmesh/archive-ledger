@@ -1,9 +1,14 @@
 //! Core library for Archive Ledger.
 
+pub mod annex;
 pub mod discovery;
 pub mod event_store;
 pub mod projection;
 
+pub use annex::{
+    AnnexImportConfig, AnnexImportError, AnnexImportResult, AnnexImportStatus, AnnexImporter,
+    AnnexSummary,
+};
 pub use discovery::{
     DiscoveredFile, DiscoveryError, DiscoveryItem, DiscoveryStats, EncodedPath, FileDiscovery,
     PathEncoding,

@@ -2,8 +2,10 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -62,6 +64,9 @@ pub enum ProjectionError {
     #[error("SQLite projection cursor is invalid: {0}")]
     InvalidCursor(String),
 
+    #[error("invalid annex import topology: {0}")]
+    InvalidAnnexTopology(String),
+
     #[error("rebuilt database failed integrity_check: {0}")]
     IntegrityCheck(String),
 }
@@ -78,6 +83,7 @@ impl ProjectionError {
             Self::InvalidPayload { .. } => "invalid_event_payload",
             Self::DuplicateOperationKey { .. } => "duplicate_operation_key",
             Self::InvalidCursor(_) => "invalid_projection_cursor",
+            Self::InvalidAnnexTopology(_) => "invalid_annex_topology",
             Self::IntegrityCheck(_) => "sqlite_integrity_failure",
         }
     }
@@ -279,6 +285,166 @@ impl ProjectionDb {
         let status = read_status(&connection).map_err(|source| sqlite_error(&self.path, source))?;
         validate_status(&connection, &status, &self.path)?;
         Ok(status)
+    }
+
+    pub fn has_operation_key(&self, operation_key: &str) -> Result<bool> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_outcomes WHERE operation_key = ?1)",
+                [operation_key],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub fn validate_annex_topology(
+        &self,
+        collection_id: &str,
+        worktree_location_id: &str,
+        cas_location_id: &str,
+        device_id: &str,
+        archive_root_id: &str,
+    ) -> Result<()> {
+        let connection = self.open_connection()?;
+        let collection_ok: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM collections
+                    WHERE collection_id = ?1 AND status = 'active'
+                 )",
+                [collection_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if !collection_ok {
+            return Err(ProjectionError::InvalidAnnexTopology(format!(
+                "annex collection {collection_id} is not active"
+            )));
+        }
+        for (kind, location_id) in [("worktree", worktree_location_id), ("CAS", cas_location_id)] {
+            let valid: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM locations l
+                        JOIN archive_roots r ON r.archive_root_id = l.archive_root_id
+                        JOIN devices d ON d.device_id = l.device_id
+                        WHERE l.location_id = ?1
+                          AND l.kind = 'filesystem'
+                          AND l.status = 'active'
+                          AND r.status = 'active'
+                          AND d.status = 'active'
+                          AND l.device_id = ?2
+                          AND r.device_id = ?2
+                          AND l.archive_root_id = ?3
+                    )",
+                    params![location_id, device_id, archive_root_id],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            if !valid {
+                return Err(ProjectionError::InvalidAnnexTopology(format!(
+                    "annex {kind} location {location_id} does not match active root {archive_root_id} and device {device_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn external_identity_id(
+        &self,
+        namespace: &str,
+        external_key: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT external_identity_id FROM external_identities
+                 WHERE namespace = ?1 AND external_key = ?2",
+                params![namespace, external_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn annex_remote_location(
+        &self,
+        source_annex_uuid: &str,
+        remote_annex_uuid: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT location_id FROM annex_remotes
+                 WHERE source_annex_uuid = ?1 AND remote_annex_uuid = ?2",
+                params![source_annex_uuid, remote_annex_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|row| row.flatten())
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn annex_inventory_counts(
+        &self,
+        collection_id: &str,
+        source_repo_id: &str,
+    ) -> Result<(u64, u64)> {
+        let connection = self.open_connection()?;
+        let duplicate_paths: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(path_count - 1), 0)
+                 FROM (
+                    SELECT COUNT(*) AS path_count
+                    FROM file_refs
+                    WHERE collection_id = ?1 AND path_state = 'active'
+                      AND external_identity_id IS NOT NULL
+                    GROUP BY external_identity_id
+                    HAVING COUNT(*) > 1
+                 )",
+                [collection_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let availability_facts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM external_availability a
+                 WHERE a.source_repo_id = ?2
+                   AND EXISTS (
+                       SELECT 1 FROM file_refs f
+                       WHERE f.collection_id = ?1
+                         AND f.external_identity_id = a.external_identity_id
+                   )",
+                params![collection_id, source_repo_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok((
+            u64::try_from(duplicate_paths).unwrap_or(0),
+            u64::try_from(availability_facts).unwrap_or(0),
+        ))
+    }
+
+    pub(crate) fn annex_import_source_fingerprint(
+        &self,
+        import_id: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT json_extract(e.payload_json, '$.source_fingerprint')
+                 FROM annex_imports i
+                 JOIN events e ON e.event_id = i.started_event_id
+                 WHERE i.import_id = ?1",
+                [import_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|row| row.flatten())
+            .map_err(|source| sqlite_error(&self.path, source))
     }
 
     pub fn apply(&self, event_store: &EventStore) -> Result<ApplyStats> {
@@ -615,7 +781,6 @@ fn nonempty_meta(connection: &Connection, key: &str) -> rusqlite::Result<Option<
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct OperationOutcomePayload {
     operation_key: String,
     job_type: String,
@@ -630,6 +795,171 @@ struct CheckpointCreatedPayload {
     checkpoint_id: String,
     checkpoint_path: String,
     event_last_seq: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LosslessPathPayload {
+    encoding: String,
+    text: Option<String>,
+    base64: Option<String>,
+    display: String,
+}
+
+impl LosslessPathPayload {
+    fn bytes(&self, record: &EventRecord) -> std::result::Result<Vec<u8>, BatchError> {
+        match self.encoding.as_str() {
+            "utf8" => self
+                .text
+                .as_ref()
+                .map(|text| text.as_bytes().to_vec())
+                .ok_or_else(|| invalid_payload(record, "UTF-8 path lacks text")),
+            "unix_bytes" | "windows_utf16le" => self
+                .base64
+                .as_ref()
+                .ok_or_else(|| invalid_payload(record, "binary path lacks base64"))
+                .and_then(|value| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .map_err(|error| {
+                            invalid_payload(record, &format!("invalid path base64: {error}"))
+                        })
+                }),
+            _ => Err(invalid_payload(record, "unknown path encoding")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalIdentityObservedPayload {
+    external_identity_id: String,
+    namespace: String,
+    external_key: String,
+    expected_hash_algo: Option<String>,
+    expected_hash_hex: Option<String>,
+    expected_size_bytes: Option<u64>,
+    resolution_state: String,
+    source_detail_json: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalIdentityResolvedPayload {
+    external_identity_id: String,
+    object_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectObservedPayload {
+    object_id: String,
+    canonical_hash_algo: String,
+    canonical_hash_hex: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectHashAddedPayload {
+    object_id: String,
+    hash_algo: String,
+    hash_hex: String,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileRefObservedPayload {
+    file_ref_id: String,
+    collection_id: String,
+    logical_path: LosslessPathPayload,
+    object_id: Option<String>,
+    external_identity_id: Option<String>,
+    identity_state: String,
+    path_state: String,
+    observed_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PathObservedPayload {
+    file_ref_id: String,
+    location_id: String,
+    observed_path: LosslessPathPayload,
+    representation: String,
+    object_id: Option<String>,
+    external_identity_id: Option<String>,
+    state: String,
+    observed_size_bytes: Option<u64>,
+    modified_time_utc_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailabilityObservedPayload {
+    external_identity_id: String,
+    source_repo_id: String,
+    source_remote_id: String,
+    state: String,
+    location_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnexRemoteMappedPayload {
+    source_annex_uuid: String,
+    remote_annex_uuid: String,
+    display_name: Option<String>,
+    location_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnexRemoteUnmappedPayload {
+    source_annex_uuid: String,
+    remote_annex_uuid: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopyObservedPayload {
+    copy_claim_id: String,
+    location_id: String,
+    relative_path: LosslessPathPayload,
+    object_id: Option<String>,
+    external_identity_id: Option<String>,
+    claim_basis: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopyVerifiedPayload {
+    verification_id: String,
+    copy_claim_id: String,
+    object_id: Option<String>,
+    location_id: String,
+    result: String,
+    expected_hash_algo: Option<String>,
+    expected_hash_hex: Option<String>,
+    observed_hash_hex: Option<String>,
+    size_bytes: Option<u64>,
+    bytes_read: Option<u64>,
+    duration_ms: Option<u64>,
+    path_observed: LosslessPathPayload,
+    device_fingerprint_status: String,
+    error_code: Option<String>,
+    error_detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnexImportStartedPayload {
+    import_id: String,
+    repo_path: LosslessPathPayload,
+    collection_id: String,
+    worktree_location_id: String,
+    cas_location_id: String,
+    device_id: String,
+    archive_root_id: String,
+    annex_uuid: Option<String>,
+    git_head_commit: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnexImportCompletedPayload {
+    import_id: String,
+    status: String,
+    summary: Value,
 }
 
 enum BatchError {
@@ -703,6 +1033,7 @@ fn apply_batch(
         ])?;
 
         project_operation_outcome(transaction, record)?;
+        project_semantic_event(transaction, record)?;
         if record.envelope.event_type == "checkpoint_created" {
             project_checkpoint_created(transaction, record)?;
         }
@@ -734,6 +1065,512 @@ fn apply_batch(
         }
     }
     Ok(())
+}
+
+fn project_semantic_event(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    match record.envelope.event_type.as_str() {
+        "external_identity_observed" => project_external_identity_observed(transaction, record),
+        "external_identity_resolved" => project_external_identity_resolved(transaction, record),
+        "external_availability_observed" => project_external_availability(transaction, record),
+        "annex_remote_mapped" => project_annex_remote_mapped(transaction, record),
+        "annex_remote_unmapped" => project_annex_remote_unmapped(transaction, record),
+        "object_observed" => project_object_observed(transaction, record),
+        "object_hash_added" => project_object_hash(transaction, record),
+        "file_ref_observed" | "file_ref_updated" => project_file_ref(transaction, record),
+        "path_observed" => project_path_observation(transaction, record),
+        "copy_observed" => project_copy_claim(transaction, record),
+        "copy_verified" => project_copy_verification(transaction, record),
+        "annex_import_started" => project_annex_import_started(transaction, record),
+        "annex_import_completed" => project_annex_import_completed(transaction, record),
+        _ => Ok(()),
+    }
+}
+
+fn project_annex_remote_mapped(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: AnnexRemoteMappedPayload = payload(record)?;
+    transaction.execute(
+        "INSERT INTO annex_remotes(
+            source_annex_uuid, remote_annex_uuid, display_name, location_id,
+            last_observed_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(source_annex_uuid, remote_annex_uuid) DO UPDATE SET
+            display_name = excluded.display_name,
+            location_id = excluded.location_id,
+            last_observed_event_id = excluded.last_observed_event_id",
+        params![
+            value.source_annex_uuid,
+            value.remote_annex_uuid,
+            value.display_name,
+            value.location_id,
+            record.envelope.event_id,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE external_availability
+         SET location_id = ?3
+         WHERE source_repo_id = ?1 AND source_remote_id = ?2",
+        params![
+            value.source_annex_uuid,
+            value.remote_annex_uuid,
+            value.location_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_annex_remote_unmapped(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: AnnexRemoteUnmappedPayload = payload(record)?;
+    transaction.execute(
+        "INSERT INTO annex_remotes(
+            source_annex_uuid, remote_annex_uuid, display_name, location_id,
+            last_observed_event_id
+         ) VALUES (?1, ?2, ?3, NULL, ?4)
+         ON CONFLICT(source_annex_uuid, remote_annex_uuid) DO UPDATE SET
+            display_name = COALESCE(excluded.display_name, annex_remotes.display_name),
+            location_id = NULL,
+            last_observed_event_id = excluded.last_observed_event_id",
+        params![
+            value.source_annex_uuid,
+            value.remote_annex_uuid,
+            value.display_name,
+            record.envelope.event_id,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE external_availability
+         SET location_id = NULL
+         WHERE source_repo_id = ?1 AND source_remote_id = ?2",
+        params![value.source_annex_uuid, value.remote_annex_uuid],
+    )?;
+    Ok(())
+}
+
+fn payload<T: serde::de::DeserializeOwned>(
+    record: &EventRecord,
+) -> std::result::Result<T, BatchError> {
+    serde_json::from_value(record.envelope.payload.clone())
+        .map_err(|source| invalid_payload(record, &source.to_string()))
+}
+
+fn invalid_payload(record: &EventRecord, message: &str) -> BatchError {
+    BatchError::Projection(ProjectionError::InvalidPayload {
+        event_type: record.envelope.event_type.clone(),
+        seq: record.envelope.seq,
+        message: message.to_owned(),
+    })
+}
+
+fn project_external_identity_observed(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ExternalIdentityObservedPayload = payload(record)?;
+    let detail = serde_json::to_string(&value.source_detail_json)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    transaction.execute(
+        "INSERT INTO external_identities(
+            external_identity_id, namespace, external_key, expected_hash_algo,
+            expected_hash_hex, expected_size_bytes, resolution_state,
+            source_detail_json, first_seen_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(external_identity_id) DO UPDATE SET
+            expected_hash_algo = COALESCE(excluded.expected_hash_algo, expected_hash_algo),
+            expected_hash_hex = COALESCE(excluded.expected_hash_hex, expected_hash_hex),
+            expected_size_bytes = COALESCE(excluded.expected_size_bytes, expected_size_bytes),
+            source_detail_json = excluded.source_detail_json,
+            resolution_state = CASE
+                WHEN external_identities.resolution_state IN ('resolved', 'conflict')
+                    THEN external_identities.resolution_state
+                ELSE excluded.resolution_state
+            END",
+        params![
+            value.external_identity_id,
+            value.namespace,
+            value.external_key,
+            value.expected_hash_algo,
+            value.expected_hash_hex,
+            optional_sql_integer(value.expected_size_bytes, "expected_size_bytes", record)?,
+            value.resolution_state,
+            detail,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_external_identity_resolved(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ExternalIdentityResolvedPayload = payload(record)?;
+    let changed = transaction.execute(
+        "UPDATE external_identities
+         SET object_id = ?2, resolution_state = 'resolved', resolved_event_id = ?3
+         WHERE external_identity_id = ?1
+           AND (object_id IS NULL OR object_id = ?2)",
+        params![
+            value.external_identity_id,
+            value.object_id,
+            record.envelope.event_id
+        ],
+    )?;
+    if changed != 1 {
+        return Err(invalid_payload(
+            record,
+            "external identity is missing or resolves to conflicting content",
+        ));
+    }
+    Ok(())
+}
+
+fn project_external_availability(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: AvailabilityObservedPayload = payload(record)?;
+    transaction.execute(
+        "INSERT INTO external_availability(
+            external_identity_id, source_repo_id, source_remote_id, state,
+            location_id, observed_time_utc_ms, observed_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(external_identity_id, source_repo_id, source_remote_id) DO UPDATE SET
+            state = excluded.state,
+            location_id = excluded.location_id,
+            observed_time_utc_ms = excluded.observed_time_utc_ms,
+            observed_event_id = excluded.observed_event_id",
+        params![
+            value.external_identity_id,
+            value.source_repo_id,
+            value.source_remote_id,
+            value.state,
+            value.location_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_object_observed(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ObjectObservedPayload = payload(record)?;
+    transaction.execute(
+        "INSERT INTO objects(
+            object_id, canonical_hash_algo, canonical_hash_hex, size_bytes,
+            first_seen_event_id, first_seen_time_utc_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(object_id) DO NOTHING",
+        params![
+            value.object_id,
+            value.canonical_hash_algo,
+            value.canonical_hash_hex,
+            sql_integer(value.size_bytes, "size_bytes", record)?,
+            record.envelope.event_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+        ],
+    )?;
+    let consistent: bool = transaction.query_row(
+        "SELECT canonical_hash_algo = ?2 AND canonical_hash_hex = ?3 AND size_bytes = ?4
+         FROM objects WHERE object_id = ?1",
+        params![
+            value.object_id,
+            value.canonical_hash_algo,
+            value.canonical_hash_hex,
+            sql_integer(value.size_bytes, "size_bytes", record)?,
+        ],
+        |row| row.get(0),
+    )?;
+    if !consistent {
+        return Err(invalid_payload(
+            record,
+            "object identity conflicts with prior state",
+        ));
+    }
+    Ok(())
+}
+
+fn project_object_hash(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ObjectHashAddedPayload = payload(record)?;
+    transaction.execute(
+        "INSERT INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(object_id, hash_algo, hash_hex) DO UPDATE SET
+            verified_event_id = excluded.verified_event_id",
+        params![
+            value.object_id,
+            value.hash_algo,
+            value.hash_hex,
+            value.source,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_file_ref(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: FileRefObservedPayload = payload(record)?;
+    let path_bytes = value.logical_path.bytes(record)?;
+    transaction.execute(
+        "INSERT INTO file_refs(
+            file_ref_id, collection_id, logical_path_bytes, logical_path_encoding,
+            logical_path_display, object_id, external_identity_id, identity_state,
+            path_state, observed_size_bytes, first_seen_event_id, last_seen_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+         ON CONFLICT(file_ref_id) DO UPDATE SET
+            object_id = excluded.object_id,
+            external_identity_id = excluded.external_identity_id,
+            identity_state = excluded.identity_state,
+            path_state = excluded.path_state,
+            observed_size_bytes = excluded.observed_size_bytes,
+            last_seen_event_id = excluded.last_seen_event_id",
+        params![
+            value.file_ref_id,
+            value.collection_id,
+            path_bytes,
+            value.logical_path.encoding,
+            value.logical_path.display,
+            value.object_id,
+            value.external_identity_id,
+            value.identity_state,
+            value.path_state,
+            optional_sql_integer(value.observed_size_bytes, "observed_size_bytes", record)?,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_path_observation(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: PathObservedPayload = payload(record)?;
+    let path_bytes = value.observed_path.bytes(record)?;
+    transaction.execute(
+        "INSERT INTO path_observations(
+            file_ref_id, location_id, observed_path_bytes, observed_path_encoding,
+            observed_path_display, representation, object_id, external_identity_id,
+            state, first_seen_event_id, last_seen_event_id, last_seen_time_utc_ms,
+            observed_size_bytes, modified_time_utc_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13)
+         ON CONFLICT(file_ref_id, location_id, observed_path_encoding, observed_path_bytes)
+         DO UPDATE SET
+            representation = excluded.representation,
+            object_id = excluded.object_id,
+            external_identity_id = excluded.external_identity_id,
+            state = excluded.state,
+            last_seen_event_id = excluded.last_seen_event_id,
+            last_seen_time_utc_ms = excluded.last_seen_time_utc_ms,
+            observed_size_bytes = excluded.observed_size_bytes,
+            modified_time_utc_ms = excluded.modified_time_utc_ms",
+        params![
+            value.file_ref_id,
+            value.location_id,
+            path_bytes,
+            value.observed_path.encoding,
+            value.observed_path.display,
+            value.representation,
+            value.object_id,
+            value.external_identity_id,
+            value.state,
+            record.envelope.event_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            optional_sql_integer(value.observed_size_bytes, "observed_size_bytes", record)?,
+            optional_sql_integer(value.modified_time_utc_ms, "modified_time_utc_ms", record)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_copy_claim(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: CopyObservedPayload = payload(record)?;
+    let path_bytes = value.relative_path.bytes(record)?;
+    transaction.execute(
+        "INSERT INTO copy_claims(
+            copy_claim_id, location_id, relative_path_bytes, relative_path_encoding,
+            relative_path_display, object_id, external_identity_id, claim_basis,
+            state, state_event_seq, first_seen_event_id, last_seen_event_id,
+            last_seen_time_utc_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
+         ON CONFLICT(copy_claim_id) DO UPDATE SET
+            object_id = excluded.object_id,
+            external_identity_id = excluded.external_identity_id,
+            claim_basis = excluded.claim_basis,
+            state = excluded.state,
+            state_event_seq = excluded.state_event_seq,
+            last_seen_event_id = excluded.last_seen_event_id,
+            last_seen_time_utc_ms = excluded.last_seen_time_utc_ms",
+        params![
+            value.copy_claim_id,
+            value.location_id,
+            path_bytes,
+            value.relative_path.encoding,
+            value.relative_path.display,
+            value.object_id,
+            value.external_identity_id,
+            value.claim_basis,
+            value.state,
+            sql_integer(record.envelope.seq, "seq", record)?,
+            record.envelope.event_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_copy_verification(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: CopyVerifiedPayload = payload(record)?;
+    let path_bytes = value.path_observed.bytes(record)?;
+    transaction.execute(
+        "INSERT INTO verification_results(
+            verification_id, event_id, job_id, copy_claim_id, object_id, location_id,
+            result, expected_hash_algo, expected_hash_hex, observed_hash_hex,
+            size_bytes, bytes_read, duration_ms, verified_time_utc_ms,
+            path_observed_bytes, path_observed_encoding, path_observed_display,
+            device_fingerprint_status, error_code, error_detail
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                   ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        params![
+            value.verification_id,
+            record.envelope.event_id,
+            record.envelope.job_id,
+            value.copy_claim_id,
+            value.object_id,
+            value.location_id,
+            value.result,
+            value.expected_hash_algo,
+            value.expected_hash_hex,
+            value.observed_hash_hex,
+            optional_sql_integer(value.size_bytes, "size_bytes", record)?,
+            optional_sql_integer(value.bytes_read, "bytes_read", record)?,
+            optional_sql_integer(value.duration_ms, "duration_ms", record)?,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            path_bytes,
+            value.path_observed.encoding,
+            value.path_observed.display,
+            value.device_fingerprint_status,
+            value.error_code,
+            value.error_detail,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE copy_claims SET
+            state = CASE
+                WHEN ?2 = 'ok' THEN 'present'
+                WHEN ?2 = 'hash_mismatch' THEN 'corrupt'
+                ELSE 'unknown'
+            END,
+            state_event_seq = ?3,
+            last_verified_event_id = ?4,
+            last_verified_time_utc_ms = ?5,
+            last_verification_result = ?2,
+            last_error_code = ?6,
+            last_error_detail = ?7
+         WHERE copy_claim_id = ?1",
+        params![
+            value.copy_claim_id,
+            value.result,
+            sql_integer(record.envelope.seq, "seq", record)?,
+            record.envelope.event_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            value.error_code,
+            value.error_detail,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_annex_import_started(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: AnnexImportStartedPayload = payload(record)?;
+    let repo_path = value.repo_path.bytes(record)?;
+    transaction.execute(
+        "INSERT INTO annex_imports(
+            import_id, job_id, repo_path_bytes, repo_path_encoding, repo_path_display,
+            collection_id, worktree_location_id, cas_location_id, device_id,
+            archive_root_id, annex_uuid, git_head_commit, status, summary_json,
+            started_event_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                   'running', '{}', ?13)",
+        params![
+            value.import_id,
+            record.envelope.job_id,
+            repo_path,
+            value.repo_path.encoding,
+            value.repo_path.display,
+            value.collection_id,
+            value.worktree_location_id,
+            value.cas_location_id,
+            value.device_id,
+            value.archive_root_id,
+            value.annex_uuid,
+            value.git_head_commit,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_annex_import_completed(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: AnnexImportCompletedPayload = payload(record)?;
+    let summary = serde_json::to_string(&value.summary)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    let changed = transaction.execute(
+        "UPDATE annex_imports
+         SET status = ?2, summary_json = ?3, completed_event_id = ?4
+         WHERE import_id = ?1",
+        params![
+            value.import_id,
+            value.status,
+            summary,
+            record.envelope.event_id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(invalid_payload(
+            record,
+            "annex import completion has no start",
+        ));
+    }
+    Ok(())
+}
+
+fn optional_sql_integer(
+    value: Option<u64>,
+    field: &str,
+    record: &EventRecord,
+) -> std::result::Result<Option<i64>, BatchError> {
+    value
+        .map(|value| sql_integer(value, field, record))
+        .transpose()
 }
 
 fn project_operation_outcome(
@@ -1002,7 +1839,7 @@ mod tests {
         store
             .append_batch(vec![
                 EventRequest::new(
-                    "file_ref_observed",
+                    "job_started",
                     json!({
                         "operation_key": "op_same",
                         "job_type": "import",
@@ -1012,7 +1849,7 @@ mod tests {
                     }),
                 ),
                 EventRequest::new(
-                    "file_ref_observed",
+                    "job_started",
                     json!({
                         "operation_key": "op_same",
                         "job_type": "import",

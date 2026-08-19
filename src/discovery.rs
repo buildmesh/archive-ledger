@@ -255,7 +255,7 @@ impl Iterator for FileDiscovery {
     }
 }
 
-fn modified_time_ms(metadata: &Metadata) -> Option<u64> {
+pub(crate) fn modified_time_ms(metadata: &Metadata) -> Option<u64> {
     metadata
         .modified()
         .ok()?
@@ -277,7 +277,7 @@ fn filesystem_device(_metadata: &Metadata) -> Result<u64> {
 }
 
 #[cfg(unix)]
-fn encode_relative_path(path: &Path) -> EncodedPath {
+pub(crate) fn encode_relative_path(path: &Path) -> EncodedPath {
     let bytes = path.as_os_str().as_bytes().to_vec();
     if let Some(text) = path.to_str() {
         EncodedPath {
@@ -295,7 +295,7 @@ fn encode_relative_path(path: &Path) -> EncodedPath {
 }
 
 #[cfg(windows)]
-fn encode_relative_path(path: &Path) -> EncodedPath {
+pub(crate) fn encode_relative_path(path: &Path) -> EncodedPath {
     if let Some(text) = path.to_str() {
         return EncodedPath {
             encoding: PathEncoding::Utf8,
@@ -315,7 +315,7 @@ fn encode_relative_path(path: &Path) -> EncodedPath {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn encode_relative_path(path: &Path) -> EncodedPath {
+pub(crate) fn encode_relative_path(path: &Path) -> EncodedPath {
     let display = path.to_string_lossy().into_owned();
     EncodedPath {
         encoding: PathEncoding::Utf8,
