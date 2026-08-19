@@ -1933,6 +1933,22 @@ mod tests {
         assert_eq!(count("SELECT count(*) FROM verification_results"), 6);
         assert_eq!(
             count(
+                "SELECT count(*) FROM verification_results
+                 WHERE result = 'ok' AND expected_hash_algo = 'sha256'
+                   AND expected_hash_hex = observed_hash_hex"
+            ),
+            4
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM copy_claims
+                 WHERE state = 'present' AND last_verification_result = 'ok'
+                   AND last_verified_time_utc_ms IS NOT NULL"
+            ),
+            3
+        );
+        assert_eq!(
+            count(
                 "SELECT count(*) FROM external_identities WHERE resolution_state = 'unsupported'"
             ),
             1
@@ -1963,7 +1979,21 @@ mod tests {
             1
         );
         assert_eq!(
+            count(
+                "SELECT count(*) FROM copy_claims
+                 WHERE state = 'corrupt' AND last_verification_result = 'hash_mismatch'"
+            ),
+            1
+        );
+        assert_eq!(
             count("SELECT count(*) FROM verification_results WHERE result = 'read_error'"),
+            1
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM copy_claims
+                 WHERE state = 'unknown' AND last_verification_result = 'read_error'"
+            ),
             1
         );
         drop(connection);

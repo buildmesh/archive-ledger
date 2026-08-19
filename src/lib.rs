@@ -3,6 +3,7 @@
 pub mod annex;
 pub mod discovery;
 pub mod event_store;
+pub mod policy;
 pub mod projection;
 pub mod scan;
 
@@ -18,6 +19,10 @@ pub use event_store::{
     AppendStats, Checkpoint, CheckpointSegment, EventBatch, EventCursor, EventEnvelope,
     EventReadStats, EventRecord, EventReferences, EventRequest, EventStore, EventStoreConfig,
     EventStoreError, PositionedEvent, SegmentManifest, VerificationReport, VerifiedSegment,
+};
+pub use policy::{
+    PolicyError, PolicyEvaluation, PolicyEvaluationResult, PolicyEvaluationValidity, PolicyFinding,
+    PolicyRequirements, UnconfiguredCollection,
 };
 pub use projection::{
     ApplyStats, LocationFreshness, ProjectionConfig, ProjectionDb, ProjectionError,
