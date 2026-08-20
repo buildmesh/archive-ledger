@@ -10,6 +10,102 @@ It inventories ordinary directories and git-annex repositories, verifies file co
 backup policy and disaster risks, and protects its own catalog history. It does **not** copy, move,
 delete, repair, or drop archive content.
 
+## Concepts and relationships
+
+An **archive** is the complete catalog managed by one Archive Ledger installation. It is not one
+directory or storage device: one archive can describe many collections spread across computers,
+removable disks, NAS devices, offline media, and storage services. The archive has one stable ID,
+one canonical event history, and a replaceable SQLite view used for interactive commands.
+
+The main relationships are:
+
+```text
+Archive
+├── Collection ──uses──> Policy
+│   ├── has a home Site
+│   └── contains File references ──refer to──> Objects or External identities
+│                            │                          │
+│                            └── Path observations      ├── External identity resolves to Object
+│                                      │               └── Copy claims
+│                                      └──────────────────at a Location
+├── Filesystem Location ──under──> Archive root ──on──> Device ──at──> Site
+├── Service Location ────────────────────────────────────────────────at──> Site
+├── Risk domains ──attach to──> Locations, roots, devices, or sites
+└── Canonical events ──materialize into──> SQLite database
+```
+
+### Content and file concepts
+
+- A **collection** is a logical group of files, such as “Family photos” or “Scanned documents.”
+  Each collection has its own logical path namespace, one home site, and one preservation policy.
+  The same storage location may contain files from more than one collection.
+- A **file** in CLI output means a **file reference**: a logical path within a collection, such as
+  `2025/trip/photo.jpg` in the “Family photos” collection. Renaming a file changes its logical
+  reference; it does not change the bytes themselves.
+- An **object** is one exact byte sequence identified by its BLAKE3 hash. Two logical files with
+  identical bytes can refer to the same object. Archive Ledger creates an object identity only
+  after it has successfully read the bytes.
+- An **external identity** is a source-system identifier known before bytes are readable, such as a
+  git-annex key. It lets a dropped annex file remain in the inventory, but it is not verified
+  protection until readable bytes resolve it to an object.
+- A **path observation** records that a logical file was seen at a particular path and location.
+  It describes names and representations, including supported git-annex representations.
+- A **copy claim** records the catalog's current evidence that content bytes exist at a path in a
+  location. It refers to an object, or initially to an external identity, and can be present,
+  missing, corrupt, unknown, or superseded. A source saying that a remote has an annex key is a
+  recovery lead, not automatically a verified copy claim.
+
+This separation is intentional: a filename answers “what does the user call this?”, an object hash
+answers “which bytes are these?”, and a copy claim answers “where does the catalog currently
+believe those bytes exist?”
+
+### Storage topology
+
+- A **site** is a place whose loss matters, such as a home, office, storage unit, or cloud region.
+- A **device** is a physical or virtual storage-bearing unit, such as an SSD, removable disk, or
+  NAS volume. Its identity should come from a filesystem UUID or another stable fingerprint, not
+  from a temporary mount path.
+- An **archive root** is a stable path on a device's filesystem beneath which Archive Ledger
+  locations are registered.
+- A **location** is the storage area where copy claims live. A filesystem location belongs to an
+  archive root and device; a device-less service location belongs directly to a site.
+
+For example, `/media/backup/photos` and `/media/backup/photos-copy` are two paths and may produce
+two copy claims, but if both are on the same disk they do not provide two-device protection. A copy
+on a second disk at another site can provide independent protection once its identity, observation,
+verification, and other policy requirements are current.
+
+### Protection and risk concepts
+
+- A **policy** defines what counts as adequate protection for a collection: required qualifying
+  copies, devices and sites, freshness limits, and optional offsite, offline, or encrypted-offsite
+  requirements. Trust and topology classification are also considered when a copy is evaluated.
+- A **qualifying copy** is a present copy claim with resolved byte identity, a successful recent
+  verification, current observation and device evidence, and active, sufficiently classified
+  topology. Visible but stale, unresolved, corrupt, or uncertain claims do not count as proven
+  protection.
+- A **risk domain** represents a shared failure that topology alone may not reveal, such as one
+  cloud account, chassis, power circuit, credential store, flood zone, or safe. Device, service,
+  and site loss are evaluated automatically; custom domains add shared dependencies.
+- A **scan** inventories one filesystem location for one collection. It discovers paths, hashes new
+  or changed files, and records coverage without modifying archive content. A git-annex **import**
+  performs the equivalent source-aware inventory from Git and annex metadata.
+- A **verification** re-reads a specific copy's bytes and compares them with the expected identity.
+  A mismatch affects that copy claim; it does not silently redefine the object.
+
+As a concrete example, the logical path `2025/trip/photo.jpg` in the “Family photos” collection may
+resolve to one BLAKE3 object and have two copy claims: one in a home SSD location and one in an
+offsite NAS location. The collection's policy determines whether those claims are sufficiently
+fresh and independent. Losing either device or site is then simulated against the remaining
+qualifying copy.
+
+### Catalog storage
+
+**Canonical events** are the durable, append-only history of observations and configuration
+changes. The **SQLite database** is their indexed materialized view and serves normal `status`,
+`file`, `copy`, and `report` commands without rescanning disks or replaying event files. SQLite can
+be rebuilt; the canonical event repository must be checkpointed and independently protected.
+
 ## Install
 
 Archive Ledger currently builds from source and requires Rust and Git. Git-annex is useful for
