@@ -200,6 +200,7 @@ pub(crate) struct ScanKnownEntry {
     pub size_bytes: Option<u64>,
     pub modified_time_utc_ms: Option<u64>,
     pub has_effective_missing_candidate: bool,
+    pub observed_by_current_scan: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1264,6 +1265,7 @@ impl ScanProjectionSession {
             .prepare_cached(
                 "SELECT p.file_ref_id, c.copy_claim_id, p.state, c.state,
                         p.observed_size_bytes, p.modified_time_utc_ms,
+                        COALESCE(json_extract(last_path_event.payload_json, '$.scan_id') = ?5, 0),
                         EXISTS(
                             SELECT 1 FROM scan_missing_candidates m
                             WHERE m.scan_id = ?5 AND m.location_id = p.location_id
@@ -1303,7 +1305,8 @@ impl ScanProjectionSession {
                             copy_state: row.get(3)?,
                             size_bytes: optional_u64(row.get(4)?)?,
                             modified_time_utc_ms: optional_u64(row.get(5)?)?,
-                            has_effective_missing_candidate: row.get(6)?,
+                            observed_by_current_scan: row.get(6)?,
+                            has_effective_missing_candidate: row.get(7)?,
                         })
                     },
                 )

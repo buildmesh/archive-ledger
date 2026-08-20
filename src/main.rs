@@ -1,20 +1,28 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use archive_ledger::{
-    utf8_path, ArchiveRootSnapshot, CachedPolicyStatus, CollectionSnapshot, CopyFilter,
-    CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot, EventRequest, EventStore,
-    EventStoreConfig, EventStoreError, FileFilter, FilePageRequest, LocationSnapshot,
-    MetadataDestinationSnapshot, MetadataError, MetadataProtector, MetadataRegistry, PolicyError,
-    PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter, PolicyFindingPage, PolicySnapshot,
-    ProjectionConfig, ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange,
-    RegistryError, RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, SiteSnapshot,
+    utf8_path, AnnexImportConfig, AnnexImportError, AnnexImportStatus, AnnexImporter,
+    ArchiveRootSnapshot, CachedPolicyStatus, CollectionSnapshot, CopyFilter, CopyPageRequest,
+    DeviceCheckIn, DeviceMount, DeviceSnapshot, EventReferences, EventRequest, EventStore,
+    EventStoreConfig, EventStoreError, FileFilter, FilePageRequest, LocationScanner,
+    LocationSnapshot, MetadataDestinationSnapshot, MetadataError, MetadataProtector,
+    MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter,
+    PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb,
+    ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError, RegistryPath,
+    ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError, ScanStatus,
+    SiteSnapshot,
 };
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 2;
@@ -52,6 +60,25 @@ enum Command {
         /// Stable archive ID; generated when omitted.
         #[arg(long)]
         archive_id: Option<String>,
+        /// Prompt for a starter single-machine topology when attached to a terminal.
+        #[arg(long, conflicts_with = "non_interactive")]
+        guided: bool,
+        /// Never prompt. Use --root-path to create the same starter topology.
+        #[arg(long)]
+        non_interactive: bool,
+        /// Create a starter site/device/root/location/collection/policy for this mounted path.
+        #[arg(long)]
+        root_path: Option<PathBuf>,
+        #[arg(long, default_value = "Home")]
+        site_name: String,
+        #[arg(long, default_value = "Primary disk")]
+        device_name: String,
+        #[arg(long, default_value = "Archive files")]
+        collection_name: String,
+        #[arg(long)]
+        fingerprint: Option<String>,
+        #[arg(long)]
+        fingerprint_kind: Option<String>,
     },
     /// Show fast cached preservation status from SQLite.
     Status,
@@ -69,6 +96,25 @@ enum Command {
     Copy {
         #[command(subcommand)]
         command: CopyCommand,
+    },
+    /// Inventory regular files without modifying them.
+    Scan(ScanArgs),
+    /// Verify the bytes behind current copy claims.
+    Verify(VerifyArgs),
+    /// Import source-specific inventories.
+    Import {
+        #[command(subcommand)]
+        command: ImportCommand,
+    },
+    /// Map git-annex remote UUIDs to registered storage locations.
+    AnnexRemote {
+        #[command(subcommand)]
+        command: AnnexRemoteCommand,
+    },
+    /// Inspect and resume local long-running work.
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
     },
     /// Manage sites through canonical full-snapshot events.
     Site {
@@ -130,10 +176,146 @@ enum Command {
         #[command(subcommand)]
         command: EventsCommand,
     },
+    /// Apply or rebuild the SQLite materialized view.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
     /// Check clean-machine restoration from a cloned event repository.
     Restore {
         #[command(subcommand)]
         command: RestoreCommand,
+    },
+}
+
+#[derive(Debug, Args, Clone)]
+struct ScanArgs {
+    /// Registered filesystem location to inventory.
+    location: String,
+    #[arg(long)]
+    collection: String,
+    /// Mounted path corresponding exactly to the registered location.
+    #[arg(long)]
+    path: PathBuf,
+    #[arg(long)]
+    device: String,
+    #[arg(long)]
+    root: String,
+    #[arg(long)]
+    logical_prefix: Option<PathBuf>,
+    #[arg(long = "exclude")]
+    exclusions: Vec<PathBuf>,
+    #[arg(long, default_value = "unavailable")]
+    fingerprint_status: String,
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    scan_id: Option<String>,
+    #[arg(long, default_value_t = 1_000)]
+    batch_entries: usize,
+    /// Stop cleanly after this many files; useful for testing resume.
+    #[arg(long, hide = true)]
+    max_items: Option<usize>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct VerifyArgs {
+    /// Registered filesystem location whose current copies should be checked.
+    location: String,
+    /// Mounted path corresponding exactly to the registered location.
+    #[arg(long)]
+    path: PathBuf,
+    /// Verify one claim instead of every current claim at the location.
+    #[arg(long)]
+    copy: Option<String>,
+    #[arg(long, default_value = "unavailable")]
+    fingerprint_status: String,
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long, default_value_t = 500)]
+    batch_entries: usize,
+    /// Stop cleanly after this many claims; useful for testing resume.
+    #[arg(long, hide = true)]
+    max_items: Option<usize>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ImportCommand {
+    /// Read a git-annex repository without changing it.
+    Annex(AnnexArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct AnnexArgs {
+    #[arg(default_value = ".")]
+    repository: PathBuf,
+    #[arg(long)]
+    collection: String,
+    #[arg(long)]
+    worktree_location: String,
+    #[arg(long)]
+    cas_location: String,
+    #[arg(long)]
+    device: String,
+    #[arg(long)]
+    root: String,
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    import_id: Option<String>,
+    #[arg(long, default_value_t = 1_000)]
+    batch_entries: usize,
+    /// Stop cleanly after this many index entries; useful for testing resume.
+    #[arg(long, hide = true)]
+    max_items: Option<usize>,
+}
+
+#[derive(Debug, Subcommand)]
+enum AnnexRemoteCommand {
+    List {
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    Map {
+        source_annex_uuid: String,
+        remote_annex_uuid: String,
+        location_id: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Unmap {
+        source_annex_uuid: String,
+        remote_annex_uuid: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommand {
+    List {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    Show {
+        job_id: String,
+    },
+    Resume {
+        job_id: String,
+        #[arg(long, hide = true)]
+        max_items: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DbCommand {
+    Apply,
+    Rebuild {
+        /// Rebuild to this path; defaults to safely replacing --database.
+        #[arg(long)]
+        target: Option<PathBuf>,
     },
 }
 
@@ -263,6 +445,8 @@ enum CopyCommand {
 
 #[derive(Debug, Subcommand)]
 enum RegistryEntityCommand {
+    /// Inspect a mounted path without registering or changing it.
+    Discover { path: PathBuf },
     /// List active registry entries.
     List {
         #[arg(long)]
@@ -448,6 +632,9 @@ enum AppError {
     Policy(PolicyError),
     Registry(RegistryError),
     Metadata(MetadataError),
+    Scan(ScanError),
+    Annex(AnnexImportError),
+    Io(std::io::Error),
     Json(serde_json::Error),
     Clock,
     Input(String),
@@ -462,6 +649,9 @@ impl AppError {
             Self::Policy(error) => error.code(),
             Self::Registry(error) => error.code(),
             Self::Metadata(error) => error.code(),
+            Self::Scan(error) => error.code(),
+            Self::Annex(error) => error.code(),
+            Self::Io(_) => "io_error",
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
             Self::Input(_) => "invalid_input",
@@ -478,6 +668,9 @@ impl std::fmt::Display for AppError {
             Self::Policy(error) => error.fmt(formatter),
             Self::Registry(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
+            Self::Scan(error) => error.fmt(formatter),
+            Self::Annex(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
             Self::Input(message) => formatter.write_str(message),
@@ -521,6 +714,24 @@ impl From<MetadataError> for AppError {
     }
 }
 
+impl From<ScanError> for AppError {
+    fn from(error: ScanError) -> Self {
+        Self::Scan(error)
+    }
+}
+
+impl From<AnnexImportError> for AppError {
+    fn from(error: AnnexImportError) -> Self {
+        Self::Annex(error)
+    }
+}
+
+impl From<std::io::Error> for AppError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 impl From<serde_json::Error> for AppError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
@@ -550,6 +761,49 @@ struct StatusOutput {
     version: u32,
     policy: CachedPolicyStatus,
     metadata: archive_ledger::MetadataProtectionStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalJob {
+    job_id: String,
+    job_type: String,
+    status: String,
+    created_time_utc_ms: u64,
+    started_time_utc_ms: Option<u64>,
+    finished_time_utc_ms: Option<u64>,
+    params: serde_json::Value,
+    progress: Option<serde_json::Value>,
+    input_version: String,
+}
+
+#[derive(Debug)]
+struct VerificationTarget {
+    copy_claim_id: String,
+    location_id: String,
+    relative_path: Vec<u8>,
+    path_encoding: String,
+    path_display: String,
+    object_id: Option<String>,
+    external_identity_id: Option<String>,
+    expected_hash_algo: Option<String>,
+    expected_hash_hex: Option<String>,
+    size_bytes: Option<u64>,
+    file_ref_id: Option<String>,
+    collection_id: Option<String>,
+    logical_path: Option<Vec<u8>>,
+    logical_path_encoding: Option<String>,
+    logical_path_display: Option<String>,
+    representation: Option<String>,
+    modified_time_utc_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct VerificationSummary {
+    attempted: u64,
+    ok: u64,
+    hash_mismatch: u64,
+    read_error: u64,
+    identity_mismatch: u64,
 }
 
 fn main() -> ExitCode {
@@ -589,8 +843,30 @@ fn main() -> ExitCode {
 }
 
 fn execute(cli: &Cli) -> Result<u8, AppError> {
-    if let Command::Init { archive_id } = &cli.command {
-        return execute_init(cli, archive_id.as_deref());
+    if let Command::Init {
+        archive_id,
+        guided,
+        non_interactive,
+        root_path,
+        site_name,
+        device_name,
+        collection_name,
+        fingerprint,
+        fingerprint_kind,
+    } = &cli.command
+    {
+        return execute_init(
+            cli,
+            archive_id.as_deref(),
+            *guided,
+            *non_interactive,
+            root_path.as_deref(),
+            site_name,
+            device_name,
+            collection_name,
+            fingerprint.as_deref(),
+            fingerprint_kind.as_deref(),
+        );
     }
     if let Command::Restore {
         command:
@@ -618,6 +894,9 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
     {
         return execute_events_verify(cli);
     }
+    if let Command::Db { command } = &cli.command {
+        return execute_db(cli, command);
+    }
     let database = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
     match &cli.command {
         Command::Init { .. } => unreachable!("init returned before opening an existing database"),
@@ -625,6 +904,13 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
         Command::File { command } => execute_file(&database, command, cli.json),
         Command::Object { command } => execute_object(&database, command, cli.json),
         Command::Copy { command } => execute_copy(&database, command, cli.json),
+        Command::Scan(args) => execute_scan(cli, &database, args),
+        Command::Verify(args) => execute_verify(cli, &database, args),
+        Command::Import { command } => match command {
+            ImportCommand::Annex(args) => execute_annex_import(cli, &database, args),
+        },
+        Command::AnnexRemote { command } => execute_annex_remote(cli, &database, command),
+        Command::Job { command } => execute_job(cli, &database, command),
         Command::Site { command } => execute_registry(cli, &database, RegistryKind::Site, command),
         Command::Collection { command } => {
             execute_registry(cli, &database, RegistryKind::Collection, command)
@@ -735,8 +1021,1441 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
             })
         }
         Command::Events { .. } => unreachable!("event verification returned before opening SQLite"),
+        Command::Db { .. } => unreachable!("database command returned before opening SQLite"),
         Command::Restore { .. } => unreachable!("restore returned before opening SQLite"),
     }
+}
+
+fn execute_db(cli: &Cli, command: &DbCommand) -> Result<u8, AppError> {
+    let events = open_event_store(cli)?;
+    match command {
+        DbCommand::Apply => {
+            let database = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
+            let stats = database.apply(&events)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "version": 1,
+                        "events_applied": stats.events_applied,
+                        "transactions": stats.transactions,
+                        "caught_up": stats.caught_up,
+                        "applied_event_seq": database.status()?.cursor.applied_seq,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Applied {} events in {} transactions; SQLite is current through sequence {}.",
+                    stats.events_applied,
+                    stats.transactions,
+                    database.status()?.cursor.applied_seq
+                );
+            }
+        }
+        DbCommand::Rebuild { target } => {
+            let current = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
+            let archive_id = current.status()?.archive_id;
+            drop(current);
+            let target = target.as_deref().unwrap_or(&cli.database);
+            let stats =
+                ProjectionDb::rebuild(&events, target, &archive_id, ProjectionConfig::default())?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "version": 1,
+                        "database": target,
+                        "archive_id": archive_id,
+                        "events_applied": stats.events_applied,
+                        "caught_up": stats.caught_up,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Rebuilt {} from {} canonical events.",
+                    target.display(),
+                    stats.events_applied
+                );
+            }
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u8, AppError> {
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let scan_id = args
+        .scan_id
+        .clone()
+        .unwrap_or_else(|| format!("scan_{suffix}"));
+    let root_path = std::fs::canonicalize(&args.path).map_err(|error| {
+        AppError::Input(format!(
+            "cannot resolve scan path {}: {error}",
+            args.path.display()
+        ))
+    })?;
+    let events = open_event_store(cli)?;
+    let scanner = LocationScanner::new(
+        &events,
+        database,
+        ScanConfig {
+            root_path: root_path.clone(),
+            scan_id: scan_id.clone(),
+            job_id: job_id.clone(),
+            collection_id: args.collection.clone(),
+            location_id: args.location.clone(),
+            device_id: args.device.clone(),
+            archive_root_id: args.root.clone(),
+            logical_prefix: args.logical_prefix.clone(),
+            exclusions: args.exclusions.clone(),
+            fingerprint_status: args.fingerprint_status.clone(),
+            batch_entries: args.batch_entries,
+        },
+    )?;
+    start_local_job(
+        database,
+        &job_id,
+        "scan",
+        &scan_id,
+        &json!({
+            "scan_id": scan_id,
+            "root_path": root_path,
+            "collection_id": args.collection,
+            "location_id": args.location,
+            "device_id": args.device,
+            "archive_root_id": args.root,
+            "logical_prefix": args.logical_prefix,
+            "exclusion_paths": args.exclusions,
+            "fingerprint_status": args.fingerprint_status,
+            "batch_entries": args.batch_entries,
+        }),
+    )?;
+    record_job_marker(&events, database, &job_id, "scan", &scan_id, "started")?;
+    if !cli.json {
+        println!("Starting scan {scan_id} ({job_id})...");
+    }
+    let result = scanner.run_at_most(args.max_items)?;
+    let status = match result.status {
+        ScanStatus::Complete => "complete",
+        ScanStatus::Partial => "partial",
+        ScanStatus::Interrupted => "running",
+        ScanStatus::Cancelled => "cancelled",
+    };
+    if status != "running" {
+        record_job_marker(&events, database, &job_id, "scan", &scan_id, status)?;
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "job_id": job_id,
+                "scan_id": scan_id,
+                "status": status,
+                "summary": result.summary,
+            }))?
+        );
+    } else {
+        println!("Scan {scan_id} ({job_id}): {status}");
+        println!(
+            "  {} files, {} bytes; {} new, {} changed, {} unchanged, {} missing",
+            result.summary.files_seen,
+            result.summary.bytes_seen,
+            result.summary.new_paths,
+            result.summary.changed_paths,
+            result.summary.unchanged_paths,
+            result.summary.missing_paths
+        );
+        if status == "running" {
+            println!("Resume with: archive job resume {job_id}");
+        }
+    }
+    Ok(
+        if matches!(result.status, ScanStatus::Partial)
+            || result.summary.traversal_errors > 0
+            || result.summary.content_read_errors > 0
+            || result.summary.concurrent_changes > 0
+        {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        },
+    )
+}
+
+fn execute_annex_import(
+    cli: &Cli,
+    database: &ProjectionDb,
+    args: &AnnexArgs,
+) -> Result<u8, AppError> {
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let import_id = args
+        .import_id
+        .clone()
+        .unwrap_or_else(|| format!("import_{suffix}"));
+    let repository = std::fs::canonicalize(&args.repository).map_err(|error| {
+        AppError::Input(format!(
+            "cannot resolve annex repository {}: {error}",
+            args.repository.display()
+        ))
+    })?;
+    let events = open_event_store(cli)?;
+    let importer = AnnexImporter::new(
+        &events,
+        database,
+        AnnexImportConfig {
+            repo_path: repository.clone(),
+            import_id: import_id.clone(),
+            job_id: job_id.clone(),
+            collection_id: args.collection.clone(),
+            worktree_location_id: args.worktree_location.clone(),
+            cas_location_id: args.cas_location.clone(),
+            device_id: args.device.clone(),
+            archive_root_id: args.root.clone(),
+            batch_entries: args.batch_entries,
+        },
+    )?;
+    let params_value = json!({
+        "repository": repository,
+        "collection_id": args.collection,
+        "worktree_location_id": args.worktree_location,
+        "cas_location_id": args.cas_location,
+        "device_id": args.device,
+        "archive_root_id": args.root,
+        "import_id": import_id,
+        "batch_entries": args.batch_entries,
+    });
+    start_local_job(database, &job_id, "annex_import", &import_id, &params_value)?;
+    record_job_marker(
+        &events,
+        database,
+        &job_id,
+        "annex_import",
+        &import_id,
+        "started",
+    )?;
+    if !cli.json {
+        println!("Starting annex import {import_id} ({job_id})...");
+    }
+    let result = importer.run_at_most(args.max_items)?;
+    let status = if result.status == AnnexImportStatus::Complete {
+        "complete"
+    } else {
+        "running"
+    };
+    update_local_job(
+        database,
+        &job_id,
+        status,
+        &serde_json::to_value(&result.summary)?,
+    )?;
+    if status == "complete" {
+        record_job_marker(
+            &events,
+            database,
+            &job_id,
+            "annex_import",
+            &import_id,
+            status,
+        )?;
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "job_id": job_id,
+                "import_id": import_id,
+                "status": status,
+                "annex_uuid": result.annex_uuid,
+                "git_head_commit": result.git_head_commit,
+                "summary": result.summary,
+            }))?
+        );
+    } else {
+        println!("Annex import {import_id} ({job_id}): {status}");
+        println!(
+            "  {} entries; {} present, {} absent, {} unsupported, {} mismatched, {} read errors",
+            result.summary.entries_seen,
+            result.summary.present,
+            result.summary.absent,
+            result.summary.unsupported,
+            result.summary.mismatched,
+            result.summary.read_errors
+        );
+        if status == "running" {
+            println!("Resume with: archive job resume {job_id}");
+        }
+    }
+    Ok(
+        if result.summary.mismatched > 0 || result.summary.read_errors > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        },
+    )
+}
+
+fn execute_annex_remote(
+    cli: &Cli,
+    database: &ProjectionDb,
+    command: &AnnexRemoteCommand,
+) -> Result<u8, AppError> {
+    match command {
+        AnnexRemoteCommand::List { source, all } => {
+            let connection = cli_connection(database)?;
+            let mut statement = connection
+                .prepare(
+                    "WITH known_remotes(source_annex_uuid, remote_annex_uuid, display_name, location_id) AS (
+                         SELECT source_annex_uuid, remote_annex_uuid, display_name, location_id
+                         FROM annex_remotes
+                         UNION ALL
+                         SELECT DISTINCT availability.source_repo_id, availability.source_remote_id,
+                                NULL, NULL
+                         FROM external_availability availability
+                         WHERE NOT EXISTS (
+                             SELECT 1 FROM annex_remotes mapped
+                             WHERE mapped.source_annex_uuid = availability.source_repo_id
+                               AND mapped.remote_annex_uuid = availability.source_remote_id
+                         )
+                     )
+                     SELECT source_annex_uuid, remote_annex_uuid, display_name, location_id
+                     FROM known_remotes
+                     WHERE (?1 IS NULL OR source_annex_uuid = ?1)
+                       AND (?2 OR location_id IS NOT NULL)
+                     ORDER BY source_annex_uuid, remote_annex_uuid",
+                )
+                .map_err(|source| cli_sql_error(database, source))?;
+            let items = statement
+                .query_map(params![source, all], |row| {
+                    Ok(json!({
+                        "source_annex_uuid": row.get::<_, String>(0)?,
+                        "remote_annex_uuid": row.get::<_, String>(1)?,
+                        "display_name": row.get::<_, Option<String>>(2)?,
+                        "location_id": row.get::<_, Option<String>>(3)?,
+                    }))
+                })
+                .map_err(|source| cli_sql_error(database, source))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|source| cli_sql_error(database, source))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"version": 1, "items": items}))?
+                );
+            } else if items.is_empty() {
+                println!("No git-annex remote mappings.");
+            } else {
+                for item in items {
+                    println!(
+                        "{} / {}  {}  {}",
+                        item["source_annex_uuid"].as_str().unwrap_or("unknown"),
+                        item["remote_annex_uuid"].as_str().unwrap_or("unknown"),
+                        item["display_name"].as_str().unwrap_or("unnamed"),
+                        item["location_id"].as_str().unwrap_or("unmapped")
+                    );
+                }
+            }
+        }
+        AnnexRemoteCommand::Map {
+            source_annex_uuid,
+            remote_annex_uuid,
+            location_id,
+            name,
+        } => {
+            record_annex_remote(
+                cli,
+                database,
+                "annex_remote_mapped",
+                json!({
+                    "source_annex_uuid": source_annex_uuid,
+                    "remote_annex_uuid": remote_annex_uuid,
+                    "display_name": name,
+                    "location_id": location_id,
+                }),
+                Some(location_id.clone()),
+            )?;
+        }
+        AnnexRemoteCommand::Unmap {
+            source_annex_uuid,
+            remote_annex_uuid,
+            name,
+        } => {
+            record_annex_remote(
+                cli,
+                database,
+                "annex_remote_unmapped",
+                json!({
+                    "source_annex_uuid": source_annex_uuid,
+                    "remote_annex_uuid": remote_annex_uuid,
+                    "display_name": name,
+                }),
+                None,
+            )?;
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn record_annex_remote(
+    cli: &Cli,
+    database: &ProjectionDb,
+    event_type: &str,
+    payload: serde_json::Value,
+    location_id: Option<String>,
+) -> Result<(), AppError> {
+    for field in ["source_annex_uuid", "remote_annex_uuid"] {
+        if payload[field].as_str().is_none_or(str::is_empty) {
+            return Err(AppError::Input(format!("{field} must be non-empty")));
+        }
+    }
+    if let Some(location_id) = &location_id {
+        let valid: bool = cli_connection(database)?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM locations WHERE location_id = ?1 AND status = 'active')",
+                [location_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| cli_sql_error(database, source))?;
+        if !valid {
+            return Err(AppError::Input(format!(
+                "active location not found: {location_id}"
+            )));
+        }
+    }
+    let events = open_event_store(cli)?;
+    let record = events.append(EventRequest::new(event_type, payload).with_references(
+        EventReferences {
+            location_id,
+            ..EventReferences::default()
+        },
+    ))?;
+    database.apply(&events)?;
+    print_mutation_seq(
+        record.envelope.seq,
+        "Annex remote mapping recorded",
+        cli.json,
+    )
+}
+
+fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Result<u8, AppError> {
+    match command {
+        JobCommand::List { limit } => {
+            if *limit == 0 || *limit > 10_000 {
+                return Err(AppError::Input(
+                    "--limit must be between 1 and 10000".to_owned(),
+                ));
+            }
+            let jobs = list_local_jobs(database, *limit)?;
+            print_jobs(cli.json, &jobs)?;
+        }
+        JobCommand::Show { job_id } => {
+            let job = local_job(database, job_id)?
+                .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+            print_jobs(cli.json, &[job])?;
+        }
+        JobCommand::Resume { job_id, max_items } => {
+            let job = local_job(database, job_id)?
+                .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+            if job.status != "running" {
+                return Err(AppError::Input(format!(
+                    "job {job_id} is {}, not resumable",
+                    job.status
+                )));
+            }
+            match job.job_type.as_str() {
+                "scan" => {
+                    let params = &job.params;
+                    return execute_scan(
+                        cli,
+                        database,
+                        &ScanArgs {
+                            location: json_string(params, "location_id")?,
+                            collection: json_string(params, "collection_id")?,
+                            path: PathBuf::from(json_string(params, "root_path")?),
+                            device: json_string(params, "device_id")?,
+                            root: json_string(params, "archive_root_id")?,
+                            logical_prefix: params["logical_prefix"].as_str().map(PathBuf::from),
+                            exclusions: params["exclusion_paths"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|value| value.as_str().map(PathBuf::from))
+                                .collect(),
+                            fingerprint_status: params["fingerprint_status"]
+                                .as_str()
+                                .unwrap_or("match")
+                                .to_owned(),
+                            job_id: Some(job.job_id),
+                            scan_id: Some(job.input_version),
+                            batch_entries: params["batch_entries"].as_u64().unwrap_or(1_000)
+                                as usize,
+                            max_items: *max_items,
+                        },
+                    );
+                }
+                "annex_import" => {
+                    let params = &job.params;
+                    return execute_annex_import(
+                        cli,
+                        database,
+                        &AnnexArgs {
+                            repository: PathBuf::from(json_string(params, "repository")?),
+                            collection: json_string(params, "collection_id")?,
+                            worktree_location: json_string(params, "worktree_location_id")?,
+                            cas_location: json_string(params, "cas_location_id")?,
+                            device: json_string(params, "device_id")?,
+                            root: json_string(params, "archive_root_id")?,
+                            job_id: Some(job.job_id),
+                            import_id: Some(job.input_version),
+                            batch_entries: params["batch_entries"].as_u64().unwrap_or(1_000)
+                                as usize,
+                            max_items: *max_items,
+                        },
+                    );
+                }
+                "verify" => {
+                    let params = &job.params;
+                    return execute_verify(
+                        cli,
+                        database,
+                        &VerifyArgs {
+                            location: json_string(params, "location_id")?,
+                            path: PathBuf::from(json_string(params, "root_path")?),
+                            copy: params["copy_claim_id"].as_str().map(str::to_owned),
+                            fingerprint_status: params["fingerprint_status"]
+                                .as_str()
+                                .unwrap_or("match")
+                                .to_owned(),
+                            job_id: Some(job.job_id),
+                            batch_entries: params["batch_entries"].as_u64().unwrap_or(500) as usize,
+                            max_items: *max_items,
+                        },
+                    );
+                }
+                other => return Err(AppError::Input(format!("unsupported job type: {other}"))),
+            }
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn print_jobs(as_json: bool, jobs: &[LocalJob]) -> Result<(), AppError> {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"version": 1, "items": jobs}))?
+        );
+    } else if jobs.is_empty() {
+        println!("No jobs.");
+    } else {
+        for job in jobs {
+            println!("{}  {}  {}", job.job_id, job.job_type, job.status);
+            if job.status == "running" {
+                println!("  Resume: archive job resume {}", job.job_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Result<u8, AppError> {
+    if args.batch_entries == 0 {
+        return Err(AppError::Input(
+            "--batch-entries must be greater than zero".to_owned(),
+        ));
+    }
+    if !matches!(
+        args.fingerprint_status.as_str(),
+        "match" | "unavailable" | "mismatch"
+    ) {
+        return Err(AppError::Input(
+            "--fingerprint-status must be match, unavailable, or mismatch".to_owned(),
+        ));
+    }
+    let root_path = std::fs::canonicalize(&args.path).map_err(|error| {
+        AppError::Input(format!(
+            "cannot resolve verification path {}: {error}",
+            args.path.display()
+        ))
+    })?;
+    let location_valid: bool = cli_connection(database)?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM locations
+                            WHERE location_id = ?1 AND kind = 'filesystem' AND status = 'active')",
+            [&args.location],
+            |row| row.get(0),
+        )
+        .map_err(|source| cli_sql_error(database, source))?;
+    if !location_valid {
+        return Err(AppError::Input(format!(
+            "active filesystem location not found: {}",
+            args.location
+        )));
+    }
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let input_version = stable_id(
+        "verify_input",
+        &[
+            args.location.as_bytes(),
+            root_path.to_string_lossy().as_bytes(),
+            args.copy.as_deref().unwrap_or("").as_bytes(),
+        ],
+    );
+    let params_value = json!({
+        "location_id": args.location,
+        "root_path": root_path,
+        "copy_claim_id": args.copy,
+        "fingerprint_status": args.fingerprint_status,
+        "batch_entries": args.batch_entries,
+    });
+    start_local_job(database, &job_id, "verify", &input_version, &params_value)?;
+    let events = open_event_store(cli)?;
+    record_job_marker(
+        &events,
+        database,
+        &job_id,
+        "verify",
+        &input_version,
+        "started",
+    )?;
+    if !cli.json {
+        println!("Starting verification {job_id}...");
+    }
+
+    let mut summary: VerificationSummary = local_job(database, &job_id)?
+        .and_then(|job| job.progress)
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    let mut after: Option<String> = None;
+    let mut new_attempts = 0usize;
+    let mut matched_target = false;
+    let mut interrupted = false;
+    loop {
+        let targets = verification_targets(
+            database,
+            &args.location,
+            args.copy.as_deref(),
+            after.as_deref(),
+            args.batch_entries,
+        )?;
+        if targets.is_empty() {
+            break;
+        }
+        let mut pending = Vec::with_capacity(targets.len());
+        for target in targets {
+            matched_target = true;
+            after = Some(target.copy_claim_id.clone());
+            let operation_key = stable_id(
+                "op",
+                &[
+                    job_id.as_bytes(),
+                    input_version.as_bytes(),
+                    target.copy_claim_id.as_bytes(),
+                    b"verification",
+                ],
+            );
+            if database.has_operation_key(&operation_key)? {
+                continue;
+            }
+            if args.max_items.is_some_and(|limit| new_attempts >= limit) {
+                interrupted = true;
+                break;
+            }
+            let attempt = verify_target(&root_path, &target, &args.fingerprint_status)?;
+            summary.attempted += 1;
+            match attempt.result.as_str() {
+                "ok" => summary.ok += 1,
+                "hash_mismatch" => summary.hash_mismatch += 1,
+                "read_error" => summary.read_error += 1,
+                "identity_mismatch" => summary.identity_mismatch += 1,
+                _ => unreachable!("verification result is internal"),
+            }
+            new_attempts += 1;
+            let resolved_object_id = target.object_id.clone().or_else(|| {
+                (attempt.result == "ok")
+                    .then_some(attempt.blake3_hex.as_ref())
+                    .flatten()
+                    .map(|hash| format!("obj_blake3_{hash}"))
+            });
+            if target.object_id.is_none() && attempt.result == "ok" {
+                let object_id = resolved_object_id
+                    .as_ref()
+                    .expect("successful verification has a BLAKE3 identity");
+                let blake3_hex = attempt
+                    .blake3_hex
+                    .as_ref()
+                    .expect("successful verification has a BLAKE3 hash");
+                pending.push(
+                    EventRequest::new(
+                        "object_observed",
+                        json!({
+                            "object_id": object_id,
+                            "canonical_hash_algo": "blake3",
+                            "canonical_hash_hex": blake3_hex,
+                            "size_bytes": attempt.bytes_read,
+                            "operation_key": verify_operation_key(&job_id, &input_version, &target.copy_claim_id, "object"),
+                            "job_type": "verify", "item_type": "object",
+                            "item_key": object_id, "outcome_kind": "observed",
+                        }),
+                    )
+                    .with_references(EventReferences {
+                        job_id: Some(job_id.clone()),
+                        object_id: Some(object_id.clone()),
+                        ..EventReferences::default()
+                    }),
+                );
+                if let (Some(algorithm), Some(observed)) =
+                    (&target.expected_hash_algo, &attempt.observed_hash_hex)
+                {
+                    if algorithm != "blake3" {
+                        pending.push(
+                            EventRequest::new(
+                                "object_hash_added",
+                                json!({
+                                    "object_id": object_id,
+                                    "hash_algo": algorithm,
+                                    "hash_hex": observed,
+                                    "source": "verification",
+                                    "operation_key": verify_operation_key(&job_id, &input_version, &target.copy_claim_id, "object_hash"),
+                                    "job_type": "verify", "item_type": "object_hash",
+                                    "item_key": target.copy_claim_id, "outcome_kind": "verified",
+                                }),
+                            )
+                            .with_references(EventReferences {
+                                job_id: Some(job_id.clone()),
+                                object_id: Some(object_id.clone()),
+                                copy_claim_id: Some(target.copy_claim_id.clone()),
+                                ..EventReferences::default()
+                            }),
+                        );
+                    }
+                }
+                if let Some(external_identity_id) = &target.external_identity_id {
+                    pending.push(
+                        EventRequest::new(
+                            "external_identity_resolved",
+                            json!({
+                                "external_identity_id": external_identity_id,
+                                "object_id": object_id,
+                                "operation_key": verify_operation_key(&job_id, &input_version, &target.copy_claim_id, "external_identity"),
+                                "job_type": "verify", "item_type": "external_identity",
+                                "item_key": external_identity_id, "outcome_kind": "resolved",
+                            }),
+                        )
+                        .with_references(EventReferences {
+                            job_id: Some(job_id.clone()),
+                            object_id: Some(object_id.clone()),
+                            copy_claim_id: Some(target.copy_claim_id.clone()),
+                            ..EventReferences::default()
+                        }),
+                    );
+                }
+                if let (
+                    Some(file_ref_id),
+                    Some(collection_id),
+                    Some(logical_path),
+                    Some(logical_encoding),
+                    Some(logical_display),
+                ) = (
+                    &target.file_ref_id,
+                    &target.collection_id,
+                    &target.logical_path,
+                    &target.logical_path_encoding,
+                    &target.logical_path_display,
+                ) {
+                    pending.push(
+                        EventRequest::new(
+                            "file_ref_updated",
+                            json!({
+                                "file_ref_id": file_ref_id,
+                                "collection_id": collection_id,
+                                "logical_path": lossless_path_json(logical_encoding, logical_path, logical_display)?,
+                                "object_id": object_id,
+                                "external_identity_id": target.external_identity_id,
+                                "identity_state": "resolved",
+                                "path_state": "active",
+                                "observed_size_bytes": attempt.bytes_read,
+                                "operation_key": verify_operation_key(&job_id, &input_version, &target.copy_claim_id, "file_ref"),
+                                "job_type": "verify", "item_type": "file_ref",
+                                "item_key": file_ref_id, "outcome_kind": "resolved",
+                            }),
+                        )
+                        .with_references(EventReferences {
+                            job_id: Some(job_id.clone()),
+                            object_id: Some(object_id.clone()),
+                            file_ref_id: Some(file_ref_id.clone()),
+                            copy_claim_id: Some(target.copy_claim_id.clone()),
+                            ..EventReferences::default()
+                        }),
+                    );
+                    pending.push(
+                        EventRequest::new(
+                            "path_observed",
+                            json!({
+                                "file_ref_id": file_ref_id,
+                                "location_id": target.location_id,
+                                "observed_path": lossless_path_json(&target.path_encoding, &target.relative_path, &target.path_display)?,
+                                "representation": target.representation.as_deref().unwrap_or("ordinary_file"),
+                                "object_id": object_id,
+                                "external_identity_id": target.external_identity_id,
+                                "state": "present",
+                                "observed_size_bytes": attempt.bytes_read,
+                                "modified_time_utc_ms": target.modified_time_utc_ms,
+                                "operation_key": verify_operation_key(&job_id, &input_version, &target.copy_claim_id, "path"),
+                                "job_type": "verify", "item_type": "path",
+                                "item_key": file_ref_id, "outcome_kind": "present",
+                            }),
+                        )
+                        .with_references(EventReferences {
+                            job_id: Some(job_id.clone()),
+                            object_id: Some(object_id.clone()),
+                            file_ref_id: Some(file_ref_id.clone()),
+                            copy_claim_id: Some(target.copy_claim_id.clone()),
+                            location_id: Some(target.location_id.clone()),
+                            ..EventReferences::default()
+                        }),
+                    );
+                }
+                pending.push(
+                    EventRequest::new(
+                        "copy_observed",
+                        json!({
+                            "copy_claim_id": target.copy_claim_id,
+                            "location_id": target.location_id,
+                            "relative_path": lossless_path_json(&target.path_encoding, &target.relative_path, &target.path_display)?,
+                            "object_id": object_id,
+                            "external_identity_id": target.external_identity_id,
+                            "claim_basis": "observed_bytes",
+                            "state": "present",
+                            "operation_key": verify_operation_key(&job_id, &input_version, &target.copy_claim_id, "copy"),
+                            "job_type": "verify", "item_type": "copy",
+                            "item_key": target.copy_claim_id, "outcome_kind": "present",
+                        }),
+                    )
+                    .with_references(EventReferences {
+                        job_id: Some(job_id.clone()),
+                        object_id: Some(object_id.clone()),
+                        file_ref_id: target.file_ref_id.clone(),
+                        copy_claim_id: Some(target.copy_claim_id.clone()),
+                        location_id: Some(target.location_id.clone()),
+                        ..EventReferences::default()
+                    }),
+                );
+            }
+            let expected_hash_algo = target
+                .expected_hash_algo
+                .clone()
+                .or_else(|| resolved_object_id.as_ref().map(|_| "blake3".to_owned()));
+            let expected_hash_hex = target
+                .expected_hash_hex
+                .clone()
+                .or_else(|| attempt.blake3_hex.clone());
+            pending.push(
+                EventRequest::new(
+                    "copy_verified",
+                    json!({
+                        "verification_id": stable_id("verify", &[job_id.as_bytes(), target.copy_claim_id.as_bytes()]),
+                        "copy_claim_id": target.copy_claim_id,
+                        "object_id": resolved_object_id,
+                        "location_id": target.location_id,
+                        "result": attempt.result,
+                        "expected_hash_algo": expected_hash_algo,
+                        "expected_hash_hex": expected_hash_hex,
+                        "observed_hash_hex": attempt.observed_hash_hex,
+                        "size_bytes": target.size_bytes.or(Some(attempt.bytes_read)),
+                        "bytes_read": attempt.bytes_read,
+                        "duration_ms": attempt.duration_ms,
+                        "path_observed": lossless_path_json(
+                            &target.path_encoding,
+                            &target.relative_path,
+                            &target.path_display,
+                        )?,
+                        "device_fingerprint_status": args.fingerprint_status,
+                        "error_code": attempt.error_code,
+                        "error_detail": attempt.error_detail,
+                        "operation_key": operation_key,
+                        "job_type": "verify",
+                        "item_type": "copy",
+                        "item_key": target.copy_claim_id,
+                        "outcome_kind": attempt.result,
+                    }),
+                )
+                .with_references(EventReferences {
+                    job_id: Some(job_id.clone()),
+                    object_id: resolved_object_id,
+                    file_ref_id: target.file_ref_id,
+                    copy_claim_id: Some(target.copy_claim_id),
+                    location_id: Some(args.location.clone()),
+                    ..EventReferences::default()
+                }),
+            );
+        }
+        if !pending.is_empty() {
+            events.append_batch(pending)?;
+            database.apply(&events)?;
+        }
+        update_local_job(
+            database,
+            &job_id,
+            "running",
+            &serde_json::to_value(&summary)?,
+        )?;
+        if interrupted {
+            break;
+        }
+    }
+    if args.copy.is_some() && !matched_target {
+        return Err(AppError::Input(format!(
+            "current verifiable copy not found at location {}: {}",
+            args.location,
+            args.copy.as_deref().unwrap_or_default()
+        )));
+    }
+    let status = if interrupted { "running" } else { "complete" };
+    update_local_job(database, &job_id, status, &serde_json::to_value(&summary)?)?;
+    if !interrupted {
+        record_job_marker(
+            &events,
+            database,
+            &job_id,
+            "verify",
+            &input_version,
+            "complete",
+        )?;
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "job_id": job_id,
+                "status": status,
+                "summary": summary,
+            }))?
+        );
+    } else {
+        println!("Verification {job_id}: {status}");
+        println!(
+            "  {} attempted; {} ok, {} mismatched, {} read errors, {} identity mismatches",
+            summary.attempted,
+            summary.ok,
+            summary.hash_mismatch,
+            summary.read_error,
+            summary.identity_mismatch
+        );
+        if interrupted {
+            println!("Resume with: archive job resume {job_id}");
+        }
+    }
+    Ok(
+        if summary.hash_mismatch > 0 || summary.read_error > 0 || summary.identity_mismatch > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        },
+    )
+}
+
+struct VerificationAttempt {
+    result: String,
+    blake3_hex: Option<String>,
+    observed_hash_hex: Option<String>,
+    bytes_read: u64,
+    duration_ms: u64,
+    error_code: Option<String>,
+    error_detail: Option<String>,
+}
+
+fn verify_target(
+    root: &Path,
+    target: &VerificationTarget,
+    fingerprint_status: &str,
+) -> Result<VerificationAttempt, AppError> {
+    let started = Instant::now();
+    if fingerprint_status == "mismatch" {
+        return Ok(VerificationAttempt {
+            result: "identity_mismatch".to_owned(),
+            blake3_hex: None,
+            observed_hash_hex: None,
+            bytes_read: 0,
+            duration_ms: 0,
+            error_code: Some("device_mismatch".to_owned()),
+            error_detail: Some("device fingerprint did not match; bytes were not read".to_owned()),
+        });
+    }
+    if target
+        .expected_hash_algo
+        .as_deref()
+        .is_some_and(|algorithm| !matches!(algorithm, "blake3" | "sha256"))
+    {
+        return Ok(VerificationAttempt {
+            result: "read_error".to_owned(),
+            blake3_hex: None,
+            observed_hash_hex: None,
+            bytes_read: 0,
+            duration_ms: 0,
+            error_code: Some("unsupported_hash".to_owned()),
+            error_detail: Some(format!(
+                "unsupported canonical hash algorithm {}",
+                target.expected_hash_algo.as_deref().unwrap_or("unknown")
+            )),
+        });
+    }
+    let relative = relative_path_from_bytes(&target.path_encoding, &target.relative_path)?;
+    if relative.is_absolute()
+        || relative.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AppError::Input(format!(
+            "copy {} contains an unsafe relative path",
+            target.copy_claim_id
+        )));
+    }
+    let path = root.join(relative);
+    let before = match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return Ok(read_error_attempt(
+                started,
+                "not_regular_file",
+                format!("{} is not a regular file", path.display()),
+            ))
+        }
+        Err(error) => {
+            return Ok(read_error_attempt(
+                started,
+                "content_read_error",
+                format!("{}: {error}", path.display()),
+            ))
+        }
+    };
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            return Ok(read_error_attempt(
+                started,
+                "content_read_error",
+                format!("{}: {error}", path.display()),
+            ))
+        }
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut sha256 = (target.expected_hash_algo.as_deref() == Some("sha256")).then(Sha256::new);
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut bytes_read = 0_u64;
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                hasher.update(&buffer[..count]);
+                if let Some(sha256) = &mut sha256 {
+                    sha256.update(&buffer[..count]);
+                }
+                bytes_read = bytes_read.saturating_add(count as u64);
+            }
+            Err(error) => {
+                return Ok(VerificationAttempt {
+                    bytes_read,
+                    ..read_error_attempt(
+                        started,
+                        "content_read_error",
+                        format!("{}: {error}", path.display()),
+                    )
+                })
+            }
+        }
+    }
+    let after = std::fs::metadata(&path).ok();
+    if after.as_ref().is_none_or(|after| {
+        after.len() != before.len() || after.modified().ok() != before.modified().ok()
+    }) {
+        return Ok(VerificationAttempt {
+            bytes_read,
+            ..read_error_attempt(
+                started,
+                "content_changed_during_read",
+                format!("{} changed while it was being verified", path.display()),
+            )
+        });
+    }
+    let blake3_hex = hasher.finalize().to_hex().to_string();
+    let observed = match sha256 {
+        Some(sha256) => format!("{:x}", sha256.finalize()),
+        None => blake3_hex.clone(),
+    };
+    let hash_matches = target
+        .expected_hash_hex
+        .as_deref()
+        .is_none_or(|expected| observed.eq_ignore_ascii_case(expected));
+    let size_matches = target.size_bytes.is_none_or(|size| bytes_read == size);
+    let matches = hash_matches && size_matches;
+    Ok(VerificationAttempt {
+        result: if matches { "ok" } else { "hash_mismatch" }.to_owned(),
+        blake3_hex: Some(blake3_hex),
+        observed_hash_hex: Some(observed),
+        bytes_read,
+        duration_ms: elapsed_ms(started),
+        error_code: (!matches).then(|| "content_hash_mismatch".to_owned()),
+        error_detail: (!matches)
+            .then(|| "observed bytes do not match the recorded object".to_owned()),
+    })
+}
+
+fn read_error_attempt(started: Instant, code: &str, detail: String) -> VerificationAttempt {
+    VerificationAttempt {
+        result: "read_error".to_owned(),
+        blake3_hex: None,
+        observed_hash_hex: None,
+        bytes_read: 0,
+        duration_ms: elapsed_ms(started),
+        error_code: Some(code.to_owned()),
+        error_detail: Some(detail),
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn verification_targets(
+    database: &ProjectionDb,
+    location_id: &str,
+    copy_claim_id: Option<&str>,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<VerificationTarget>, AppError> {
+    let connection = cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT c.copy_claim_id, c.location_id, c.relative_path_bytes,
+                    c.relative_path_encoding, c.relative_path_display,
+                    c.object_id, c.external_identity_id,
+                    COALESCE(o.canonical_hash_algo, x.expected_hash_algo),
+                    COALESCE(o.canonical_hash_hex, x.expected_hash_hex),
+                    COALESCE(o.size_bytes, x.expected_size_bytes, f.observed_size_bytes),
+                    f.file_ref_id, f.collection_id, f.logical_path_bytes,
+                    f.logical_path_encoding, f.logical_path_display,
+                    p.representation, p.modified_time_utc_ms
+             FROM copy_claims c
+             LEFT JOIN objects o ON o.object_id = c.object_id
+             LEFT JOIN external_identities x ON x.external_identity_id = c.external_identity_id
+             JOIN locations l ON l.location_id = c.location_id
+             LEFT JOIN path_observations p
+               ON p.location_id = c.location_id
+              AND p.observed_path_encoding = c.relative_path_encoding
+              AND p.observed_path_bytes = c.relative_path_bytes
+              AND p.state = 'present'
+             LEFT JOIN file_refs f ON f.file_ref_id = p.file_ref_id AND f.path_state = 'active'
+             WHERE c.location_id = ?1
+               AND l.kind = 'filesystem' AND l.status = 'active'
+               AND c.state IN ('present', 'corrupt', 'unknown')
+               AND (?2 IS NULL OR c.copy_claim_id = ?2)
+               AND (?3 IS NULL OR c.copy_claim_id > ?3)
+             ORDER BY c.copy_claim_id
+             LIMIT ?4",
+        )
+        .map_err(|source| cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map(
+            params![
+                location_id,
+                copy_claim_id,
+                after,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let size: Option<i64> = row.get(9)?;
+                Ok(VerificationTarget {
+                    copy_claim_id: row.get(0)?,
+                    location_id: row.get(1)?,
+                    relative_path: row.get(2)?,
+                    path_encoding: row.get(3)?,
+                    path_display: row.get(4)?,
+                    object_id: row.get(5)?,
+                    external_identity_id: row.get(6)?,
+                    expected_hash_algo: row.get(7)?,
+                    expected_hash_hex: row.get(8)?,
+                    size_bytes: size
+                        .map(|size| {
+                            u64::try_from(size)
+                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, size))
+                        })
+                        .transpose()?,
+                    file_ref_id: row.get(10)?,
+                    collection_id: row.get(11)?,
+                    logical_path: row.get(12)?,
+                    logical_path_encoding: row.get(13)?,
+                    logical_path_display: row.get(14)?,
+                    representation: row.get(15)?,
+                    modified_time_utc_ms: row
+                        .get::<_, Option<i64>>(16)?
+                        .map(|time| {
+                            u64::try_from(time)
+                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(16, time))
+                        })
+                        .transpose()?,
+                })
+            },
+        )
+        .map_err(|source| cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| cli_sql_error(database, source))?;
+    Ok(rows)
+}
+
+fn relative_path_from_bytes(encoding: &str, bytes: &[u8]) -> Result<PathBuf, AppError> {
+    match encoding {
+        "utf8" => Ok(PathBuf::from(std::str::from_utf8(bytes).map_err(
+            |error| AppError::Input(format!("invalid UTF-8 path in SQLite: {error}")),
+        )?)),
+        #[cfg(unix)]
+        "unix_bytes" => {
+            use std::os::unix::ffi::OsStringExt;
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+        }
+        other => Err(AppError::Input(format!(
+            "path encoding {other} cannot be verified on this platform"
+        ))),
+    }
+}
+
+fn lossless_path_json(
+    encoding: &str,
+    bytes: &[u8],
+    display: &str,
+) -> Result<serde_json::Value, AppError> {
+    match encoding {
+        "utf8" => Ok(json!({
+            "encoding": "utf8",
+            "text": std::str::from_utf8(bytes).map_err(|error| AppError::Input(error.to_string()))?,
+            "display": display,
+        })),
+        "unix_bytes" | "windows_utf16le" => Ok(json!({
+            "encoding": encoding,
+            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "display": display,
+        })),
+        other => Err(AppError::Input(format!(
+            "unsupported path encoding: {other}"
+        ))),
+    }
+}
+
+fn start_local_job(
+    database: &ProjectionDb,
+    job_id: &str,
+    job_type: &str,
+    input_version: &str,
+    params_value: &serde_json::Value,
+) -> Result<(), AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let params_text = serde_json::to_string(params_value)?;
+    let connection = cli_connection(database)?;
+    connection
+        .execute(
+            "INSERT INTO jobs(job_id, job_type, status, created_time_utc_ms,
+                              started_time_utc_ms, params_json, input_version)
+             VALUES (?1, ?2, 'running', ?4, ?4, ?5, ?3)
+             ON CONFLICT(job_id) DO NOTHING",
+            params![job_id, job_type, input_version, now, params_text],
+        )
+        .map_err(|source| cli_sql_error(database, source))?;
+    let actual: (String, String) = connection
+        .query_row(
+            "SELECT job_type, input_version FROM jobs WHERE job_id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|source| cli_sql_error(database, source))?;
+    if actual != (job_type.to_owned(), input_version.to_owned()) {
+        return Err(AppError::Input(format!(
+            "job {job_id} belongs to {} input {}, not {job_type} input {input_version}",
+            actual.0, actual.1
+        )));
+    }
+    Ok(())
+}
+
+fn update_local_job(
+    database: &ProjectionDb,
+    job_id: &str,
+    status: &str,
+    progress: &serde_json::Value,
+) -> Result<(), AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    cli_connection(database)?
+        .execute(
+            "UPDATE jobs SET status = ?2, progress_json = ?3,
+                 finished_time_utc_ms = CASE WHEN ?2 = 'running' THEN NULL ELSE ?4 END
+             WHERE job_id = ?1",
+            params![job_id, status, serde_json::to_string(progress)?, now],
+        )
+        .map_err(|source| cli_sql_error(database, source))?;
+    Ok(())
+}
+
+fn record_job_marker(
+    events: &EventStore,
+    database: &ProjectionDb,
+    job_id: &str,
+    job_type: &str,
+    input_version: &str,
+    status: &str,
+) -> Result<(), AppError> {
+    let event_type = if status == "started" {
+        "job_started"
+    } else {
+        "job_finished"
+    };
+    let operation_key = stable_id(
+        "op",
+        &[
+            job_id.as_bytes(),
+            input_version.as_bytes(),
+            status.as_bytes(),
+        ],
+    );
+    if !database.has_operation_key(&operation_key)? {
+        events.append(
+            EventRequest::new(
+                event_type,
+                json!({
+                    "job_id": job_id,
+                    "job_type": job_type,
+                    "input_version": input_version,
+                    "status": status,
+                    "operation_key": operation_key,
+                    "item_type": "job",
+                    "item_key": job_id,
+                    "outcome_kind": status,
+                }),
+            )
+            .with_references(EventReferences {
+                job_id: Some(job_id.to_owned()),
+                ..EventReferences::default()
+            }),
+        )?;
+        database.apply(events)?;
+    }
+    Ok(())
+}
+
+fn list_local_jobs(database: &ProjectionDb, limit: usize) -> Result<Vec<LocalJob>, AppError> {
+    let connection = cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT job_id, job_type, status, created_time_utc_ms, started_time_utc_ms,
+                    finished_time_utc_ms, params_json, progress_json, input_version
+             FROM jobs ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?1",
+        )
+        .map_err(|source| cli_sql_error(database, source))?;
+    let raw = statement
+        .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(|source| cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| cli_sql_error(database, source))?;
+    raw.into_iter()
+        .map(|row| {
+            Ok(LocalJob {
+                job_id: row.0,
+                job_type: row.1,
+                status: row.2,
+                created_time_utc_ms: nonnegative_time(row.3)?,
+                started_time_utc_ms: row.4.map(nonnegative_time).transpose()?,
+                finished_time_utc_ms: row.5.map(nonnegative_time).transpose()?,
+                params: serde_json::from_str(&row.6)?,
+                progress: row.7.as_deref().map(serde_json::from_str).transpose()?,
+                input_version: row.8,
+            })
+        })
+        .collect()
+}
+
+fn local_job(database: &ProjectionDb, job_id: &str) -> Result<Option<LocalJob>, AppError> {
+    Ok(list_local_jobs(database, 10_000)?
+        .into_iter()
+        .find(|job| job.job_id == job_id))
+}
+
+fn nonnegative_time(value: i64) -> Result<u64, AppError> {
+    u64::try_from(value)
+        .map_err(|_| AppError::Input("SQLite contains a negative job time".to_owned()))
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Result<String, AppError> {
+    value[key]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::Input(format!("job parameters lack {key}")))
+}
+
+fn cli_connection(database: &ProjectionDb) -> Result<Connection, AppError> {
+    let connection =
+        Connection::open(database.path()).map_err(|source| cli_sql_error(database, source))?;
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")
+        .map_err(|source| cli_sql_error(database, source))?;
+    Ok(connection)
+}
+
+fn cli_sql_error(database: &ProjectionDb, source: rusqlite::Error) -> AppError {
+    AppError::Projection(ProjectionError::Sqlite {
+        path: database.path().to_path_buf(),
+        source,
+    })
+}
+
+fn stable_id(prefix: &str, pieces: &[&[u8]]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for piece in pieces {
+        hasher.update(&(piece.len() as u64).to_le_bytes());
+        hasher.update(piece);
+    }
+    format!("{prefix}_{}", &hasher.finalize().to_hex()[..32])
+}
+
+fn verify_operation_key(job_id: &str, input_version: &str, copy_id: &str, kind: &str) -> String {
+    stable_id(
+        "op",
+        &[
+            job_id.as_bytes(),
+            input_version.as_bytes(),
+            copy_id.as_bytes(),
+            kind.as_bytes(),
+        ],
+    )
 }
 
 fn execute_status(database: &ProjectionDb, as_json: bool) -> Result<u8, AppError> {
@@ -1109,6 +2828,12 @@ fn execute_events_verify(cli: &Cli) -> Result<u8, AppError> {
 }
 
 fn open_event_store(cli: &Cli) -> Result<EventStore, AppError> {
+    if !cli.events.is_dir() {
+        return Err(AppError::Input(format!(
+            "canonical event store not found at {}; refusing to create a replacement for an existing catalog (restore it or use init with empty targets)",
+            cli.events.display()
+        )));
+    }
     Ok(EventStore::open_or_create(
         &cli.events,
         EventStoreConfig {
@@ -1131,7 +2856,19 @@ fn print_mutation_seq(seq: u64, message: &str, as_json: bool) -> Result<(), AppE
     Ok(())
 }
 
-fn execute_init(cli: &Cli, archive_id: Option<&str>) -> Result<u8, AppError> {
+#[allow(clippy::too_many_arguments)]
+fn execute_init(
+    cli: &Cli,
+    archive_id: Option<&str>,
+    guided: bool,
+    non_interactive: bool,
+    root_path: Option<&Path>,
+    site_name: &str,
+    device_name: &str,
+    collection_name: &str,
+    fingerprint: Option<&str>,
+    fingerprint_kind: Option<&str>,
+) -> Result<u8, AppError> {
     if cli.database.exists() || cli.events.exists() {
         return Err(AppError::Input(
             "init target already exists; choose empty --database and --events paths".to_owned(),
@@ -1140,6 +2877,60 @@ fn execute_init(cli: &Cli, archive_id: Option<&str>) -> Result<u8, AppError> {
     let archive_id = archive_id
         .map(str::to_owned)
         .unwrap_or_else(|| format!("arc_{}", ulid::Ulid::new().to_string().to_ascii_lowercase()));
+    let should_prompt =
+        guided || (!non_interactive && root_path.is_none() && std::io::stdin().is_terminal());
+    let starter = if should_prompt {
+        let default_root = std::env::current_dir()?.to_string_lossy().into_owned();
+        let selected_root = prompt_default("Mounted archive path", &default_root)?;
+        let selected_site = prompt_default("Home site name", site_name)?;
+        let selected_device = prompt_default("Primary device name", device_name)?;
+        let selected_collection = prompt_default("Collection name", collection_name)?;
+        let selected_fingerprint =
+            prompt_default("Stable device fingerprint (leave blank if unavailable)", "")?;
+        let selected_kind = if selected_fingerprint.is_empty() {
+            None
+        } else {
+            Some(prompt_default("Fingerprint kind", "filesystem_uuid")?)
+        };
+        Some((
+            PathBuf::from(selected_root),
+            selected_site,
+            selected_device,
+            selected_collection,
+            (!selected_fingerprint.is_empty()).then_some(selected_fingerprint),
+            selected_kind,
+        ))
+    } else {
+        root_path.map(|path| {
+            (
+                path.to_path_buf(),
+                site_name.to_owned(),
+                device_name.to_owned(),
+                collection_name.to_owned(),
+                fingerprint.map(str::to_owned),
+                fingerprint_kind.map(str::to_owned),
+            )
+        })
+    };
+    if starter
+        .as_ref()
+        .is_some_and(|starter| starter.4.is_some() != starter.5.is_some())
+    {
+        return Err(AppError::Input(
+            "--fingerprint and --fingerprint-kind must be provided together".to_owned(),
+        ));
+    }
+    let starter = starter
+        .map(|mut starter| {
+            starter.0 = std::fs::canonicalize(&starter.0).map_err(|error| {
+                AppError::Input(format!(
+                    "cannot resolve starter root {}: {error}",
+                    starter.0.display()
+                ))
+            })?;
+            Ok::<_, AppError>(starter)
+        })
+        .transpose()?;
     let events = EventStore::open_or_create(
         &cli.events,
         EventStoreConfig {
@@ -1156,6 +2947,126 @@ fn execute_init(cli: &Cli, archive_id: Option<&str>) -> Result<u8, AppError> {
         json!({"archive_id": archive_id}),
     ))?;
     database.apply(&events)?;
+    let starter_ids = if let Some((
+        mounted_path,
+        site_name,
+        device_name,
+        collection_name,
+        fingerprint,
+        fingerprint_kind,
+    )) = starter
+    {
+        let registry = Registry::new(&events, &database);
+        registry.record(RegistryChange::Site(
+            RegistryAction::Register,
+            SiteSnapshot {
+                site_id: "site_home".to_owned(),
+                display_name: site_name,
+                site_kind: "home".to_owned(),
+                description: Some("Starter home site".to_owned()),
+                status: "active".to_owned(),
+            },
+        ))?;
+        registry.record(RegistryChange::Policy(
+            RegistryAction::Register,
+            PolicySnapshot {
+                policy_id: "policy_starter".to_owned(),
+                display_name: "Two copies at two sites".to_owned(),
+                policy_version: 1,
+                requirements: PolicyRequirements {
+                    min_qualifying_copies: 2,
+                    min_devices: 2,
+                    min_sites: 2,
+                    require_offsite_copy: true,
+                    require_offline_copy: false,
+                    require_encrypted_offsite: false,
+                    max_verification_age_days: 365,
+                    max_observation_age_days: 365,
+                    max_device_checkin_age_days: 365,
+                },
+                enabled: true,
+                status: "active".to_owned(),
+            },
+        ))?;
+        registry.record(RegistryChange::Device(
+            RegistryAction::Register,
+            DeviceSnapshot {
+                device_id: "device_primary".to_owned(),
+                display_name: device_name,
+                device_kind: "disk".to_owned(),
+                serial_hint: None,
+                hardware_fingerprint: fingerprint.clone(),
+                fingerprint_kind: fingerprint_kind.clone(),
+                identity_state: if fingerprint.is_some() {
+                    "confirmed"
+                } else {
+                    "unavailable"
+                }
+                .to_owned(),
+                owner: None,
+                status: "active".to_owned(),
+                current_site_id: Some("site_home".to_owned()),
+                expected_availability: "online".to_owned(),
+            },
+        ))?;
+        registry.record(RegistryChange::ArchiveRoot(
+            RegistryAction::Register,
+            ArchiveRootSnapshot {
+                archive_root_id: "root_primary".to_owned(),
+                device_id: "device_primary".to_owned(),
+                display_name: mounted_path.display().to_string(),
+                root_path_on_device: RegistryPath::utf8("/"),
+                status: "active".to_owned(),
+            },
+        ))?;
+        registry.record(RegistryChange::Location(
+            RegistryAction::Register,
+            LocationSnapshot {
+                location_id: "location_primary".to_owned(),
+                display_name: "Primary archive location".to_owned(),
+                kind: "filesystem".to_owned(),
+                archive_root_id: Some("root_primary".to_owned()),
+                relative_path: Some(RegistryPath::utf8("")),
+                device_id: Some("device_primary".to_owned()),
+                site_id: None,
+                encryption_state: Some("unknown".to_owned()),
+                trust_level: Some("trusted".to_owned()),
+                expected_availability: "online".to_owned(),
+                is_writable: false,
+                status: "active".to_owned(),
+            },
+        ))?;
+        registry.record(RegistryChange::Collection(
+            RegistryAction::Register,
+            CollectionSnapshot {
+                collection_id: "collection_primary".to_owned(),
+                display_name: collection_name,
+                description: Some(format!("Files under {}", mounted_path.display())),
+                home_site_id: Some("site_home".to_owned()),
+                policy_id: Some("policy_starter".to_owned()),
+                status: "active".to_owned(),
+            },
+        ))?;
+        let catalog_location_id = std::fs::canonicalize(events.root())
+            .ok()
+            .filter(|event_root| event_root.starts_with(&mounted_path))
+            .map(|_| "location_primary");
+        if let Some(location_id) = catalog_location_id {
+            MetadataRegistry::new(&events, &database).set_catalog_location(location_id)?;
+        }
+        Some(json!({
+            "mounted_path": mounted_path,
+            "site_id": "site_home",
+            "device_id": "device_primary",
+            "archive_root_id": "root_primary",
+            "location_id": "location_primary",
+            "collection_id": "collection_primary",
+            "policy_id": "policy_starter",
+            "catalog_location_id": catalog_location_id,
+        }))
+    } else {
+        None
+    };
     if cli.json {
         println!(
             "{}",
@@ -1164,16 +3075,48 @@ fn execute_init(cli: &Cli, archive_id: Option<&str>) -> Result<u8, AppError> {
                 "archive_id": archive_id,
                 "database": cli.database,
                 "events": cli.events,
-                "applied_event_seq": 1,
+                "applied_event_seq": database.status()?.cursor.applied_seq,
+                "starter": starter_ids,
             }))?
         );
     } else {
         println!("Initialized archive {archive_id}");
         println!("  database: {}", cli.database.display());
         println!("  canonical events: {}", cli.events.display());
-        println!("Next: register sites, devices, locations, a collection, and a policy.");
+        if starter_ids.is_some() {
+            println!("Starter topology created. Next: archive scan location_primary --collection collection_primary --path <mounted-path> --device device_primary --root root_primary");
+            if starter_ids
+                .as_ref()
+                .is_some_and(|starter| starter["catalog_location_id"].is_null())
+            {
+                println!("The event repository is outside that mounted path, so its catalog location was not guessed. Register its real storage location, then run archive catalog-location <location-id>.");
+            }
+            println!("Then register an independent offsite copy and a metadata destination.");
+        } else {
+            println!("Next: register sites, devices, locations, a collection, and a policy.");
+            println!(
+                "For a starter topology, rerun in an empty target with --root-path <mounted-path>."
+            );
+        }
     }
     Ok(EXIT_OK)
+}
+
+fn prompt_default(label: &str, default: &str) -> Result<String, AppError> {
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+    Ok(if input.is_empty() {
+        default.to_owned()
+    } else {
+        input.to_owned()
+    })
 }
 
 fn execute_registry(
@@ -1183,6 +3126,42 @@ fn execute_registry(
     command: &RegistryEntityCommand,
 ) -> Result<u8, AppError> {
     match command {
+        RegistryEntityCommand::Discover { path } => {
+            if !matches!(kind, RegistryKind::Device) {
+                return Err(AppError::Input(
+                    "discover is available only under device".to_owned(),
+                ));
+            }
+            let canonical = std::fs::canonicalize(path).map_err(|error| {
+                AppError::Input(format!("cannot inspect {}: {error}", path.display()))
+            })?;
+            let metadata = std::fs::metadata(&canonical)?;
+            #[cfg(unix)]
+            let device_number = {
+                use std::os::unix::fs::MetadataExt;
+                Some(metadata.dev())
+            };
+            #[cfg(not(unix))]
+            let device_number: Option<u64> = None;
+            let output = json!({
+                "version": 1,
+                "path": canonical,
+                "filesystem_device_number": device_number,
+                "stable_fingerprint": null,
+                "fingerprint_status": "unavailable",
+                "note": "the filesystem device number is host-local and is not a durable device fingerprint",
+            });
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Mounted path: {}", canonical.display());
+                if let Some(number) = device_number {
+                    println!("  host-local filesystem device number: {number}");
+                }
+                println!("  stable fingerprint: unavailable");
+                println!("Use a filesystem UUID or hardware identifier with device add when one is available.");
+            }
+        }
         RegistryEntityCommand::List { all } => {
             let state = database.registry_state(*all)?;
             let values = registry_values(kind, &state)?;

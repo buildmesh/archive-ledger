@@ -160,4 +160,13 @@ fn empty_archive_cli_has_human_and_stable_json_workflows() {
     assert_eq!(invalid_result.status.code(), Some(2));
     let error: Value = serde_json::from_slice(&invalid_result.stderr).unwrap();
     assert_eq!(error["error"]["code"], "policy_invalid_state");
+
+    let refused_rebuild = archive(&temp)
+        .args(["--json", "db", "rebuild"])
+        .output()
+        .unwrap();
+    assert_eq!(refused_rebuild.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&refused_rebuild.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_input");
+    assert!(temp.path().join("archive.db").is_file());
 }

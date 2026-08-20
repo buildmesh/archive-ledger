@@ -470,6 +470,14 @@ impl<'a> LocationScanner<'a> {
         let params_json = serde_json::to_string(&json!({
             "scan_id": self.config.scan_id,
             "root_path": self.config.root_path.to_string_lossy(),
+            "collection_id": self.config.collection_id,
+            "location_id": self.config.location_id,
+            "device_id": self.config.device_id,
+            "archive_root_id": self.config.archive_root_id,
+            "logical_prefix": self.config.logical_prefix.as_ref().map(|path| path.to_string_lossy()),
+            "exclusion_paths": self.config.exclusions.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+            "fingerprint_status": self.config.fingerprint_status,
+            "batch_entries": self.config.batch_entries,
             "scope": self.scope_json,
             "exclusions": self.exclusions_json,
         }))
@@ -544,8 +552,10 @@ impl<'a> LocationScanner<'a> {
                             && known.modified_time_utc_ms == file.modified_time_utc_ms
                     });
                     if unchanged {
-                        summary.unchanged_paths += 1;
                         let known = known.expect("checked above");
+                        if !known.observed_by_current_scan {
+                            summary.unchanged_paths += 1;
+                        }
                         pending_seen.push(seen_path(&file.relative_path, &known));
                     } else {
                         match self.events_for_file(&file, known.as_ref())? {
