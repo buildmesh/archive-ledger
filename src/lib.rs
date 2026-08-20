@@ -5,6 +5,8 @@ pub mod discovery;
 pub mod event_store;
 pub mod policy;
 pub mod projection;
+pub mod registry;
+pub mod review;
 pub mod scan;
 
 pub use annex::{
@@ -21,11 +23,23 @@ pub use event_store::{
     EventStoreError, PositionedEvent, SegmentManifest, VerificationReport, VerifiedSegment,
 };
 pub use policy::{
-    PolicyError, PolicyEvaluation, PolicyEvaluationResult, PolicyEvaluationValidity, PolicyFinding,
-    PolicyRequirements, UnconfiguredCollection,
+    CachedPolicyStatus, FilePolicyReview, PolicyError, PolicyEvaluation, PolicyEvaluationResult,
+    PolicyEvaluationValidity, PolicyFinding, PolicyFindingFilter, PolicyFindingPage,
+    PolicyRequirements, QualifyingCopyReview, StalePolicyEvaluation, UnconfiguredCollection,
 };
 pub use projection::{
     ApplyStats, LocationFreshness, ProjectionConfig, ProjectionDb, ProjectionError,
     ProjectionStatus, SUPPORTED_EVENT_TYPES,
+};
+pub use registry::{
+    ArchiveRootSnapshot, CollectionSnapshot, DeviceCheckIn, DeviceMount, DeviceSnapshot,
+    LocationSnapshot, PolicySnapshot, Registry, RegistryAction, RegistryChange, RegistryError,
+    RegistryMutationResult, RegistryPath, RegistryState, RiskAssignment, RiskDomainSnapshot,
+    SiteSnapshot,
+};
+pub use review::{
+    utf8_path, CopyFilter, CopyPage, CopyPageRequest, CopyReview, FileFilter, FilePage,
+    FilePageRequest, FileReview, FileSummary, HistoryEntry, HistoryPage, LosslessPath,
+    ObjectHashReview, ObjectReview, ReviewError,
 };
 pub use scan::{LocationScanner, ScanConfig, ScanError, ScanResult, ScanStatus, ScanSummary};

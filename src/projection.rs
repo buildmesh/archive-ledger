@@ -14,6 +14,11 @@ use crate::discovery::{EncodedPath, PathEncoding};
 use crate::event_store::{
     EventCursor, EventReadStats, EventRecord, EventStore, EventStoreError, PositionedEvent,
 };
+use crate::policy::PolicyRequirements;
+use crate::registry::{
+    ArchiveRootSnapshot, CollectionSnapshot, DeviceSnapshot, LocationSnapshot, PolicySnapshot,
+    RegistryPath, RiskAssignment, RiskDomainSnapshot, SiteSnapshot,
+};
 
 const SCHEMA_VERSION: u32 = 4;
 const STREAM_ID: &str = "stream_primary";
@@ -324,6 +329,23 @@ event_catalog! {
 }
 
 impl ProjectionDb {
+    pub fn open_existing(path: impl AsRef<Path>, config: ProjectionConfig) -> Result<Self> {
+        config.validate()?;
+        let path = path.as_ref().to_path_buf();
+        fs::metadata(&path).map_err(|source| io_error("open database", &path, source))?;
+        let database = Self { path, config };
+        let connection = database.open_connection()?;
+        let archive_id = meta_required(&connection, "archive_id")
+            .map_err(|source| sqlite_error(&database.path, source))?;
+        database.validate_identity(&connection, &archive_id)?;
+        validate_status(
+            &connection,
+            &read_status(&connection).map_err(|source| sqlite_error(&database.path, source))?,
+            &database.path,
+        )?;
+        Ok(database)
+    }
+
     pub fn open_or_create(
         path: impl AsRef<Path>,
         archive_id: &str,
@@ -1890,6 +1912,29 @@ fn project_semantic_event(
     record: &EventRecord,
 ) -> std::result::Result<(), BatchError> {
     match record.envelope.event_type.as_str() {
+        "site_registered" | "site_updated" | "site_retired" => {
+            project_site_snapshot(transaction, record)
+        }
+        "policy_registered" | "policy_updated" | "policy_retired" => {
+            project_policy_snapshot(transaction, record)
+        }
+        "collection_registered" | "collection_updated" | "collection_retired" => {
+            project_collection_snapshot(transaction, record)
+        }
+        "device_registered" | "device_updated" | "device_moved" | "device_retired" => {
+            project_device_snapshot(transaction, record)
+        }
+        "archive_root_registered" | "archive_root_updated" | "archive_root_retired" => {
+            project_archive_root_snapshot(transaction, record)
+        }
+        "location_registered" | "location_updated" | "location_retired" => {
+            project_location_snapshot(transaction, record)
+        }
+        "risk_domain_registered" | "risk_domain_updated" | "risk_domain_retired" => {
+            project_risk_domain_snapshot(transaction, record)
+        }
+        "risk_assigned" => project_risk_assignment(transaction, record, true),
+        "risk_unassigned" => project_risk_assignment(transaction, record, false),
         "external_identity_observed" => project_external_identity_observed(transaction, record),
         "external_identity_resolved" => project_external_identity_resolved(transaction, record),
         "external_availability_observed" => project_external_availability(transaction, record),
@@ -1910,6 +1955,427 @@ fn project_semantic_event(
         "annex_import_started" => project_annex_import_started(transaction, record),
         "annex_import_completed" => project_annex_import_completed(transaction, record),
         _ => Ok(()),
+    }
+}
+
+fn project_site_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: SiteSnapshot = payload(record)?;
+    validate_snapshot(record, &value.site_id, &value.display_name, &value.status)?;
+    transaction.execute(
+        "INSERT INTO sites(site_id, display_name, site_kind, description, status, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(site_id) DO UPDATE SET display_name = excluded.display_name,
+           site_kind = excluded.site_kind, description = excluded.description,
+           status = excluded.status, last_event_id = excluded.last_event_id",
+        params![
+            value.site_id,
+            value.display_name,
+            value.site_kind,
+            value.description,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_policy_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: PolicySnapshot = payload(record)?;
+    validate_snapshot(record, &value.policy_id, &value.display_name, &value.status)?;
+    let requirements_json = serde_json::to_string(&value.requirements)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    PolicyRequirements::from_json(&value.policy_id, &requirements_json)
+        .map_err(|error| invalid_payload(record, &error.to_string()))?;
+    if value.policy_version == 0 {
+        return Err(invalid_payload(record, "policy_version must be positive"));
+    }
+    let prior_version: Option<i64> = transaction
+        .query_row(
+            "SELECT policy_version FROM policies WHERE policy_id = ?1",
+            [&value.policy_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(prior) = prior_version {
+        let prior = u64::try_from(prior)
+            .map_err(|_| invalid_payload(record, "stored policy_version is invalid"))?;
+        if value.policy_version < prior
+            || (record.envelope.event_type == "policy_updated" && value.policy_version <= prior)
+        {
+            return Err(invalid_payload(
+                record,
+                "policy updates must increase policy_version",
+            ));
+        }
+    }
+    transaction.execute(
+        "INSERT INTO policies(policy_id, display_name, policy_version, requirements_json,
+                              enabled, status, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(policy_id) DO UPDATE SET display_name = excluded.display_name,
+           policy_version = excluded.policy_version, requirements_json = excluded.requirements_json,
+           enabled = excluded.enabled, status = excluded.status,
+           last_event_id = excluded.last_event_id",
+        params![
+            value.policy_id,
+            value.display_name,
+            sql_integer(value.policy_version, "policy_version", record)?,
+            requirements_json,
+            value.enabled,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_collection_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: CollectionSnapshot = payload(record)?;
+    validate_snapshot(
+        record,
+        &value.collection_id,
+        &value.display_name,
+        &value.status,
+    )?;
+    transaction.execute(
+        "INSERT INTO collections(collection_id, display_name, description, home_site_id,
+                                 policy_id, status, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(collection_id) DO UPDATE SET display_name = excluded.display_name,
+           description = excluded.description, home_site_id = excluded.home_site_id,
+           policy_id = excluded.policy_id, status = excluded.status,
+           last_event_id = excluded.last_event_id",
+        params![
+            value.collection_id,
+            value.display_name,
+            value.description,
+            value.home_site_id,
+            value.policy_id,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_device_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: DeviceSnapshot = payload(record)?;
+    validate_snapshot(record, &value.device_id, &value.display_name, &value.status)?;
+    let previous_site: Option<Option<String>> = transaction
+        .query_row(
+            "SELECT current_site_id FROM devices WHERE device_id = ?1",
+            [&value.device_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    transaction.execute(
+        "INSERT INTO devices(device_id, display_name, device_kind, serial_hint,
+          hardware_fingerprint, fingerprint_kind, identity_state, owner, status,
+          current_site_id, expected_availability, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(device_id) DO UPDATE SET display_name = excluded.display_name,
+          device_kind = excluded.device_kind, serial_hint = excluded.serial_hint,
+          hardware_fingerprint = excluded.hardware_fingerprint,
+          fingerprint_kind = excluded.fingerprint_kind,
+          identity_state = excluded.identity_state, owner = excluded.owner,
+          status = excluded.status, current_site_id = excluded.current_site_id,
+          expected_availability = excluded.expected_availability,
+          last_event_id = excluded.last_event_id",
+        params![
+            value.device_id,
+            value.display_name,
+            value.device_kind,
+            value.serial_hint,
+            value.hardware_fingerprint,
+            value.fingerprint_kind,
+            value.identity_state,
+            value.owner,
+            value.status,
+            value.current_site_id,
+            value.expected_availability,
+            record.envelope.event_id,
+        ],
+    )?;
+    if previous_site.flatten() != value.current_site_id {
+        transaction.execute(
+            "UPDATE device_site_history SET departed_time_utc_ms = ?2
+             WHERE device_id = ?1 AND departed_time_utc_ms IS NULL",
+            params![
+                value.device_id,
+                sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            ],
+        )?;
+        if let Some(site_id) = value.current_site_id {
+            transaction.execute(
+                "INSERT INTO device_site_history(device_id, site_id, arrived_time_utc_ms,
+                                                 moved_event_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    value.device_id,
+                    site_id,
+                    sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+                    record.envelope.event_id,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn project_archive_root_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ArchiveRootSnapshot = payload(record)?;
+    validate_snapshot(
+        record,
+        &value.archive_root_id,
+        &value.display_name,
+        &value.status,
+    )?;
+    let bytes = registry_path_bytes(&value.root_path_on_device, record)?;
+    transaction.execute(
+        "INSERT INTO archive_roots(archive_root_id, device_id, display_name,
+          root_path_on_device_bytes, root_path_encoding, root_path_display,
+          status, created_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(archive_root_id) DO UPDATE SET device_id = excluded.device_id,
+          display_name = excluded.display_name,
+          root_path_on_device_bytes = excluded.root_path_on_device_bytes,
+          root_path_encoding = excluded.root_path_encoding,
+          root_path_display = excluded.root_path_display, status = excluded.status",
+        params![
+            value.archive_root_id,
+            value.device_id,
+            value.display_name,
+            bytes,
+            value.root_path_on_device.encoding,
+            value.root_path_on_device.display,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_location_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: LocationSnapshot = payload(record)?;
+    validate_snapshot(
+        record,
+        &value.location_id,
+        &value.display_name,
+        &value.status,
+    )?;
+    let relative_bytes = value
+        .relative_path
+        .as_ref()
+        .map(|path| registry_path_bytes(path, record))
+        .transpose()?;
+    if value.kind == "filesystem" {
+        let consistent: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_roots r
+             WHERE r.archive_root_id = ?1 AND r.device_id = ?2)",
+            params![value.archive_root_id, value.device_id],
+            |row| row.get(0),
+        )?;
+        if !consistent || value.site_id.is_some() || relative_bytes.is_none() {
+            return Err(invalid_payload(
+                record,
+                "filesystem location must have a matching root/device, relative path, and no site",
+            ));
+        }
+    } else if value.kind == "service" {
+        if value.site_id.is_none()
+            || value.archive_root_id.is_some()
+            || value.device_id.is_some()
+            || relative_bytes.is_some()
+        {
+            return Err(invalid_payload(
+                record,
+                "service location must have only a site topology",
+            ));
+        }
+    } else {
+        return Err(invalid_payload(record, "location kind is unsupported"));
+    }
+    transaction.execute(
+        "INSERT INTO locations(location_id, display_name, kind, archive_root_id,
+          relative_path_bytes, relative_path_encoding, relative_path_display,
+          device_id, site_id, encryption_state, trust_level, expected_availability,
+          is_writable, status, created_event_id, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+         ON CONFLICT(location_id) DO UPDATE SET display_name = excluded.display_name,
+          kind = excluded.kind, archive_root_id = excluded.archive_root_id,
+          relative_path_bytes = excluded.relative_path_bytes,
+          relative_path_encoding = excluded.relative_path_encoding,
+          relative_path_display = excluded.relative_path_display,
+          device_id = excluded.device_id, site_id = excluded.site_id,
+          encryption_state = excluded.encryption_state, trust_level = excluded.trust_level,
+          expected_availability = excluded.expected_availability,
+          is_writable = excluded.is_writable, status = excluded.status,
+          last_event_id = excluded.last_event_id",
+        params![
+            value.location_id,
+            value.display_name,
+            value.kind,
+            value.archive_root_id,
+            relative_bytes,
+            value
+                .relative_path
+                .as_ref()
+                .map(|path| path.encoding.as_str()),
+            value
+                .relative_path
+                .as_ref()
+                .map(|path| path.display.as_str()),
+            value.device_id,
+            value.site_id,
+            value.encryption_state,
+            value.trust_level,
+            value.expected_availability,
+            value.is_writable,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_risk_domain_snapshot(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: RiskDomainSnapshot = payload(record)?;
+    validate_snapshot(
+        record,
+        &value.risk_domain_id,
+        &value.display_name,
+        &value.status,
+    )?;
+    transaction.execute(
+        "INSERT INTO risk_domains(risk_domain_id, display_name, risk_kind,
+                                  description, status, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(risk_domain_id) DO UPDATE SET display_name = excluded.display_name,
+          risk_kind = excluded.risk_kind, description = excluded.description,
+          status = excluded.status, last_event_id = excluded.last_event_id",
+        params![
+            value.risk_domain_id,
+            value.display_name,
+            value.risk_kind,
+            value.description,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_risk_assignment(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+    assign: bool,
+) -> std::result::Result<(), BatchError> {
+    let value: RiskAssignment = payload(record)?;
+    let exists: bool = transaction.query_row(
+        "SELECT CASE ?1
+           WHEN 'location' THEN EXISTS(SELECT 1 FROM locations WHERE location_id = ?2)
+           WHEN 'archive_root' THEN EXISTS(SELECT 1 FROM archive_roots WHERE archive_root_id = ?2)
+           WHEN 'device' THEN EXISTS(SELECT 1 FROM devices WHERE device_id = ?2)
+           WHEN 'site' THEN EXISTS(SELECT 1 FROM sites WHERE site_id = ?2)
+           ELSE 0 END",
+        params![value.entity_type, value.entity_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(invalid_payload(record, "risk assignment entity is unknown"));
+    }
+    if assign {
+        transaction.execute(
+            "INSERT INTO entity_risk_domains(entity_type, entity_id, risk_domain_id,
+                                             assigned_event_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(entity_type, entity_id, risk_domain_id) DO UPDATE SET
+               assigned_event_id = excluded.assigned_event_id",
+            params![
+                value.entity_type,
+                value.entity_id,
+                value.risk_domain_id,
+                record.envelope.event_id,
+            ],
+        )?;
+    } else {
+        transaction.execute(
+            "DELETE FROM entity_risk_domains
+             WHERE entity_type = ?1 AND entity_id = ?2 AND risk_domain_id = ?3",
+            params![value.entity_type, value.entity_id, value.risk_domain_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot(
+    record: &EventRecord,
+    id: &str,
+    display_name: &str,
+    status: &str,
+) -> std::result::Result<(), BatchError> {
+    if id.trim().is_empty() || display_name.trim().is_empty() {
+        return Err(invalid_payload(
+            record,
+            "registry ID and display name are required",
+        ));
+    }
+    let retired_event = record.envelope.event_type.ends_with("_retired");
+    if (retired_event && status != "retired") || (!retired_event && status != "active") {
+        return Err(invalid_payload(
+            record,
+            "registry event type and snapshot status disagree",
+        ));
+    }
+    Ok(())
+}
+
+fn registry_path_bytes(
+    path: &RegistryPath,
+    record: &EventRecord,
+) -> std::result::Result<Vec<u8>, BatchError> {
+    match path.encoding.as_str() {
+        "utf8" => path
+            .text
+            .as_ref()
+            .map(|text| text.as_bytes().to_vec())
+            .ok_or_else(|| invalid_payload(record, "UTF-8 registry path lacks text")),
+        "unix_bytes" | "windows_utf16le" => path
+            .base64
+            .as_ref()
+            .ok_or_else(|| invalid_payload(record, "binary registry path lacks base64"))
+            .and_then(|value| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(|error| {
+                        invalid_payload(record, &format!("invalid path base64: {error}"))
+                    })
+            }),
+        _ => Err(invalid_payload(
+            record,
+            "registry path encoding is unsupported",
+        )),
     }
 }
 
@@ -3547,6 +4013,152 @@ mod tests {
         fs::rename(&canonical, &unavailable).unwrap();
         assert_eq!(database.status().unwrap().cursor.applied_seq, 1);
         fs::rename(&unavailable, &canonical).unwrap();
+    }
+
+    #[test]
+    fn registry_snapshots_project_and_rebuild_with_validated_topology() {
+        let temp = TempDir::new().unwrap();
+        let store = event_store(&temp, 100);
+        let requirements = json!({
+            "min_qualifying_copies": 2,
+            "min_devices": 2,
+            "min_sites": 2,
+            "require_offsite_copy": true,
+            "require_offline_copy": false,
+            "require_encrypted_offsite": false,
+            "max_verification_age_days": 365,
+            "max_observation_age_days": 365,
+            "max_device_checkin_age_days": 365
+        });
+        store
+            .append_batch(vec![
+                EventRequest::new(
+                    "site_registered",
+                    json!({"site_id":"site_1","display_name":"Home","site_kind":"home",
+                           "description":null,"status":"active"}),
+                ),
+                EventRequest::new(
+                    "policy_registered",
+                    json!({"policy_id":"policy_1","display_name":"Starter","policy_version":1,
+                           "requirements":requirements,"enabled":true,"status":"active"}),
+                ),
+                EventRequest::new(
+                    "collection_registered",
+                    json!({"collection_id":"collection_1","display_name":"Photos",
+                           "description":null,"home_site_id":"site_1","policy_id":"policy_1",
+                           "status":"active"}),
+                ),
+                EventRequest::new(
+                    "device_registered",
+                    json!({"device_id":"device_1","display_name":"Disk","device_kind":"disk",
+                           "serial_hint":null,"hardware_fingerprint":"fp1","fingerprint_kind":"serial",
+                           "identity_state":"confirmed","owner":null,"status":"active",
+                           "current_site_id":"site_1","expected_availability":"online"}),
+                ),
+                EventRequest::new(
+                    "archive_root_registered",
+                    json!({"archive_root_id":"root_1","device_id":"device_1",
+                           "display_name":"Archive root","root_path_on_device":{
+                             "encoding":"utf8","text":"/archive","base64":null,"display":"/archive"},
+                           "status":"active"}),
+                ),
+                EventRequest::new(
+                    "location_registered",
+                    json!({"location_id":"location_1","display_name":"Main archive",
+                           "kind":"filesystem","archive_root_id":"root_1","relative_path":{
+                             "encoding":"utf8","text":"photos","base64":null,"display":"photos"},
+                           "device_id":"device_1","site_id":null,"encryption_state":"encrypted",
+                           "trust_level":"trusted","expected_availability":"online",
+                           "is_writable":false,"status":"active"}),
+                ),
+                EventRequest::new(
+                    "risk_domain_registered",
+                    json!({"risk_domain_id":"risk_1","display_name":"Flood zone",
+                           "risk_kind":"environment","description":null,"status":"active"}),
+                ),
+                EventRequest::new(
+                    "risk_assigned",
+                    json!({"entity_type":"archive_root","entity_id":"root_1",
+                           "risk_domain_id":"risk_1"}),
+                ),
+            ])
+            .unwrap();
+        let database = database(&temp, ProjectionConfig::default());
+        database.apply(&store).unwrap();
+        let connection = database.open_connection().unwrap();
+        let count = |table: &str| -> i64 {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count("sites"), 1);
+        assert_eq!(count("policies"), 1);
+        assert_eq!(count("collections"), 1);
+        assert_eq!(count("devices"), 1);
+        assert_eq!(count("device_site_history"), 1);
+        assert_eq!(count("archive_roots"), 1);
+        assert_eq!(count("locations"), 1);
+        assert_eq!(count("risk_domains"), 1);
+        assert_eq!(count("entity_risk_domains"), 1);
+        drop(connection);
+
+        let rebuilt_path = temp.path().join("rebuilt.db");
+        let rebuilt = ProjectionDb::rebuild(
+            &store,
+            &rebuilt_path,
+            "arc_test",
+            ProjectionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.events_applied, 8);
+        let rebuilt =
+            ProjectionDb::open_existing(rebuilt_path, ProjectionConfig::default()).unwrap();
+        assert_eq!(rebuilt.status().unwrap().cursor.applied_seq, 8);
+        assert_eq!(
+            rebuilt
+                .open_connection()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM entity_risk_domains", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_registry_topology_fails_before_projection_cursor_advances() {
+        let temp = TempDir::new().unwrap();
+        let store = event_store(&temp, 100);
+        store
+            .append_batch(vec![
+                EventRequest::new(
+                    "site_registered",
+                    json!({"site_id":"site_1","display_name":"Home","site_kind":"home",
+                           "description":null,"status":"active"}),
+                ),
+                EventRequest::new(
+                    "device_registered",
+                    json!({"device_id":"device_1","display_name":"Disk","device_kind":"disk",
+                           "serial_hint":null,"hardware_fingerprint":"fp1","fingerprint_kind":"serial",
+                           "identity_state":"confirmed","owner":null,"status":"active",
+                           "current_site_id":"site_1","expected_availability":"online"}),
+                ),
+                EventRequest::new(
+                    "location_registered",
+                    json!({"location_id":"bad","display_name":"Bad location","kind":"filesystem",
+                           "archive_root_id":"missing","relative_path":{"encoding":"utf8",
+                             "text":"","base64":null,"display":""},"device_id":"device_1",
+                           "site_id":null,"encryption_state":"unknown","trust_level":"unknown",
+                           "expected_availability":"online","is_writable":false,"status":"active"}),
+                ),
+            ])
+            .unwrap();
+        let database = database(&temp, ProjectionConfig::default());
+        let error = database.apply(&store).unwrap_err();
+        assert_eq!(error.code(), "invalid_event_payload");
+        assert_eq!(database.status().unwrap().cursor.applied_seq, 0);
     }
 
     #[test]
