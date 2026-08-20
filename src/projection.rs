@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -130,7 +131,9 @@ pub struct ProjectionConfig {
 impl Default for ProjectionConfig {
     fn default() -> Self {
         Self {
-            batch_events: 1_000,
+            // Amortize synchronous durable commits; the byte limit remains the
+            // primary memory bound when events are large.
+            batch_events: 10_000,
             batch_bytes: 16 * 1024 * 1024,
             busy_timeout: Duration::from_secs(5),
         }
@@ -1857,6 +1860,9 @@ fn apply_batch(
     initial_policy_input_seq: u64,
 ) -> std::result::Result<(), BatchError> {
     let mut policy_input_seq = initial_policy_input_seq;
+    // A transaction has one SQLite snapshot, so a running scan check can be
+    // reused until a scan completion in this same ordered batch invalidates it.
+    let mut verified_running_scans = HashSet::new();
     let mut insert_event = transaction.prepare_cached(
         "INSERT INTO events(
             stream_id, seq, event_id, event_type, event_time_utc_ms, actor_id, host_id, job_id,
@@ -1904,7 +1910,7 @@ fn apply_batch(
         ])?;
 
         project_operation_outcome(transaction, record)?;
-        project_semantic_event(transaction, record)?;
+        project_semantic_event(transaction, record, &mut verified_running_scans)?;
         if record.envelope.event_type == "checkpoint_created" {
             project_checkpoint_created(transaction, record)?;
         }
@@ -1941,6 +1947,7 @@ fn apply_batch(
 fn project_semantic_event(
     transaction: &Transaction<'_>,
     record: &EventRecord,
+    verified_running_scans: &mut HashSet<(String, String)>,
 ) -> std::result::Result<(), BatchError> {
     match record.envelope.event_type.as_str() {
         "catalog_location_set" => project_catalog_location(transaction, record),
@@ -1986,9 +1993,17 @@ fn project_semantic_event(
         "device_checked_in" => project_device_checked_in(transaction, record),
         "device_mount_observed" => project_device_mount_observed(transaction, record),
         "scan_started" => project_scan_started(transaction, record),
-        "path_missing_candidate" => project_scan_missing_candidate(transaction, record, "path"),
-        "copy_missing_candidate" => project_scan_missing_candidate(transaction, record, "copy"),
-        "scan_completed" => project_scan_completed(transaction, record),
+        "path_missing_candidate" => {
+            project_scan_missing_candidate(transaction, record, "path", verified_running_scans)
+        }
+        "copy_missing_candidate" => {
+            project_scan_missing_candidate(transaction, record, "copy", verified_running_scans)
+        }
+        "scan_completed" => {
+            let result = project_scan_completed(transaction, record);
+            verified_running_scans.clear();
+            result
+        }
         "annex_import_started" => project_annex_import_started(transaction, record),
         "annex_import_completed" => project_annex_import_completed(transaction, record),
         _ => Ok(()),
@@ -3016,6 +3031,7 @@ fn project_scan_missing_candidate(
     transaction: &Transaction<'_>,
     record: &EventRecord,
     kind: &str,
+    verified_running_scans: &mut HashSet<(String, String)>,
 ) -> std::result::Result<(), BatchError> {
     let value: ScanMissingCandidatePayload = payload(record)?;
     if (kind == "path" && value.file_ref_id.is_none())
@@ -3026,19 +3042,23 @@ fn project_scan_missing_candidate(
             "missing candidate lacks its target ID",
         ));
     }
-    let running: bool = transaction.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM scan_runs
-            WHERE scan_id = ?1 AND location_id = ?2 AND status = 'running'
-         )",
-        params![value.scan_id, value.location_id],
-        |row| row.get(0),
-    )?;
-    if !running {
-        return Err(invalid_payload(
-            record,
-            "missing candidate has no running scan",
-        ));
+    let scan_key = (value.scan_id.clone(), value.location_id.clone());
+    if !verified_running_scans.contains(&scan_key) {
+        let running: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM scan_runs
+                WHERE scan_id = ?1 AND location_id = ?2 AND status = 'running'
+             )",
+            params![value.scan_id, value.location_id],
+            |row| row.get(0),
+        )?;
+        if !running {
+            return Err(invalid_payload(
+                record,
+                "missing candidate has no running scan",
+            ));
+        }
+        verified_running_scans.insert(scan_key);
     }
     transaction.execute(
         "INSERT INTO scan_missing_candidates(
@@ -3598,21 +3618,6 @@ fn project_operation_outcome(
     else {
         return Ok(());
     };
-    let existing: Option<String> = transaction
-        .query_row(
-            "SELECT event_id FROM operation_outcomes WHERE operation_key = ?1",
-            [operation_key],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(event_id) = existing {
-        return Err(BatchError::Projection(
-            ProjectionError::DuplicateOperationKey {
-                operation_key: operation_key.to_owned(),
-                event_id,
-            },
-        ));
-    }
     let payload: OperationOutcomePayload = serde_json::from_value(record.envelope.payload.clone())
         .map_err(|source| {
             BatchError::Projection(ProjectionError::InvalidPayload {
@@ -3621,10 +3626,11 @@ fn project_operation_outcome(
                 message: format!("operation outcome: {source}"),
             })
         })?;
-    transaction.execute(
+    let inserted = transaction.execute(
         "INSERT INTO operation_outcomes(
             operation_key, event_id, event_seq, job_id, job_type, item_type, item_key, outcome_kind
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(operation_key) DO NOTHING",
         params![
             payload.operation_key,
             record.envelope.event_id,
@@ -3636,6 +3642,19 @@ fn project_operation_outcome(
             payload.outcome_kind,
         ],
     )?;
+    if inserted == 0 {
+        let event_id = transaction.query_row(
+            "SELECT event_id FROM operation_outcomes WHERE operation_key = ?1",
+            [operation_key],
+            |row| row.get(0),
+        )?;
+        return Err(BatchError::Projection(
+            ProjectionError::DuplicateOperationKey {
+                operation_key: operation_key.to_owned(),
+                event_id,
+            },
+        ));
+    }
     Ok(())
 }
 
@@ -4071,6 +4090,23 @@ mod tests {
         assert_eq!(tail.lines_read, 1);
         assert_eq!(tail.segments_opened, 1);
         assert_eq!(database.status().unwrap().cursor.applied_seq, 101);
+    }
+
+    #[test]
+    fn default_projection_amortizes_durable_commits_with_a_bounded_batch() {
+        let temp = TempDir::new().unwrap();
+        let store = event_store(&temp, 10_000);
+        store
+            .append_batch((0..2_500).map(summary_event).collect())
+            .unwrap();
+        let config = ProjectionConfig::default();
+        assert_eq!(config.batch_events, 10_000);
+        assert_eq!(config.batch_bytes, 16 * 1024 * 1024);
+        let database = database(&temp, config);
+        let applied = database.apply(&store).unwrap();
+        assert_eq!(applied.events_applied, 2_500);
+        assert_eq!(applied.transactions, 1);
+        assert!(applied.caught_up);
     }
 
     #[test]

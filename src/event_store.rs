@@ -1554,6 +1554,7 @@ impl EventStore {
         }
 
         let mut records = Vec::with_capacity(prepared.len());
+        let mut append_file = None;
         for (envelope, line, hash) in prepared {
             if state.open.is_none() {
                 let path = self.layout.segment_path(state.next_seq);
@@ -1572,10 +1573,17 @@ impl EventStore {
             }
 
             let open = state.open.as_mut().expect("open segment was created");
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&open.path)
-                .map_err(|source| io_error("open segment for append", &open.path, source))?;
+            if append_file.is_none() {
+                append_file = Some(
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&open.path)
+                        .map_err(|source| {
+                            io_error("open segment for append", &open.path, source)
+                        })?,
+                );
+            }
+            let file = append_file.as_mut().expect("append file was opened");
             file.write_all(&line)
                 .and_then(|_| file.write_all(b"\n"))
                 .map_err(|source| io_error("append event", &open.path, source))?;
@@ -1591,10 +1599,12 @@ impl EventStore {
             });
 
             if open.event_count == self.config.rollover_events {
+                drop(append_file.take());
                 self.close_open_segment(state)?;
             }
         }
 
+        drop(append_file);
         if state.open.is_some() {
             if force_close_after {
                 self.close_open_segment(state)?;
