@@ -3,6 +3,7 @@
 pub mod annex;
 pub mod discovery;
 pub mod event_store;
+pub mod metadata;
 pub mod policy;
 pub mod projection;
 pub mod registry;
@@ -21,6 +22,11 @@ pub use event_store::{
     AppendStats, Checkpoint, CheckpointSegment, EventBatch, EventCursor, EventEnvelope,
     EventReadStats, EventRecord, EventReferences, EventRequest, EventStore, EventStoreConfig,
     EventStoreError, PositionedEvent, SegmentManifest, VerificationReport, VerifiedSegment,
+};
+pub use metadata::{
+    initialize_metadata_repository, restore_check, IndependenceAssessment,
+    MetadataCheckpointResult, MetadataDestinationSnapshot, MetadataDestinationState, MetadataError,
+    MetadataProtectionStatus, MetadataProtector, MetadataRegistry, RestoreCheckResult,
 };
 pub use policy::{
     CachedPolicyStatus, FilePolicyReview, PolicyError, PolicyEvaluation, PolicyEvaluationResult,

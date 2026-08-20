@@ -14,6 +14,7 @@ use crate::discovery::{EncodedPath, PathEncoding};
 use crate::event_store::{
     EventCursor, EventReadStats, EventRecord, EventStore, EventStoreError, PositionedEvent,
 };
+use crate::metadata::{locator_is_secret_free, MetadataDestinationSnapshot};
 use crate::policy::PolicyRequirements;
 use crate::registry::{
     ArchiveRootSnapshot, CollectionSnapshot, DeviceSnapshot, LocationSnapshot, PolicySnapshot,
@@ -1579,6 +1580,36 @@ struct CheckpointCreatedPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogLocationPayload {
+    location_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCommitPayload {
+    checkpoint_id: String,
+    git_commit: String,
+    event_last_seq: u64,
+    event_last_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointReplicationPayload {
+    checkpoint_id: String,
+    destination_id: String,
+    status: String,
+    observed_git_commit: Option<String>,
+    observed_event_last_seq: Option<u64>,
+    observed_event_last_hash: Option<String>,
+    independence_status: String,
+    independence_reasons: Value,
+    error_code: Option<String>,
+    error_detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LosslessPathPayload {
     encoding: String,
     text: Option<String>,
@@ -1912,6 +1943,12 @@ fn project_semantic_event(
     record: &EventRecord,
 ) -> std::result::Result<(), BatchError> {
     match record.envelope.event_type.as_str() {
+        "catalog_location_set" => project_catalog_location(transaction, record),
+        "checkpoint_commit_observed" => project_checkpoint_commit(transaction, record),
+        "checkpoint_replication_observed" => project_checkpoint_replication(transaction, record),
+        "metadata_destination_registered"
+        | "metadata_destination_updated"
+        | "metadata_destination_retired" => project_metadata_destination(transaction, record),
         "site_registered" | "site_updated" | "site_retired" => {
             project_site_snapshot(transaction, record)
         }
@@ -3637,6 +3674,234 @@ fn project_checkpoint_created(
         ],
     )?;
     Ok(())
+}
+
+fn project_catalog_location(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: CatalogLocationPayload = payload(record)?;
+    let active: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM locations WHERE location_id = ?1 AND status = 'active')",
+        [&value.location_id],
+        |row| row.get(0),
+    )?;
+    if !active {
+        return Err(invalid_payload(record, "catalog location is not active"));
+    }
+    transaction.execute(
+        "UPDATE archive_meta SET value = ?1 WHERE key = 'catalog_location_id'",
+        [&value.location_id],
+    )?;
+    Ok(())
+}
+
+fn project_metadata_destination(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: MetadataDestinationSnapshot = payload(record)?;
+    validate_snapshot(
+        record,
+        &value.destination_id,
+        &value.display_name,
+        &value.status,
+    )?;
+    if !value.remote_ref.starts_with("refs/")
+        || value.location_id.is_empty()
+        || value.git_remote_name.is_empty()
+        || value.remote_locator.is_empty()
+        || !locator_is_secret_free(&value.remote_locator)
+    {
+        return Err(invalid_payload(
+            record,
+            "metadata destination fields are invalid",
+        ));
+    }
+    let location_active: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM locations WHERE location_id = ?1 AND status = 'active')",
+        [&value.location_id],
+        |row| row.get(0),
+    )?;
+    if !location_active {
+        return Err(invalid_payload(
+            record,
+            "metadata destination location is not active",
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO metadata_destinations(destination_id, display_name, location_id,
+          git_remote_name, remote_locator, remote_ref, status, last_event_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(destination_id) DO UPDATE SET
+          display_name = excluded.display_name, location_id = excluded.location_id,
+          git_remote_name = excluded.git_remote_name,
+          remote_locator = excluded.remote_locator, remote_ref = excluded.remote_ref,
+          status = excluded.status, last_event_id = excluded.last_event_id",
+        params![
+            value.destination_id,
+            value.display_name,
+            value.location_id,
+            value.git_remote_name,
+            value.remote_locator,
+            value.remote_ref,
+            value.status,
+            record.envelope.event_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn project_checkpoint_commit(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: CheckpointCommitPayload = payload(record)?;
+    if !is_git_object_id(&value.git_commit) {
+        return Err(invalid_payload(record, "git commit identity is invalid"));
+    }
+    let updated = transaction.execute(
+        "UPDATE checkpoints SET local_git_commit = ?2, commit_observed_event_id = ?3,
+          commit_observed_time_utc_ms = ?4, verification_status = 'verified',
+          last_verified_time_utc_ms = ?4
+         WHERE checkpoint_id = ?1 AND event_last_seq = ?5 AND event_last_hash = ?6
+           AND (local_git_commit IS NULL OR local_git_commit = ?2)",
+        params![
+            value.checkpoint_id,
+            value.git_commit,
+            record.envelope.event_id,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            sql_integer(value.event_last_seq, "event_last_seq", record)?,
+            value.event_last_hash,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(invalid_payload(
+            record,
+            "checkpoint commit does not match a projected checkpoint",
+        ));
+    }
+    let current: i64 = transaction.query_row(
+        "SELECT CAST(value AS INTEGER) FROM archive_meta
+         WHERE key = 'last_verified_checkpoint_seq'",
+        [],
+        |row| row.get(0),
+    )?;
+    let observed = sql_integer(value.event_last_seq, "event_last_seq", record)?;
+    if observed >= current {
+        transaction.execute(
+            "UPDATE archive_meta SET value = ?1 WHERE key = 'last_verified_checkpoint_id'",
+            [&value.checkpoint_id],
+        )?;
+        transaction.execute(
+            "UPDATE archive_meta SET value = ?1 WHERE key = 'last_verified_checkpoint_seq'",
+            [observed.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_checkpoint_replication(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: CheckpointReplicationPayload = payload(record)?;
+    if !matches!(
+        value.status.as_str(),
+        "present" | "missing" | "diverged" | "error"
+    ) || !matches!(
+        value.independence_status.as_str(),
+        "independent" | "overlapping" | "unknown"
+    ) || value
+        .observed_git_commit
+        .as_deref()
+        .is_some_and(|commit| !is_git_object_id(commit))
+    {
+        return Err(invalid_payload(
+            record,
+            "replication observation is invalid",
+        ));
+    }
+    let references_exist: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id = ?1)
+          AND EXISTS(SELECT 1 FROM metadata_destinations
+                     WHERE destination_id = ?2 AND status = 'active')",
+        params![value.checkpoint_id, value.destination_id],
+        |row| row.get(0),
+    )?;
+    if !references_exist {
+        return Err(invalid_payload(
+            record,
+            "replication references an unknown checkpoint or active destination",
+        ));
+    }
+    let checkpoint: (Option<String>, i64, String) = transaction.query_row(
+        "SELECT local_git_commit, event_last_seq, event_last_hash
+         FROM checkpoints WHERE checkpoint_id = ?1",
+        [&value.checkpoint_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if value.status == "present"
+        && (value.observed_git_commit.as_deref() != checkpoint.0.as_deref()
+            || value.observed_event_last_seq
+                != Some(u64::try_from(checkpoint.1).map_err(|_| {
+                    invalid_payload(record, "checkpoint sequence is outside u64 range")
+                })?)
+            || value.observed_event_last_hash.as_deref() != Some(checkpoint.2.as_str()))
+    {
+        return Err(invalid_payload(
+            record,
+            "present replication does not match the committed checkpoint",
+        ));
+    }
+    let observed_seq = value
+        .observed_event_last_seq
+        .map(|seq| sql_integer(seq, "observed_event_last_seq", record))
+        .transpose()?;
+    let reasons_json = serde_json::to_string(&value.independence_reasons).map_err(|source| {
+        BatchError::Projection(ProjectionError::InvalidPayload {
+            event_type: record.envelope.event_type.clone(),
+            seq: record.envelope.seq,
+            message: source.to_string(),
+        })
+    })?;
+    transaction.execute(
+        "INSERT INTO checkpoint_replications(checkpoint_id, destination_id, status,
+          observed_git_commit, observed_event_last_seq, observed_event_last_hash,
+          observed_time_utc_ms, event_id, independence_status,
+          independence_reason_json, error_code, error_detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(checkpoint_id, destination_id) DO UPDATE SET
+          status = excluded.status, observed_git_commit = excluded.observed_git_commit,
+          observed_event_last_seq = excluded.observed_event_last_seq,
+          observed_event_last_hash = excluded.observed_event_last_hash,
+          observed_time_utc_ms = excluded.observed_time_utc_ms,
+          event_id = excluded.event_id, independence_status = excluded.independence_status,
+          independence_reason_json = excluded.independence_reason_json,
+          error_code = excluded.error_code, error_detail = excluded.error_detail",
+        params![
+            value.checkpoint_id,
+            value.destination_id,
+            value.status,
+            value.observed_git_commit,
+            observed_seq,
+            value.observed_event_last_hash,
+            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            record.envelope.event_id,
+            value.independence_status,
+            reasons_json,
+            value.error_code,
+            value.error_detail,
+        ],
+    )?;
+    Ok(())
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn sql_integer(

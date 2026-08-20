@@ -404,6 +404,29 @@ impl EventStore {
         &self.layout.root
     }
 
+    pub fn archive_id(&self) -> Result<String> {
+        let batch = self.read_batch(&EventCursor::default(), 1, self.config.max_event_bytes)?;
+        let record = batch.events.first().ok_or_else(|| {
+            EventStoreError::InvalidLayout(
+                "event stream has no archive_initialized event".to_owned(),
+            )
+        })?;
+        if record.record.envelope.event_type != "archive_initialized" {
+            return Err(EventStoreError::InvalidLayout(
+                "the first event is not archive_initialized".to_owned(),
+            ));
+        }
+        record.record.envelope.payload["archive_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                EventStoreError::InvalidLayout(
+                    "archive_initialized lacks a valid archive_id".to_owned(),
+                )
+            })
+    }
+
     pub fn append(&self, request: EventRequest) -> Result<EventRecord> {
         let mut records = self.append_batch(vec![request])?;
         records.pop().ok_or_else(|| {

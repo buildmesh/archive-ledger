@@ -96,6 +96,40 @@ fn empty_archive_cli_has_human_and_stable_json_workflows() {
     let error: Value = serde_json::from_slice(&malformed.stderr).unwrap();
     assert_eq!(error["error"]["code"], "invalid_input");
 
+    let checkpoint = archive(&temp)
+        .args(["--json", "checkpoint"])
+        .output()
+        .unwrap();
+    assert!(checkpoint.status.success());
+    let checkpoint_output: Value = serde_json::from_slice(&checkpoint.stdout).unwrap();
+    assert_eq!(checkpoint_output["version"], 1);
+    assert!(checkpoint_output["local_git_commit"].as_str().is_some());
+
+    let verified = Command::new(env!("CARGO_BIN_EXE_archive"))
+        .arg("--database")
+        .arg(temp.path().join("database-does-not-exist.db"))
+        .arg("--events")
+        .arg(temp.path().join("canonical"))
+        .args(["--json", "events", "verify"])
+        .output()
+        .unwrap();
+    assert!(verified.status.success());
+    let output: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert!(output["last_seq"].as_u64().unwrap() > 0);
+
+    let rebuilt = temp.path().join("clean-restore.db");
+    let restored = Command::new(env!("CARGO_BIN_EXE_archive"))
+        .args(["--json", "restore", "check"])
+        .arg(temp.path().join("canonical"))
+        .arg("--rebuild-database")
+        .arg(&rebuilt)
+        .output()
+        .unwrap();
+    assert!(restored.status.success());
+    let output: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(output["archive_id"], "arc_cli_fixture");
+    assert_eq!(output["verified_event_seq"], output["rebuilt_event_seq"]);
+
     let empty_files = archive(&temp)
         .args(["--json", "file", "find", "--limit", "10"])
         .output()

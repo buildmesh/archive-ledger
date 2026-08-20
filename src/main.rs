@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use archive_ledger::{
     utf8_path, ArchiveRootSnapshot, CachedPolicyStatus, CollectionSnapshot, CopyFilter,
     CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot, EventRequest, EventStore,
-    EventStoreConfig, EventStoreError, FileFilter, FilePageRequest, LocationSnapshot, PolicyError,
+    EventStoreConfig, EventStoreError, FileFilter, FilePageRequest, LocationSnapshot,
+    MetadataDestinationSnapshot, MetadataError, MetadataProtector, MetadataRegistry, PolicyError,
     PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter, PolicyFindingPage, PolicySnapshot,
     ProjectionConfig, ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange,
     RegistryError, RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, SiteSnapshot,
@@ -108,6 +109,94 @@ enum Command {
     Report {
         #[command(subcommand)]
         command: ReportCommand,
+    },
+    /// Register and check Git destinations for canonical metadata.
+    MetadataDestination {
+        #[command(subcommand)]
+        command: MetadataDestinationCommand,
+    },
+    /// Record which registered location contains this catalog.
+    CatalogLocation { location_id: String },
+    /// Create or reconcile a durable metadata checkpoint.
+    Checkpoint {
+        #[command(subcommand)]
+        command: Option<CheckpointCommand>,
+        /// Push and observe every active metadata destination.
+        #[arg(long)]
+        replicate: bool,
+    },
+    /// Verify canonical event history.
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
+    /// Check clean-machine restoration from a cloned event repository.
+    Restore {
+        #[command(subcommand)]
+        command: RestoreCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MetadataDestinationCommand {
+    Add(MetadataDestinationArgs),
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    Show {
+        id: String,
+    },
+    Update {
+        snapshot: String,
+    },
+    Retire {
+        snapshot: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    Check {
+        destination_id: String,
+        checkpoint_id: String,
+        #[arg(long)]
+        push: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct MetadataDestinationArgs {
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    location: String,
+    #[arg(long)]
+    remote: String,
+    #[arg(long)]
+    locator: String,
+    #[arg(long = "ref", default_value = "refs/heads/archive-ledger")]
+    remote_ref: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum CheckpointCommand {
+    Reconcile { checkpoint_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum EventsCommand {
+    Verify,
+}
+
+#[derive(Debug, Subcommand)]
+enum RestoreCommand {
+    Check {
+        /// Local clone of a canonical event repository.
+        event_repository: PathBuf,
+        /// New or safely replaceable SQLite projection path.
+        #[arg(long)]
+        rebuild_database: PathBuf,
     },
 }
 
@@ -324,6 +413,8 @@ enum ReportCommand {
     Integrity(ReportArgs),
     /// Show cached per-policy totals and validity.
     Policy(ReportSummaryArgs),
+    /// Show checkpoint, commit, and independent replication coverage.
+    Metadata,
 }
 
 #[derive(Debug, Args)]
@@ -356,6 +447,7 @@ enum AppError {
     Review(ReviewError),
     Policy(PolicyError),
     Registry(RegistryError),
+    Metadata(MetadataError),
     Json(serde_json::Error),
     Clock,
     Input(String),
@@ -369,6 +461,7 @@ impl AppError {
             Self::Review(error) => error.code(),
             Self::Policy(error) => error.code(),
             Self::Registry(error) => error.code(),
+            Self::Metadata(error) => error.code(),
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
             Self::Input(_) => "invalid_input",
@@ -384,6 +477,7 @@ impl std::fmt::Display for AppError {
             Self::Review(error) => error.fmt(formatter),
             Self::Policy(error) => error.fmt(formatter),
             Self::Registry(error) => error.fmt(formatter),
+            Self::Metadata(error) => error.fmt(formatter),
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
             Self::Input(message) => formatter.write_str(message),
@@ -421,6 +515,12 @@ impl From<RegistryError> for AppError {
     }
 }
 
+impl From<MetadataError> for AppError {
+    fn from(error: MetadataError) -> Self {
+        Self::Metadata(error)
+    }
+}
+
 impl From<serde_json::Error> for AppError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
@@ -443,6 +543,13 @@ struct PolicyReportOutput {
     collection: Option<String>,
     rollup_scope: &'static str,
     status: CachedPolicyStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusOutput {
+    version: u32,
+    policy: CachedPolicyStatus,
+    metadata: archive_ledger::MetadataProtectionStatus,
 }
 
 fn main() -> ExitCode {
@@ -484,6 +591,32 @@ fn main() -> ExitCode {
 fn execute(cli: &Cli) -> Result<u8, AppError> {
     if let Command::Init { archive_id } = &cli.command {
         return execute_init(cli, archive_id.as_deref());
+    }
+    if let Command::Restore {
+        command:
+            RestoreCommand::Check {
+                event_repository,
+                rebuild_database,
+            },
+    } = &cli.command
+    {
+        let result = archive_ledger::restore_check(event_repository, rebuild_database)?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!(
+                "Restore verified through sequence {} and rebuilt matching SQLite state at {}.",
+                result.verified_event_seq,
+                rebuild_database.display()
+            );
+        }
+        return Ok(EXIT_OK);
+    }
+    if let Command::Events {
+        command: EventsCommand::Verify,
+    } = &cli.command
+    {
+        return execute_events_verify(cli);
     }
     let database = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
     match &cli.command {
@@ -550,21 +683,84 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
                 execute_cached_report(&database, args, cli.json)
             }
             ReportCommand::Policy(args) => execute_policy_report(&database, args, cli.json),
+            ReportCommand::Metadata => execute_metadata_status(&database, cli.json),
         },
+        Command::MetadataDestination { command } => {
+            execute_metadata_destination(cli, &database, command)
+        }
+        Command::CatalogLocation { location_id } => {
+            let events = open_event_store(cli)?;
+            let seq =
+                MetadataRegistry::new(&events, &database).set_catalog_location(location_id)?;
+            print_mutation_seq(seq, "Catalog location recorded", cli.json)?;
+            Ok(EXIT_OK)
+        }
+        Command::Checkpoint { command, replicate } => {
+            let events = open_event_store(cli)?;
+            let protector = MetadataProtector::new(&events, &database);
+            let result = match command {
+                Some(CheckpointCommand::Reconcile { checkpoint_id }) => {
+                    protector.reconcile(checkpoint_id)?
+                }
+                None => protector.checkpoint(*replicate)?,
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Checkpoint {} covers sequence {} and is committed as {}.",
+                    result.checkpoint_id, result.event_last_seq, result.local_git_commit
+                );
+                if result.replication_observations == 0 {
+                    println!(
+                        "No destination was pushed; use --replicate after configuring Git remotes."
+                    );
+                }
+            }
+            let replication_failed = *replicate
+                && database
+                    .metadata_protection_status()?
+                    .destinations
+                    .iter()
+                    .filter(|destination| destination.snapshot.status == "active")
+                    .all(|destination| {
+                        destination.latest_replication_status.as_deref() != Some("present")
+                            || destination.latest_independence_status.as_deref()
+                                != Some("independent")
+                    });
+            Ok(if replication_failed {
+                EXIT_FINDINGS
+            } else {
+                EXIT_OK
+            })
+        }
+        Command::Events { .. } => unreachable!("event verification returned before opening SQLite"),
+        Command::Restore { .. } => unreachable!("restore returned before opening SQLite"),
     }
 }
 
 fn execute_status(database: &ProjectionDb, as_json: bool) -> Result<u8, AppError> {
     let status = database.cached_policy_status(now_utc_ms()?)?;
-    let has_findings = !status.unconfigured_collections.is_empty()
+    let metadata = database.metadata_protection_status()?;
+    let has_findings = metadata.unreplicated_events > 0
+        || metadata.catalog_location_id.is_none()
+        || !status.unconfigured_collections.is_empty()
         || !status.stale_policies.is_empty()
         || status
             .evaluations
             .iter()
             .any(|policy| policy.files_violated > 0 || policy.files_uncertain > 0);
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&StatusOutput {
+                version: 1,
+                policy: status,
+                metadata,
+            })?
+        );
     } else {
+        print_metadata_status(&metadata);
         print_cached_status(&status);
     }
     Ok(if has_findings { EXIT_FINDINGS } else { EXIT_OK })
@@ -689,6 +885,252 @@ fn execute_copy(
     Ok(EXIT_OK)
 }
 
+fn execute_metadata_destination(
+    cli: &Cli,
+    database: &ProjectionDb,
+    command: &MetadataDestinationCommand,
+) -> Result<u8, AppError> {
+    match command {
+        MetadataDestinationCommand::List { all } => {
+            let mut destinations = database.metadata_protection_status()?.destinations;
+            if !all {
+                destinations.retain(|destination| destination.snapshot.status == "active");
+            }
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"version": 1, "items": destinations}))?
+                );
+            } else {
+                for destination in destinations {
+                    print_metadata_destination(&destination);
+                }
+            }
+        }
+        MetadataDestinationCommand::Show { id } => {
+            let destination = database
+                .metadata_protection_status()?
+                .destinations
+                .into_iter()
+                .find(|destination| destination.snapshot.destination_id == *id)
+                .ok_or_else(|| AppError::Input(format!("metadata destination not found: {id}")))?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&destination)?);
+            } else {
+                print_metadata_destination(&destination);
+            }
+        }
+        MetadataDestinationCommand::Add(args) => {
+            let snapshot = MetadataDestinationSnapshot {
+                destination_id: args.id.clone().unwrap_or_else(|| {
+                    format!(
+                        "metadata_{}",
+                        ulid::Ulid::new().to_string().to_ascii_lowercase()
+                    )
+                }),
+                display_name: args.name.clone(),
+                location_id: args.location.clone(),
+                git_remote_name: args.remote.clone(),
+                remote_locator: args.locator.clone(),
+                remote_ref: args.remote_ref.clone(),
+                status: "active".to_owned(),
+            };
+            record_metadata_destination(cli, database, RegistryAction::Register, snapshot)?;
+            if !cli.json {
+                println!(
+                    "Next: git -C {} remote add {} {}",
+                    cli.events.display(),
+                    args.remote,
+                    args.locator
+                );
+            }
+        }
+        MetadataDestinationCommand::Update { snapshot } => {
+            record_metadata_destination(
+                cli,
+                database,
+                RegistryAction::Update,
+                parse_snapshot(snapshot)?,
+            )?;
+        }
+        MetadataDestinationCommand::Retire { snapshot, yes } => {
+            if !yes {
+                return Err(AppError::Input(
+                    "retirement requires --yes after reviewing the full snapshot".to_owned(),
+                ));
+            }
+            record_metadata_destination(
+                cli,
+                database,
+                RegistryAction::Retire,
+                parse_snapshot(snapshot)?,
+            )?;
+        }
+        MetadataDestinationCommand::Check {
+            destination_id,
+            checkpoint_id,
+            push,
+        } => {
+            let events = open_event_store(cli)?;
+            MetadataProtector::new(&events, database).check_destination(
+                checkpoint_id,
+                destination_id,
+                *push,
+            )?;
+            let state = database
+                .metadata_protection_status()?
+                .destinations
+                .into_iter()
+                .find(|destination| destination.snapshot.destination_id == *destination_id)
+                .ok_or_else(|| {
+                    AppError::Input(format!("metadata destination not found: {destination_id}"))
+                })?;
+            let protected = state.latest_replication_status.as_deref() == Some("present")
+                && state.latest_independence_status.as_deref() == Some("independent");
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            } else {
+                print_metadata_destination(&state);
+            }
+            return Ok(if protected { EXIT_OK } else { EXIT_FINDINGS });
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn record_metadata_destination(
+    cli: &Cli,
+    database: &ProjectionDb,
+    action: RegistryAction,
+    snapshot: MetadataDestinationSnapshot,
+) -> Result<(), AppError> {
+    let events = open_event_store(cli)?;
+    archive_ledger::initialize_metadata_repository(events.root())?;
+    let seq = MetadataRegistry::new(&events, database).record_destination(action, snapshot)?;
+    print_mutation_seq(seq, "Metadata destination recorded", cli.json)
+}
+
+fn print_metadata_destination(destination: &archive_ledger::MetadataDestinationState) {
+    println!(
+        "{}  {}  {}",
+        destination.snapshot.display_name,
+        destination.snapshot.destination_id,
+        destination.snapshot.status
+    );
+    println!(
+        "  location: {}  Git: {} -> {}",
+        destination.snapshot.location_id,
+        destination.snapshot.git_remote_name,
+        destination.snapshot.remote_ref
+    );
+    println!(
+        "  latest: {} / {}",
+        destination
+            .latest_replication_status
+            .as_deref()
+            .unwrap_or("never checked"),
+        destination
+            .latest_independence_status
+            .as_deref()
+            .unwrap_or("unknown independence")
+    );
+}
+
+fn execute_metadata_status(database: &ProjectionDb, as_json: bool) -> Result<u8, AppError> {
+    let status = database.metadata_protection_status()?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        print_metadata_status(&status);
+    }
+    Ok(
+        if status.uncommitted_events > 0
+            || status.unreplicated_events > 0
+            || status.catalog_location_id.is_none()
+        {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        },
+    )
+}
+
+fn print_metadata_status(status: &archive_ledger::MetadataProtectionStatus) {
+    println!(
+        "Catalog events: projected through {}; checkpointed through {}; committed through {}; independently protected through {}.",
+        status.applied_event_seq,
+        status.checkpointed_through_seq,
+        status.committed_through_seq,
+        status.independently_protected_through_seq
+    );
+    if status.catalog_location_id.is_none() {
+        println!("UNKNOWN catalog location. Next: archive catalog-location <location-id>");
+    }
+    if status.uncheckpointed_events > 0 {
+        println!(
+            "WARNING {} events are not checkpointed. Next: archive checkpoint",
+            status.uncheckpointed_events
+        );
+    }
+    if status.uncommitted_events > 0 {
+        println!(
+            "WARNING {} events are not committed to Git. Next: archive checkpoint (or archive checkpoint reconcile <checkpoint-id> after an interrupted checkpoint)",
+            status.uncommitted_events
+        );
+    }
+    if status.unreplicated_events > 0 {
+        println!(
+            "WARNING {} events are not independently protected. Next: configure a metadata destination and run archive checkpoint --replicate",
+            status.unreplicated_events
+        );
+    }
+}
+
+fn execute_events_verify(cli: &Cli) -> Result<u8, AppError> {
+    let report = open_event_store(cli)?.verify()?;
+    let output = json!({
+        "version": 1,
+        "last_seq": report.last_seq,
+        "last_event_hash": report.last_event_hash,
+        "segments": report.segments.len(),
+        "checkpoints": report.checkpoints.len(),
+    });
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "Verified {} events, {} segments, and {} checkpoints.",
+            report.last_seq,
+            report.segments.len(),
+            report.checkpoints.len()
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+fn open_event_store(cli: &Cli) -> Result<EventStore, AppError> {
+    Ok(EventStore::open_or_create(
+        &cli.events,
+        EventStoreConfig {
+            actor_id: cli.actor.clone(),
+            host_id: cli.host.clone(),
+            ..EventStoreConfig::default()
+        },
+    )?)
+}
+
+fn print_mutation_seq(seq: u64, message: &str, as_json: bool) -> Result<(), AppError> {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"version": 1, "event_seq": seq}))?
+        );
+    } else {
+        println!("{message} at sequence {seq}.");
+    }
+    Ok(())
+}
+
 fn execute_init(cli: &Cli, archive_id: Option<&str>) -> Result<u8, AppError> {
     if cli.database.exists() || cli.events.exists() {
         return Err(AppError::Input(
@@ -706,6 +1148,7 @@ fn execute_init(cli: &Cli, archive_id: Option<&str>) -> Result<u8, AppError> {
             ..EventStoreConfig::default()
         },
     )?;
+    archive_ledger::initialize_metadata_repository(events.root())?;
     let database =
         ProjectionDb::open_or_create(&cli.database, &archive_id, ProjectionConfig::default())?;
     events.append(EventRequest::new(
