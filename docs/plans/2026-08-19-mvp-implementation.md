@@ -30,6 +30,7 @@ The resulting implementation work is:
 | `al-9nm` | Trustworthy verification, policies, and device/site/shared-domain loss analysis |
 | `al-cgn` | Independent metadata replication status and clean-machine restore proof |
 | `al-950` | Human-friendly and structured review/management CLI |
+| `al-skp` | Centralized named catalogs and ergonomic Collection/Location workflows |
 
 Implementation work must update the matching issue with observed evidence and discovered constraints. New durable work is recorded in Beads, not appended as checkboxes here.
 
@@ -144,8 +145,9 @@ Required behavior:
 
 - full-snapshot canonical events for register/update/retire transitions;
 - stable display names and IDs;
-- device discovery where supported;
-- recorded fingerprint kind/value and explicit “unavailable” confidence;
+- Device and Archive Root discovery where supported;
+- separate Device hardware and Archive Root filesystem/partition fingerprint
+  evidence with explicit “unavailable” confidence;
 - fingerprint mismatch fail-closed behavior;
 - validated root-to-device and location-to-root relationships;
 - partial uniqueness for active confirmed device fingerprints and explicit
@@ -160,8 +162,9 @@ Required behavior:
   device-backed location;
 - registry correction without history rewrite.
 
-Primary tests use two same-model removable drives, changed mount paths, a
-fingerprint mismatch, a duplicate/cloned fingerprint, an offline drive, device
+Primary tests use two same-model removable drives, a filesystem UUID observed at
+changed mount paths, a fingerprint mismatch, a duplicate/cloned filesystem
+fingerprint, an offline drive, device
 movement between sites, invalid all-null and mismatched root/device locations,
 and duplicate inherited risk assignments.
 
@@ -199,6 +202,8 @@ There is no silent “other file” bucket.
 - Emit resolution and successful import-time verification facts.
 - Emit durable mismatch/read-error verification outcomes.
 - Deduplicate facts across a bounded batch and against indexed SQLite state.
+- Use one user-facing Location per annex repository; worktree and annex
+  object-store representations are paths inside it.
 - Derive collision-safe location/import IDs and validate repository path, root, and device agreement.
 
 ### Resume
@@ -246,6 +251,9 @@ Required behavior:
 - never refresh complete-coverage age after a partial scan;
 - track device check-in and expected/offline availability separately;
 - surface observation horizon and uncertainty in every relevant query.
+- expose the same engine as positive-only `archive location add [path]` and
+  complete-reconciliation `archive location scan [location]`; add mode never
+  activates missing candidates or refreshes complete Location coverage.
 
 Primary tests:
 
@@ -356,7 +364,14 @@ Implement one query/service layer used by both human and structured output after
 the underlying facts and policy semantics are trustworthy:
 
 - concise status with urgent findings first;
+- centralized Archive discovery/default selection with an explicit-path escape
+  hatch for existing catalogs;
+- Archive, Collection, Device, Location, and Site display-name rename helpers;
+- Device move and cwd-aware Collection/Location initialization helpers;
 - collection/device/location listing, detail, update, and retirement;
+- SQLite-backed Collection and Location status rollups;
+- a concise stale-presence report grouped by Device, optionally expanded to
+  Locations, that displays applicable observation-age thresholds;
 - archive-root and metadata-destination listing, detail, update, checking, and retirement;
 - policy and risk-domain update/retirement;
 - file find/show/history;
@@ -382,10 +397,34 @@ projection change, lossless Unicode/non-UTF-8 round trips, stable JSON snapshots
 and error exit statuses.
 
 Run usability walkthroughs from an empty archive and from the full disaster
-fixture. The empty-archive walkthrough uses guided `archive init` to establish
-the catalog location, home site, first device/root/location, collection, starter
-policy, and optional metadata destination. Avoid requiring users to invent
-internal IDs where discovery or generated defaults are safe.
+fixture. `archive init` creates only a centrally stored named Archive. The user
+then runs `archive collection init` in the initial content directory; it infers
+the mounted root and known Device when safe and prompts only for missing Device
+and Site facts. Additional ordinary and annex repositories use Location-scoped
+commands. Avoid requiring users to invent internal IDs where discovery or
+generated defaults are safe.
+
+## Phase 7A: Ergonomic workflow revision (`al-skp`)
+
+Implement the accepted revision in dependency order:
+
+1. update the authoritative product, event, schema, and this implementation
+   contract, removing superseded command descriptions;
+2. add a dependency-checking `Makefile` whose default `make install` builds a
+   release binary and installs under `${PREFIX:-$HOME/.local}` without `sudo`;
+3. add canonical Archive display names, centralized per-user catalog discovery,
+   default selection, and safe explicit-path access to existing catalogs;
+4. add Archive Root filesystem identity and cwd/mount inference, then guided
+   Collection/Location initialization and one-Location annex import;
+5. add stable-ID-preserving rename helpers, Device Site movement, and cached
+   Collection/Location status;
+6. expose positive-only Location add and complete Location scan through the
+   existing scan engine;
+7. add the concise stale-presence report and verify its grouped queries at the
+   established 500,000-file scale.
+
+Background scanning of connected Devices and file-copy mutation are separate
+deferred Beads features. They do not expand this read-only phase.
 
 ## Phase 8: Scale and release gate
 
@@ -411,6 +450,8 @@ Measure and record outside product source:
 - actual filesystem discovery and git-annex import at fixture scale, rather than
   only pre-generated event replay;
 - query plans for the hot report paths.
+- concise Device/Location stale-presence rollups under mixed Collection policy
+  thresholds.
 
 Release requirements:
 
@@ -443,6 +484,8 @@ Each important rule has one primary owner:
 | Policy cache validity | event/version/time invalidation tests |
 | Device/site/shared-risk loss | disaster-scenario integration fixture |
 | Human/JSON agreement | shared query result and CLI snapshot tests |
+| Cwd/root inference and removable remount | disposable mount-discovery adapter tests |
+| Stale-presence grouping and thresholds | projection query and CLI fixture tests |
 | Metadata restorability | destructive clean-machine fixture restore |
 | Metadata destination independence | topology and same-disk rejection tests |
 | Lossless paths and pagination | platform path round-trip and stale-token CLI tests |

@@ -13,6 +13,10 @@ the [schema specification](2026-08-19-schema.md).
 
 The JSONL event stream is canonical archive metadata. SQLite is a rebuildable materialized view.
 
+Each named Archive owns one independent stream. Per-user discovery/default
+configuration points to Archive directories but is not part of, and cannot
+override, canonical Archive identity.
+
 The MVP has exactly one stream and one writer at a time:
 
 - `stream_id` is `stream_primary`;
@@ -294,8 +298,8 @@ High-volume operations use local-operational queues for progress and canonical e
 
 - `scan_started` records the collection, location, optional logical-path prefix,
   resolved root/device identity, filesystem-boundary rule, traversal version,
-  normalized exclusion rules and fingerprint. At most one canonical running scan
-  may cover a location/collection/scope tuple.
+  normalized exclusion rules and fingerprint, and mode `add` or `complete`. At
+  most one canonical running scan may cover a location/collection/scope tuple.
 - Positive changes may emit `file_ref_observed`, `path_observed`, `copy_observed`,
   identity events, and baseline `copy_verified` outcomes for new or changed
   content during the scan. A known unchanged entry refreshes coverage only.
@@ -314,6 +318,12 @@ High-volume operations use local-operational queues for progress and canonical e
   from an interrupted, failed, cancelled, malformed, or unfinalized scan remain
   inert and may later be pruned from SQLite.
 - A partial scan never advances complete-coverage freshness.
+
+An `add` scan is deliberately positive-only even when its requested subtree was
+fully enumerated: it emits no missing candidates and never advances the larger
+Location's complete-coverage freshness. A `complete` scan follows the missing
+candidate and atomic publication rules below. Both modes share discovery,
+hashing, event, and resume implementations.
 
 Namespace coverage and byte integrity are separate. An enumerated regular file
 whose content cannot be read remains a present unknown/non-qualifying fact with
@@ -358,6 +368,7 @@ Registry events carry full current snapshots. Observation events carry the chang
 ### Lifecycle and metadata
 
 - `archive_initialized`
+- `archive_updated`
 - `catalog_location_set`
 - `checkpoint_created`
 - `checkpoint_commit_observed`
@@ -401,7 +412,11 @@ Copy, repair, quarantine, and destructive-operation events are not part of the M
 
 Detailed structs belong in code schemas generated or checked against fixtures, but these rules are normative:
 
-- registry snapshots contain all user-controlled and identity fields;
+- `archive_initialized` and `archive_updated` contain the stable Archive ID and
+  current human display name; updates never change the ID;
+- registry snapshots contain all user-controlled and identity fields, including
+  Archive Root filesystem/partition identity evidence separately from Device
+  hardware evidence;
 - external identities contain namespace, key, expected size/hash when known, and source;
 - paths use a versioned lossless value: `{encoding: "utf8", text: ...}` when
   possible, `{encoding: "unix_bytes", base64: ...}` for non-UTF-8 Unix names,
@@ -409,14 +424,22 @@ Detailed structs belong in code schemas generated or checked against fixtures, b
   non-representable Windows names. Unknown encodings fail closed; display
   strings are never used as identity;
 - scan completion contains completeness, scope and exclusions fingerprints,
-  observed counts/digests, missing-candidate count/digest, and structured error
-  counts;
+  scan mode, observed counts/digests, missing-candidate count/digest, and
+  structured error counts; `add` completion always declares zero activatable
+  missing candidates;
 - verification contains result, expected and observed hashes, bytes read, duration, path, device fingerprint result, and error detail;
 - job completion distinguishes `complete`, `partial`, `failed`, and `cancelled`;
 - annex import completion reports every category, including present, absent, unsupported, unresolved, mismatched, and ignored-by-explicit-rule counts;
 - errors are structured values with stable codes; free text is supplemental.
 - every resumable per-item outcome contains its deterministic `operation_key`;
   the projector rejects a key already associated with a different event.
+
+Schema upgrades do not rewrite old event lines. When replaying version 1 history
+created before named Archives, an `archive_initialized` payload without a
+display name deterministically uses its Archive ID as the initial display name
+until an `archive_updated` event supplies one. Legacy annex imports that named
+separate worktree and CAS Locations retain those topology facts; new imports use
+one repository Location and never synthesize a history rewrite.
 
 ## Restore procedure
 
