@@ -4,234 +4,331 @@ Archive Ledger is a local-first command-line catalog for answering three practic
 
 - Where are my files and copies?
 - Are those copies still readable and recent enough to trust?
-- Which files could be permanently lost if a disk, site, account, or other shared dependency fails?
+- Which files could be permanently lost if a disk, site, account, or shared dependency fails?
 
-It inventories ordinary directories and git-annex repositories, verifies file content, evaluates
-backup policy and disaster risks, and protects its own catalog history. It does **not** copy, move,
-delete, repair, or drop archive content.
+It inventories ordinary directories and git-annex repositories, verifies bytes, evaluates backup
+policy and disaster risks, and protects its own catalog history. It does not copy, move, delete,
+repair, or drop archive content.
 
 ## Concepts and relationships
 
-An **archive** is the complete catalog managed by one Archive Ledger installation. It is not one
-directory or storage device: one archive can describe many collections spread across computers,
-removable disks, NAS devices, offline media, and storage services. The archive has one stable ID,
-one canonical event history, and a replaceable SQLite view used for interactive commands.
-
-The main relationships are:
+An **Archive** is one complete catalog. It is not a directory or storage device: one Archive can
+describe many Collections spread across computers, removable disks, NAS devices, offline media,
+and services.
 
 ```text
 Archive
 ├── Collection ──uses──> Policy
-│   ├── has a home Site
-│   └── contains File references ──refer to──> Objects or External identities
-│                            │                          │
-│                            └── Path observations      ├── External identity resolves to Object
-│                                      │               └── Copy claims
-│                                      └──────────────────at a Location
-├── Filesystem Location ──under──> Archive root ──on──> Device ──at──> Site
+│   └── File (logical path) ──refers to──> Object (exact bytes)
+│                                             │
+│                                             └── Copy claim at a Location
+├── Filesystem Location ──under──> Archive Root ──on──> Device ──at──> Site
 ├── Service Location ────────────────────────────────────────────────at──> Site
-├── Risk domains ──attach to──> Locations, roots, devices, or sites
+├── Risk domains ──attach to──> Locations, roots, Devices, or Sites
 └── Canonical events ──materialize into──> SQLite database
 ```
 
-### Content and file concepts
+### Content
 
-- A **collection** is a logical group of files, such as “Family photos” or “Scanned documents.”
-  Each collection has its own logical path namespace, one home site, and one preservation policy.
-  The same storage location may contain files from more than one collection.
-- A **file** in CLI output means a **file reference**: a logical path within a collection, such as
-  `2025/trip/photo.jpg` in the “Family photos” collection. Renaming a file changes its logical
-  reference; it does not change the bytes themselves.
-- An **object** is one exact byte sequence identified by its BLAKE3 hash. Two logical files with
-  identical bytes can refer to the same object. Archive Ledger creates an object identity only
-  after it has successfully read the bytes.
-- An **external identity** is a source-system identifier known before bytes are readable, such as a
-  git-annex key. It lets a dropped annex file remain in the inventory, but it is not verified
-  protection until readable bytes resolve it to an object.
-- A **path observation** records that a logical file was seen at a particular path and location.
-  It describes names and representations, including supported git-annex representations.
-- A **copy claim** records the catalog's current evidence that content bytes exist at a path in a
-  location. It refers to an object, or initially to an external identity, and can be present,
-  missing, corrupt, unknown, or superseded. A source saying that a remote has an annex key is a
-  recovery lead, not automatically a verified copy claim.
+- A **Collection** is a logical set of files, such as “Photos,” “Documents,” or “Emails.” It has
+  its own logical path namespace, home Site, and preservation Policy.
+- A **File** is a logical path within a Collection, such as `2026/trip/photo.jpg`. It is not the
+  bytes themselves.
+- An **Object** is one exact byte sequence identified by BLAKE3. Identical Files can refer to one
+  deduplicated Object.
+- An **external identity** is a source identifier known before bytes are readable, such as a
+  git-annex key. It keeps a dropped annex File reviewable but is not verified protection.
+- A **path observation** records where a File representation was seen.
+- A **copy claim** records current evidence that Object bytes exist at a Location. Its state may be
+  present, missing, corrupt, unknown, or superseded.
 
-This separation is intentional: a filename answers “what does the user call this?”, an object hash
-answers “which bytes are these?”, and a copy claim answers “where does the catalog currently
-believe those bytes exist?”
+The distinctions matter: a File answers “what does the user call this?”, an Object answers “which
+bytes are these?”, and a copy claim answers “where does the catalog currently believe those bytes
+exist?” A source reporting an annex key is a recovery lead, not automatically a verified copy.
 
-### Storage topology
+### Storage
 
-- A **site** is a place whose loss matters, such as a home, office, storage unit, or cloud region.
-- A **device** is a physical or virtual storage-bearing unit, such as an SSD, removable disk, or
-  NAS volume. Its identity should come from a filesystem UUID or another stable fingerprint, not
-  from a temporary mount path.
-- An **archive root** is a stable path on a device's filesystem beneath which Archive Ledger
-  locations are registered.
-- A **location** is the storage area where copy claims live. A filesystem location belongs to an
-  archive root and device; a device-less service location belongs directly to a site.
+- A **Site** is a place whose loss matters, such as a home, office, storage unit, or cloud region.
+- A **Device** is a physical or virtual storage-bearing unit, such as an SSD, removable disk, or NAS
+  volume. Archive Ledger prefers filesystem or partition UUIDs over temporary mount paths.
+- An **Archive Root** identifies the mounted filesystem root on a Device.
+- A **Location** is a storage area containing copy claims. A filesystem Location belongs to an
+  Archive Root and Device; a device-less service Location belongs directly to a Site.
 
-For example, `/media/backup/photos` and `/media/backup/photos-copy` are two paths and may produce
-two copy claims, but if both are on the same disk they do not provide two-device protection. A copy
-on a second disk at another site can provide independent protection once its identity, observation,
-verification, and other policy requirements are current.
+A Location may hold all or only part of a Collection. Several Locations on several Devices may
+together form one complete backup set. Two paths on one disk do not provide two-Device protection.
 
-### Protection and risk concepts
+### Protection
 
-- A **policy** defines what counts as adequate protection for a collection: required qualifying
-  copies, devices and sites, freshness limits, and optional offsite, offline, or encrypted-offsite
-  requirements. Trust and topology classification are also considered when a copy is evaluated.
-- A **qualifying copy** is a present copy claim with resolved byte identity, a successful recent
-  verification, current observation and device evidence, and active, sufficiently classified
-  topology. Visible but stale, unresolved, corrupt, or uncertain claims do not count as proven
-  protection.
-- A **risk domain** represents a shared failure that topology alone may not reveal, such as one
-  cloud account, chassis, power circuit, credential store, flood zone, or safe. Device, service,
-  and site loss are evaluated automatically; custom domains add shared dependencies.
-- A **scan** inventories one filesystem location for one collection. It discovers paths, hashes new
-  or changed files, and records coverage without modifying archive content. A git-annex **import**
-  performs the equivalent source-aware inventory from Git and annex metadata.
-- A **verification** re-reads a specific copy's bytes and compares them with the expected identity.
-  A mismatch affects that copy claim; it does not silently redefine the object.
+- A **Policy** defines required qualifying copies, Devices and Sites, freshness limits, and optional
+  offsite, offline, or encrypted-offsite requirements.
+- A **qualifying copy** has resolved byte identity, successful recent verification, current
+  observation and Device evidence, and sufficiently classified active topology.
+- A **risk domain** represents a shared failure not visible from basic topology, such as one NAS
+  chassis, safe, cloud account, credential store, power circuit, or flood zone.
+- A positive **add** inventories files it sees without drawing conclusions about absent files.
+- A complete **scan** reconciles an entire Location and may mark prior paths missing.
+- A **verification** re-reads one copy and compares it with the expected Object identity.
 
-As a concrete example, the logical path `2025/trip/photo.jpg` in the “Family photos” collection may
-resolve to one BLAKE3 object and have two copy claims: one in a home SSD location and one in an
-offsite NAS location. The collection's policy determines whether those claims are sufficiently
-fresh and independent. Losing either device or site is then simulated against the remaining
-qualifying copy.
+Device, Site, and device-less service loss are simulated automatically. Custom risk domains add
+shared dependencies. A copy can remain visible while being too stale, unresolved, corrupt, or
+uncertain to count as adequate protection.
 
-### Catalog storage
+### Catalog data
 
-**Canonical events** are the durable, append-only history of observations and configuration
-changes. The **SQLite database** is their indexed materialized view and serves normal `status`,
-`file`, `copy`, and `report` commands without rescanning disks or replaying event files. SQLite can
-be rebuilt; the canonical event repository must be checkpointed and independently protected.
+Canonical events are the durable append-only history. SQLite is their indexed materialized view
+and serves normal `status`, `file`, `copy`, and `report` commands. SQLite can be rebuilt; canonical
+history must be checkpointed and independently protected.
 
 ## Install
 
-Archive Ledger currently builds from source and requires Rust and Git. Git-annex is useful for
-creating and managing annex repositories, but the importer itself uses read-only Git metadata.
+Archive Ledger currently targets Linux and builds from source. It requires Rust/Cargo, Git,
+`findmnt` from util-linux, and the POSIX `install` utility. Git-annex is useful for managing annex
+repositories but is not required by the read-only importer.
 
 ```bash
 cd /path/to/archive-ledger
-cargo build --release
-mkdir -p "$HOME/.local/bin"
-install -m 0755 target/release/archive "$HOME/.local/bin/archive"
+make install
+export PATH="$HOME/.local/bin:$PATH"
 archive --version
 ```
 
-Run commands from the directory where you want the catalog, or pass explicit global paths:
+`make install` checks dependencies, performs a locked release build, and installs
+`$HOME/.local/bin/archive`. Use `make install PREFIX=/usr/local` or `DESTDIR` when packaging.
+
+## Create an Archive and first Collection
+
+Create one named catalog. This does not inspect the current directory or tie the Archive to any
+particular files:
 
 ```bash
-archive --database /path/to/archive.db \
-        --events /path/to/canonical-events \
-        status
+archive init --name "Personal archive"
 ```
 
-The defaults are `.archive-ledger/archive.db` and `.archive-ledger/canonical` in the current
-directory.
-
-## Quick start
-
-On a terminal, `archive init` prompts for a mounted archive path and creates a starter home site,
-device, root, location, collection, and two-site backup policy. For scripts, use the equivalent
-non-interactive form:
+The first Archive becomes the default. Additional Archives can be selected explicitly:
 
 ```bash
-archive init --non-interactive \
-  --root-path /mnt/archive \
-  --fingerprint 0123-4567 \
-  --fingerprint-kind filesystem_uuid
+archive init --name "Work archive"
+archive use "Personal archive"
+archive --archive "Work archive" status
 ```
 
-If the storage has no stable identifier you can omit the fingerprint. Archive Ledger keeps that
-uncertainty visible instead of treating the mount path as device identity. `archive device discover
-/mnt/archive` shows safe discovery information, but its host-local device number is not presented as
-a durable fingerprint.
+Catalogs live under the XDG data directory, normally
+`~/.local/share/archive-ledger/archives/<archive-id>/`. Init prints the exact SQLite and canonical
+event paths. Existing custom catalogs remain accessible with global `--database` and `--events`
+options, but central named Archives are the normal workflow.
 
-The starter IDs are printed by `init`. With their defaults, inventory the files without modifying
-them:
+For an ordinary directory, create a Collection from its logical root:
 
 ```bash
-archive scan location_primary \
-  --collection collection_primary \
-  --path /mnt/archive \
-  --device device_primary \
-  --root root_primary
+cd /srv/archive/documents
+archive collection init --name "Documents"
 ```
 
-Scan and verification commands default device fingerprint status to `unavailable`. After checking
-that the mounted storage's real identifier matches the registered fingerprint, add
-`--fingerprint-status match`; pass `mismatch` when it does not. Archive Ledger will record the
-check and refuse a mismatched scan instead of trusting the path.
+Archive Ledger discovers the mount root, directory-relative path, and filesystem or partition UUID
+when available. It asks for a Device name and Site only when those facts cannot be inferred. A
+typical first run might use “Main computer” and “Home.” Setup creates a starter Policy and a
+Location named `Documents on Main computer` unless overridden.
 
-Review the result from SQLite; these commands do not need the event directory to be online:
+For scripts, provide every fact that might otherwise prompt:
+
+```bash
+archive collection init /srv/archive/documents \
+  --name "Documents" \
+  --device "Main computer" \
+  --site "Home" \
+  --non-interactive
+```
+
+If stable filesystem identity is unavailable, non-interactive setup fails closed. Inspect it and
+explicitly accept weaker identity only when necessary:
+
+```bash
+archive location discover /srv/archive/documents
+archive collection init /srv/archive/documents \
+  --name "Documents" --device "Main computer" --site "Home" \
+  --allow-unidentified-root --non-interactive
+```
+
+An unidentified removable filesystem can only be reused from matching prior mount evidence. A
+mount path alone is never silently promoted to durable Device identity.
+
+## Add files and reconcile a Location
+
+Setup registers topology but does not enumerate ordinary content. Add present files from the
+Collection root:
+
+```bash
+cd /srv/archive/documents
+archive location add . --collection "Documents"
+```
+
+`location add` is positive-only. It streams traversal, computes BLAKE3 for new or changed regular
+files, records successful reads as verification, and never marks an unvisited file missing. It can
+safely target a subtree:
+
+```bash
+cd /srv/archive/documents/2026
+archive location add .
+```
+
+After the first inventory, Location and Collection can usually be inferred from the current path.
+Use `--location` or `--collection` when a path is ambiguous.
+
+A complete reconciliation is explicit:
+
+```bash
+cd /srv/archive/documents
+archive location scan
+```
+
+Only a successfully completed scan can mark prior paths missing. Traversal errors, permission
+failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.
+Partial runs retain positives but cannot publish missing facts or fresh complete-coverage evidence.
+
+## Add another Device or partial Location
+
+Suppose an external disk is mounted at `/media/sd01` and contains another ordinary copy or subset:
+
+```bash
+cd /media/sd01/documents
+archive location init --collection "Documents" \
+  --device "SD01" --site "Home" --non-interactive
+archive location add . --collection "Documents"
+```
+
+One Device may have several Locations, and several Devices together may contain every Object. If a
+removable filesystem is later mounted elsewhere, its UUID identifies the same Archive Root and
+Device.
+
+Record a physical Site move without changing stable IDs:
+
+```bash
+archive site add \
+  --id site_offsite_storage --name "Offsite storage" --kind storage
+archive device move "SD01" --to "Offsite storage"
+```
+
+Correct display names without changing identity or history:
+
+```bash
+archive rename "Family archive"
+archive collection rename "Documents" "Family documents"
+archive location rename "Documents on SD01" "Documents backup on SD01"
+archive device rename "SD01" "Blue backup disk"
+archive site rename "Home" "House"
+```
+
+## Import git-annex repositories
+
+One git-annex repository maps to one Collection Location, even when it contains only part of the
+Collection's bytes. Create and import the main repository in one step:
+
+```bash
+cd /var/lib/annex/photos
+archive collection init --name "Photos" \
+  --device "Main computer" --site "Home" \
+  --import-annex --non-interactive
+```
+
+Import each additional annex repository or remote as another partial Location:
+
+```bash
+cd /media/sd01/annex/photos
+archive location import-annex --collection "Photos" \
+  --device "SD01" --site "Home" --non-interactive
+```
+
+The importer reads the Git index, annex keys, object bytes, location logs, and `git-annex` branch.
+It does not invoke mutating git-annex commands and verifies that HEAD and worktree status stay
+unchanged. Every tracked annex path becomes a File reference. A dangling link remains an unresolved
+external identity and is absent from that Location; readable content becomes a BLAKE3 Object and
+verified present copy.
+
+For example, photos, documents, and emails repositories normally become three Collections. The
+main photos repository and every partial photos remote are Locations of Photos. Multiple disks that
+together contain all Photos Objects are multiple Locations on multiple Devices, not separate
+Collections.
+
+Review annex UUID evidence and optionally map a reported remote to known storage:
+
+```bash
+archive annex-remote list --all
+archive annex-remote map <source-annex-uuid> <remote-annex-uuid> <location-id> \
+  --name "Photos on offsite annex"
+archive annex-remote unmap <source-annex-uuid> <remote-annex-uuid>
+```
+
+Remote availability is a recovery lead, not a verified copy. Import or scan actual bytes before
+treating the Location as proven protection.
+
+## Review status, integrity, and disaster risk
+
+Fast summaries come from indexed SQLite and do not enumerate storage:
 
 ```bash
 archive status
-archive file find --collection collection_primary --limit 100
+archive collection status "Documents"
+archive location status "Documents on Main computer"
+archive collection list
+archive location list
+archive file find --collection <documents-collection-id> --limit 100
 archive file show <file-id>
-archive copy list --location location_primary --limit 100
+archive copy list --location <main-location-id> --limit 100
+```
+
+File and copy lists use stable continuations, so directories with thousands of entries and
+Collections with hundreds of thousands of Files remain reviewable without running the equivalent
+of `ls` or loading the full result in memory.
+
+Evaluate and review Policy and simulated loss results:
+
+```bash
+archive policy evaluate
 archive report risk
 archive report integrity
 archive report policy
 ```
 
-Lists are read from the indexed database rather than by enumerating large directories. Use the
-printed `--continue` token to page through hundreds of thousands of records without rescanning
-storage.
+Early reports commonly have findings until independent Devices and Sites are inventoried and
+verified. Use risk domains for shared failures that topology cannot reveal, such as several disks
+in one safe, one NAS chassis, one cloud account, or one credential store.
 
-## Add another copy location
-
-The starter policy deliberately reports risk until it sees two current, verified copies on two
-devices at two sites. Register the actual topology of another copy before scanning it:
+The stale-presence report answers which Device should be mounted and refreshed next. Its first line
+states the applicable Policy age or mixed-Policy range:
 
 ```bash
-archive site add \
-  --id site_offsite --name "Offsite" --kind office
-
-archive device add \
-  --id device_offsite --name "Offsite disk" --kind disk \
-  --site site_offsite \
-  --fingerprint A1B2-C3D4 --fingerprint-kind filesystem_uuid \
-  --availability offline
-
-archive root add \
-  --id root_offsite --name "Offsite archive root" --kind filesystem \
-  --device device_offsite --path /
-
-archive location add \
-  --id location_offsite --name "Offsite files" --kind filesystem \
-  --root root_offsite --device device_offsite --path ""
-
-archive scan location_offsite \
-  --collection collection_primary \
-  --path /media/offsite/archive \
-  --device device_offsite \
-  --root root_offsite
-
-archive policy evaluate
-archive report risk
+archive report stale-presence
+archive report stale-presence --locations
+archive report stale-presence --collection "Photos" --older-than 180
 ```
 
-Use `archive risk-domain add` and `archive risk-domain assign` for dependencies the structural
-topology cannot infer—for example, two services in one account or disks stored in the same safe.
-Loss reports simulate each registered device, site, service account, and custom shared domain.
+The default deduplicates stale Objects per Device. `--locations` adds Location counts, last complete
+inventory, oldest stale observation, Site and availability context, and a suggested `scan` or
+`import-annex` action. Missing, corrupt, unknown, and unresolved annex states remain separate from
+stale resolved presence.
 
-## Verify content
+## Verify bytes and resume work
 
-A scan hashes new or changed regular files and records that read as baseline verification. Routine
-verification re-reads current copy claims in bounded batches:
+Adding or scanning content records the hashing read as baseline verification. Routine verification
+re-reads current copy claims:
 
 ```bash
-archive verify location_primary --path /mnt/archive
-archive verify location_primary --path /mnt/archive --copy <copy-claim-id>
+archive verify <main-location-id> \
+  --path /srv/archive/documents \
+  --fingerprint-status match
+
+archive verify <main-location-id> \
+  --path /srv/archive/documents \
+  --copy <copy-claim-id> \
+  --fingerprint-status match
 ```
 
-Every attempt is durable. A mismatch marks only that copy corrupt; a read error or device identity
-failure makes it non-qualifying until a later successful verification. Archive Ledger never repairs
-or replaces the bytes automatically.
+Use `match` only after confirming the mounted filesystem is the registered Device. A mismatch
+blocks reads. A hash mismatch marks that copy corrupt without redefining the expected Object; a
+read error makes the claim non-qualifying until later successful verification.
 
-Long-running scans, imports, and verification jobs print a durable job ID:
+Long operations print durable job IDs:
 
 ```bash
 archive job list
@@ -239,131 +336,92 @@ archive job show <job-id>
 archive job resume <job-id>
 ```
 
-Resume applies the canonical event tail first and skips already-recorded per-file outcomes, so an
-interruption cannot duplicate durable facts.
+Resume applies canonical events first and uses deterministic outcomes, so interruption does not
+duplicate durable facts. Operations are batched and do not require all paths in memory.
 
-## Import a git-annex repository
+## Protect and recover the catalog
 
-Register two locations on the annex device: one for the worktree representation and one for the
-annex object store. Then run this from inside the repository:
+SQLite is the normal interactive materialized view, but it is replaceable. Canonical events are the
+durable rebuild source, so protecting only `archive.db` is insufficient. Exact paths are printed by
+`archive init --json`.
 
-```bash
-archive import annex . \
-  --collection collection_primary \
-  --worktree-location location_annex_worktree \
-  --cas-location location_annex_cas \
-  --device device_primary \
-  --root root_primary
-```
-
-The importer reads the Git index, annex keys, object bytes, and the `git-annex` branch. It does not
-run mutating git-annex commands or change the source repository. Present, dropped, unsupported,
-mismatched, unreadable, and duplicate entries are reported separately. Dropped files remain
-reviewable even when no local bytes exist.
-
-See remote UUIDs observed in annex location logs and map a remote to a registered location:
+Record the registered Location physically containing the catalog, then configure a Git remote whose
+registered storage and Site are independent:
 
 ```bash
-archive annex-remote list --all
-archive annex-remote map <source-annex-uuid> <remote-annex-uuid> <location-id> \
-  --name "Offsite annex"
-archive annex-remote unmap <source-annex-uuid> <remote-annex-uuid>
-```
+archive catalog-location <catalog-location-id>
 
-A remote availability claim is useful evidence but does not become a verified copy merely because
-it is mapped.
-
-## Protect the catalog
-
-The SQLite database is a replaceable materialized view. The canonical event repository is the
-durable history needed to rebuild it, so protecting only `archive.db` is not sufficient.
-
-First register the location that physically contains the catalog if guided setup did not do so:
-
-```bash
-archive catalog-location <location-id>
-```
-
-Register a Git destination whose location has honest device/site/risk topology, add the Git remote,
-then checkpoint and replicate:
-
-```bash
 archive metadata-destination add \
-  --id metadata_offsite \
   --name "Offsite catalog history" \
-  --location <registered-location-id> \
+  --location <offsite-metadata-location-id> \
   --remote backup \
   --locator ssh://backup.example/archive-ledger.git
 
-git -C .archive-ledger/canonical remote add \
+git -C <canonical-event-path> remote add \
   backup ssh://backup.example/archive-ledger.git
 
 archive checkpoint --replicate
 archive report metadata
 ```
 
-“Protected through N” appears only after Archive Ledger observes the checkpoint at a destination
-whose storage and site are independent of the catalog. A second directory or bare Git repository
-on the catalog disk may be replicated successfully, but it is intentionally reported as
-independence `unknown`.
+“Protected through N” appears only after Archive Ledger observes the checkpoint at independent
+topology. A Git repository on the same disk may receive events but is not counted as proven
+independent protection. Keep credentials in Git, SSH, or credential-manager configuration—not in
+locators or canonical events.
 
-Credentials belong in Git/SSH credential configuration, never in destination locators or canonical
-events.
-
-## Integrity and recovery
-
-Verify the canonical chain and bring SQLite up to date:
+Verify history, update SQLite, rebuild a disposable projection, and rehearse recovery:
 
 ```bash
 archive events verify
 archive db apply
-```
-
-Rebuild a replacement database from canonical history:
-
-```bash
 archive db rebuild --target /tmp/archive-rebuilt.db
-```
 
-To rehearse clean-machine recovery, clone an independently protected event repository and rebuild a
-new database from it:
-
-```bash
 git clone --branch archive-ledger \
   ssh://backup.example/archive-ledger.git restored-events
-
 archive restore check restored-events \
   --rebuild-database restored-archive.db
 ```
 
-`restore check` verifies the event chain, streams a fresh SQLite projection, and confirms that the
-rebuilt cursor matches the verified event tail. It does not overwrite the current database.
+`restore check` verifies the chain and builds a new database; it does not overwrite the current
+catalog.
 
-## Exit status and automation
+## Automation and exit status
 
 - `0`: command completed and the selected check has no findings.
 - `2`: invalid input, damaged state, I/O failure, or another command error.
-- `10`: the command completed but found preservation, integrity, metadata-protection, or partial
-  coverage concerns.
+- `10`: command completed but found preservation, integrity, stale-presence, metadata-protection,
+  or partial-coverage concerns.
 
-Exit `10` is expected while an archive is under-protected; it is not the same as a command failure.
-Use global `--json` for versioned structured output and stable error codes:
+Exit `10` is an actionable finding, not a crash. Global `--json` provides versioned structured
+results. Setup commands have explicit non-interactive flags:
 
 ```bash
-archive --json report risk --limit 100
 archive --json status
+archive --json report stale-presence --locations
+archive --json file find --collection <documents-collection-id> --limit 100
+
+archive collection init /srv/archive/documents \
+  --name "Documents" --device "Main computer" --site "Home" \
+  --non-interactive
 ```
 
-## Safety model
+Errors include stable codes. Review lists use deterministic ordering and continuation tokens that
+fail closed if SQLite advances between pages.
 
-- Scans and git-annex imports are read-only and do not follow symlinks as ordinary content.
-- Scans stay on the selected filesystem and record exclusions and traversal uncertainty.
-- A known device fingerprint mismatch blocks a scan and causes verification to avoid reading bytes.
-- Partial scans never infer that unseen files are missing.
-- Registry corrections append new facts; canonical history is not rewritten.
-- No current command deletes, drops, copies, repairs, or quarantines archive content.
+## Safety and current scope
 
-For large archives, discovery and hashing stream in bounded batches, projection applies only the
-unapplied event tail, and normal file/copy/risk review is served from indexed SQLite state. The
-project includes explicit 500,000-file scale gates; routine test runs leave those expensive tests
-ignored unless requested.
+- `location add`, `location scan`, and git-annex import do not modify archive content.
+- Generic traversal does not follow symlinks as ordinary files or cross filesystems.
+- Device identity mismatch blocks scanning; unidentified roots remain visibly uncertain.
+- Positive-only add and every partial scan are incapable of publishing missing facts.
+- Complete missing activation is atomic and follows only confirmed complete coverage.
+- Registry changes and renames append canonical events; history is not rewritten.
+- Current commands do not copy, move, delete, drop, repair, or quarantine content.
+
+Background scanning of connected Devices and content mutation such as `archive copy` are planned,
+not current behavior. Continue using established tools such as git-annex for copy/drop operations,
+then import or scan the resulting state.
+
+The implementation has explicit 500,000-File and 500,000-Object scale gates. Discovery, hashing,
+projection, and large result lists are bounded or paged. SQLite intentionally trades some storage
+for low-latency indexed review; canonical history remains the recovery source.

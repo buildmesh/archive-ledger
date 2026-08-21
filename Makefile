@@ -17,6 +17,7 @@ all: build
 check-deps:
 	@command -v "$(CARGO)" >/dev/null 2>&1 || { echo "error: Cargo is required; install Rust from https://rustup.rs/" >&2; exit 1; }
 	@command -v git >/dev/null 2>&1 || { echo "error: Git is required; install it with your operating system package manager" >&2; exit 1; }
+	@command -v findmnt >/dev/null 2>&1 || { echo "error: findmnt is required for safe storage discovery; install the util-linux package" >&2; exit 1; }
 	@command -v "$(INSTALL)" >/dev/null 2>&1 || { echo "error: a POSIX-compatible install command is required (usually provided by coreutils)" >&2; exit 1; }
 
 build: check-deps
