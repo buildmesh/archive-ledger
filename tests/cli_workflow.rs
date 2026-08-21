@@ -293,6 +293,67 @@ mod unix {
         assert_eq!(first["archive_root"]["fingerprint_kind"], "filesystem_uuid");
         assert_eq!(first["location"]["display_name"], "Photos on SD01");
 
+        let year = photos.join("2026");
+        fs::create_dir(&year).unwrap();
+        fs::write(year.join("first.jpg"), b"first image").unwrap();
+        fs::write(year.join("stable.jpg"), b"stable image").unwrap();
+        let mut add = central_archive(&temp);
+        use_fake_findmnt(&mut add, &bin, &mount_a, Some("TEST-UUID"));
+        let add = success(add.current_dir(&year).args([
+            "--json",
+            "location",
+            "add",
+            ".",
+            "--collection",
+            "Photos",
+            "--max-items",
+            "1",
+        ]));
+        let add = json(&add);
+        assert_eq!(add["status"], "running");
+        let resumed = success(central_archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            add["job_id"].as_str().unwrap(),
+        ]));
+        assert_eq!(json(&resumed)["status"], "complete");
+
+        fs::remove_file(year.join("first.jpg")).unwrap();
+        fs::write(year.join("second.jpg"), b"second image").unwrap();
+        let mut positive_only = central_archive(&temp);
+        use_fake_findmnt(&mut positive_only, &bin, &mount_a, Some("TEST-UUID"));
+        let positive_only = success(
+            positive_only
+                .current_dir(&year)
+                .args(["--json", "location", "add"]),
+        );
+        assert_eq!(json(&positive_only)["summary"]["missing_paths"], 0);
+        let before_scan = success(central_archive(&temp).args([
+            "--json",
+            "location",
+            "status",
+            first["location"]["location_id"].as_str().unwrap(),
+        ]));
+        assert_eq!(json(&before_scan)["present_count"], 3);
+        assert_eq!(json(&before_scan)["missing_count"], 0);
+
+        let mut scan = central_archive(&temp);
+        use_fake_findmnt(&mut scan, &bin, &mount_a, Some("TEST-UUID"));
+        let scan = success(
+            scan.current_dir(&photos)
+                .args(["--json", "location", "scan"]),
+        );
+        assert_eq!(json(&scan)["summary"]["missing_paths"], 1);
+        let after_scan = success(central_archive(&temp).args([
+            "--json",
+            "location",
+            "status",
+            first["location"]["location_id"].as_str().unwrap(),
+        ]));
+        assert_eq!(json(&after_scan)["present_count"], 2);
+        assert_eq!(json(&after_scan)["missing_count"], 1);
+
         let mut second = central_archive(&temp);
         use_fake_findmnt(&mut second, &bin, &mount_b, Some("test-uuid"));
         let second = success(
@@ -683,7 +744,7 @@ mod unix {
         let annex = annex_fixture(&temp);
         success(archive(&temp).args([
             "location",
-            "add",
+            "register",
             "--id",
             "location_annex_cas",
             "--name",
@@ -739,7 +800,7 @@ mod unix {
         ]));
         success(archive(&temp).args([
             "location",
-            "add",
+            "register",
             "--id",
             "location_metadata",
             "--name",

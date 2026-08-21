@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use archive_ledger::{
     EventStore, EventStoreConfig, LocationScanner, ProjectionConfig, ProjectionDb, ScanConfig,
-    ScanStatus,
+    ScanMode, ScanStatus,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -158,10 +158,12 @@ fn scanner<'a>(
             location_id: "location_scale".to_owned(),
             device_id: "device_scale".to_owned(),
             archive_root_id: "root_scale".to_owned(),
+            location_prefix: None,
             logical_prefix: None,
             exclusions: Vec::new(),
             fingerprint_status: "match".to_owned(),
             batch_entries: 1_000,
+            scan_mode: ScanMode::Complete,
         },
     )
     .unwrap()

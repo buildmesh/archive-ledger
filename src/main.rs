@@ -14,12 +14,12 @@ use archive_ledger::{
     MetadataProtector, MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding,
     PolicyFindingFilter, PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig,
     ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError,
-    RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError,
+    RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError, ScanMode,
     ScanStatus, SiteSnapshot, StatusError, StorageDiscoveryError,
 };
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -198,6 +198,7 @@ enum Command {
         command: CopyCommand,
     },
     /// Inventory regular files without modifying them.
+    #[command(hide = true)]
     Scan(ScanArgs),
     /// Verify the bytes behind current copy claims.
     Verify(VerifyArgs),
@@ -679,6 +680,10 @@ enum LocationCommand {
     Rename { location: String, new_name: String },
     /// Show a fast SQLite-only Location summary; infer from cwd when omitted.
     Status { location: Option<String> },
+    /// Add present files to a Collection without marking unseen files missing.
+    Add(LocationAddArgs),
+    /// Completely reconcile a Location, including files that are now missing.
+    Scan(LocationScanArgs),
     /// Inspect a mounted path without registering or changing it.
     Discover { path: PathBuf },
     /// List active Locations.
@@ -688,8 +693,9 @@ enum LocationCommand {
     },
     /// Show one Location by name or stable ID.
     Show { id: String },
-    /// Add a Location with friendly flags, or provide a complete JSON snapshot.
-    Add(Box<RegistryAddArgs>),
+    /// Low-level compatibility command for registering a Location snapshot.
+    #[command(hide = true)]
+    Register(Box<RegistryAddArgs>),
     /// Replace user-controlled fields with a complete JSON snapshot.
     Update { snapshot: String },
     /// Retire a Location with a complete JSON snapshot whose status is retired.
@@ -698,6 +704,51 @@ enum LocationCommand {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Debug, Args)]
+struct LocationAddArgs {
+    /// Directory to inventory; defaults to the current directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Location name or ID; inferred from the path when omitted.
+    #[arg(long)]
+    location: Option<String>,
+    /// Collection name or ID; inferred from existing inventory when omitted.
+    #[arg(long)]
+    collection: Option<String>,
+    #[arg(long = "exclude")]
+    exclusions: Vec<PathBuf>,
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    scan_id: Option<String>,
+    #[arg(long, default_value_t = 1_000)]
+    batch_entries: usize,
+    #[arg(long, hide = true)]
+    max_items: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct LocationScanArgs {
+    /// Location name or ID; inferred from cwd when omitted.
+    location: Option<String>,
+    /// Mounted path corresponding exactly to the Location.
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Collection name or ID; inferred from existing inventory when omitted.
+    #[arg(long)]
+    collection: Option<String>,
+    #[arg(long = "exclude")]
+    exclusions: Vec<PathBuf>,
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    scan_id: Option<String>,
+    #[arg(long, default_value_t = 1_000)]
+    batch_entries: usize,
+    #[arg(long, hide = true)]
+    max_items: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -1475,7 +1526,51 @@ fn execute_db(cli: &Cli, command: &DbCommand) -> Result<u8, AppError> {
     Ok(EXIT_OK)
 }
 
+struct ScanExecutionArgs {
+    location: String,
+    collection: String,
+    path: PathBuf,
+    device: String,
+    root: String,
+    location_prefix: Option<PathBuf>,
+    logical_prefix: Option<PathBuf>,
+    exclusions: Vec<PathBuf>,
+    fingerprint_status: String,
+    job_id: Option<String>,
+    scan_id: Option<String>,
+    batch_entries: usize,
+    max_items: Option<usize>,
+    scan_mode: ScanMode,
+}
+
 fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u8, AppError> {
+    execute_scan_run(
+        cli,
+        database,
+        &ScanExecutionArgs {
+            location: args.location.clone(),
+            collection: args.collection.clone(),
+            path: args.path.clone(),
+            device: args.device.clone(),
+            root: args.root.clone(),
+            location_prefix: None,
+            logical_prefix: args.logical_prefix.clone(),
+            exclusions: args.exclusions.clone(),
+            fingerprint_status: args.fingerprint_status.clone(),
+            job_id: args.job_id.clone(),
+            scan_id: args.scan_id.clone(),
+            batch_entries: args.batch_entries,
+            max_items: args.max_items,
+            scan_mode: ScanMode::Complete,
+        },
+    )
+}
+
+fn execute_scan_run(
+    cli: &Cli,
+    database: &ProjectionDb,
+    args: &ScanExecutionArgs,
+) -> Result<u8, AppError> {
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id
@@ -1503,10 +1598,12 @@ fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u
             location_id: args.location.clone(),
             device_id: args.device.clone(),
             archive_root_id: args.root.clone(),
+            location_prefix: args.location_prefix.clone(),
             logical_prefix: args.logical_prefix.clone(),
             exclusions: args.exclusions.clone(),
             fingerprint_status: args.fingerprint_status.clone(),
             batch_entries: args.batch_entries,
+            scan_mode: args.scan_mode,
         },
     )?;
     start_local_job(
@@ -1516,11 +1613,13 @@ fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u
         &scan_id,
         &json!({
             "scan_id": scan_id,
+            "scan_mode": args.scan_mode.as_str(),
             "root_path": root_path,
             "collection_id": args.collection,
             "location_id": args.location,
             "device_id": args.device,
             "archive_root_id": args.root,
+            "location_prefix": args.location_prefix,
             "logical_prefix": args.logical_prefix,
             "exclusion_paths": args.exclusions,
             "fingerprint_status": args.fingerprint_status,
@@ -1529,7 +1628,10 @@ fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u
     )?;
     record_job_marker(&events, database, &job_id, "scan", &scan_id, "started")?;
     if !cli.json {
-        println!("Starting scan {scan_id} ({job_id})...");
+        println!(
+            "Starting {} {scan_id} ({job_id})...",
+            args.scan_mode.as_str()
+        );
     }
     let result = scanner.run_at_most(args.max_items)?;
     let status = match result.status {
@@ -1548,12 +1650,20 @@ fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u
                 "version": 1,
                 "job_id": job_id,
                 "scan_id": scan_id,
+                "scan_mode": args.scan_mode.as_str(),
                 "status": status,
                 "summary": result.summary,
             }))?
         );
     } else {
-        println!("Scan {scan_id} ({job_id}): {status}");
+        println!(
+            "{} {scan_id} ({job_id}): {status}",
+            if args.scan_mode == ScanMode::Add {
+                "Add"
+            } else {
+                "Scan"
+            }
+        );
         println!(
             "  {} files, {} bytes; {} new, {} changed, {} unchanged, {} missing",
             result.summary.files_seen,
@@ -1576,6 +1686,75 @@ fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u
             EXIT_FINDINGS
         } else {
             EXIT_OK
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_location_inventory(
+    cli: &Cli,
+    database: &ProjectionDb,
+    path: Option<&Path>,
+    location_selector: Option<&str>,
+    collection_selector: Option<&str>,
+    exclusions: &[PathBuf],
+    job_id: Option<&str>,
+    scan_id: Option<&str>,
+    batch_entries: usize,
+    max_items: Option<usize>,
+    scan_mode: ScanMode,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let mut scope = resolve_inventory_location(cli, database, &state, location_selector, path)?;
+    if scan_mode == ScanMode::Complete && path.is_none() {
+        scope.scan_path = scope.location_path.clone();
+    }
+    let collection = if let Some(selector) = collection_selector {
+        select_collection(&state.collections, selector)?
+            .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?
+    } else {
+        infer_collection_at_location(database, &state, &scope.location.location_id)?
+    };
+    let relative_prefix = scope
+        .scan_path
+        .strip_prefix(&scope.location_path)
+        .map_err(|_| AppError::Input("inventory path is outside the selected Location".to_owned()))?
+        .to_path_buf();
+    if scan_mode == ScanMode::Complete && !relative_prefix.as_os_str().is_empty() {
+        return Err(AppError::Input(
+            "a complete Location scan must start at the Location root; omit --path or provide the registered Location path"
+                .to_owned(),
+        ));
+    }
+    let archive_root_id = scope
+        .location
+        .archive_root_id
+        .clone()
+        .ok_or_else(|| AppError::Input("filesystem Location has no Archive Root".to_owned()))?;
+    let device_id = scope
+        .location
+        .device_id
+        .clone()
+        .ok_or_else(|| AppError::Input("filesystem Location has no Device".to_owned()))?;
+    let prefix = (!relative_prefix.as_os_str().is_empty()).then_some(relative_prefix);
+    execute_scan_run(
+        cli,
+        database,
+        &ScanExecutionArgs {
+            location: scope.location.location_id,
+            collection: collection.collection_id,
+            path: scope.scan_path,
+            device: device_id,
+            root: archive_root_id,
+            location_prefix: prefix.clone(),
+            logical_prefix: prefix,
+            exclusions: exclusions.to_vec(),
+            fingerprint_status: scope.fingerprint_status,
+            job_id: job_id.map(ToOwned::to_owned),
+            scan_id: scan_id.map(ToOwned::to_owned),
+            batch_entries,
+            max_items,
+            scan_mode,
         },
     )
 }
@@ -1891,15 +2070,25 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
             match job.job_type.as_str() {
                 "scan" => {
                     let params = &job.params;
-                    return execute_scan(
+                    let scan_mode = match params["scan_mode"].as_str().unwrap_or("complete") {
+                        "add" => ScanMode::Add,
+                        "complete" => ScanMode::Complete,
+                        other => {
+                            return Err(AppError::Input(format!(
+                                "job {job_id} has invalid scan mode {other:?}"
+                            )))
+                        }
+                    };
+                    return execute_scan_run(
                         cli,
                         database,
-                        &ScanArgs {
+                        &ScanExecutionArgs {
                             location: json_string(params, "location_id")?,
                             collection: json_string(params, "collection_id")?,
                             path: PathBuf::from(json_string(params, "root_path")?),
                             device: json_string(params, "device_id")?,
                             root: json_string(params, "archive_root_id")?,
+                            location_prefix: params["location_prefix"].as_str().map(PathBuf::from),
                             logical_prefix: params["logical_prefix"].as_str().map(PathBuf::from),
                             exclusions: params["exclusion_paths"]
                                 .as_array()
@@ -1916,6 +2105,7 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
                             batch_entries: params["batch_entries"].as_u64().unwrap_or(1_000)
                                 as usize,
                             max_items: *max_items,
+                            scan_mode,
                         },
                     );
                 }
@@ -3936,6 +4126,32 @@ fn execute_location(
         LocationCommand::Status { location } => {
             execute_location_status(cli, database, location.as_deref())
         }
+        LocationCommand::Add(args) => execute_location_inventory(
+            cli,
+            database,
+            Some(&args.path),
+            args.location.as_deref(),
+            args.collection.as_deref(),
+            &args.exclusions,
+            args.job_id.as_deref(),
+            args.scan_id.as_deref(),
+            args.batch_entries,
+            args.max_items,
+            ScanMode::Add,
+        ),
+        LocationCommand::Scan(args) => execute_location_inventory(
+            cli,
+            database,
+            args.path.as_deref(),
+            args.location.as_deref(),
+            args.collection.as_deref(),
+            &args.exclusions,
+            args.job_id.as_deref(),
+            args.scan_id.as_deref(),
+            args.batch_entries,
+            args.max_items,
+            ScanMode::Complete,
+        ),
         LocationCommand::Discover { path } => execute_registry(
             cli,
             database,
@@ -3954,7 +4170,7 @@ fn execute_location(
             RegistryKind::Location,
             &RegistryEntityCommand::Show { id: id.clone() },
         ),
-        LocationCommand::Add(args) => execute_registry(
+        LocationCommand::Register(args) => execute_registry(
             cli,
             database,
             RegistryKind::Location,
@@ -4206,7 +4422,122 @@ fn infer_cwd_location(
     state: &archive_ledger::RegistryState,
 ) -> Result<LocationSnapshot, AppError> {
     let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
-    let mounted = archive_ledger::discover_mounted_filesystem(&cwd)?;
+    infer_location_for_path(cli, database, state, &cwd).map(|scope| scope.location)
+}
+
+struct InventoryLocationScope {
+    location: LocationSnapshot,
+    location_path: PathBuf,
+    scan_path: PathBuf,
+    fingerprint_status: String,
+}
+
+fn resolve_inventory_location(
+    cli: &Cli,
+    database: &ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    selector: Option<&str>,
+    path: Option<&Path>,
+) -> Result<InventoryLocationScope, AppError> {
+    let scan_path = path
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|error| AppError::Input(format!("cannot resolve inventory path: {error}")))?;
+    if let Some(selector) = selector {
+        let location = select_location(&state.locations, selector)?
+            .ok_or_else(|| AppError::Input(format!("Location not found: {selector:?}")))?;
+        if location.kind != "filesystem" {
+            return Err(AppError::Input(format!(
+                "Location {} is not a filesystem Location",
+                location.display_name
+            )));
+        }
+        let hint = scan_path
+            .clone()
+            .unwrap_or(std::fs::canonicalize(std::env::current_dir()?)?);
+        if let Ok(scope) = scope_for_location_at_path(cli, database, state, &location, &hint) {
+            return Ok(InventoryLocationScope {
+                scan_path: scan_path.unwrap_or(scope.location_path.clone()),
+                ..scope
+            });
+        }
+        if path.is_some() {
+            return scope_for_location_at_path(cli, database, state, &location, &hint);
+        }
+        let mount_root = latest_observed_mount(database, &cli.host, &location)?;
+        let relative = location
+            .relative_path
+            .as_ref()
+            .ok_or_else(|| AppError::Input("filesystem Location has no relative path".to_owned()))?
+            .to_path_buf()
+            .ok_or_else(|| {
+                AppError::Input("Location path cannot be represented on this platform".to_owned())
+            })?;
+        let location_path = std::fs::canonicalize(mount_root.join(relative)).map_err(|error| {
+            AppError::Input(format!(
+                "the last observed mount for {} is not available: {error}; mount the Device or use --path",
+                location.display_name
+            ))
+        })?;
+        return scope_for_location_at_path(cli, database, state, &location, &location_path);
+    }
+
+    let scan_path = scan_path.unwrap_or(std::fs::canonicalize(std::env::current_dir()?)?);
+    infer_location_for_path(cli, database, state, &scan_path)
+}
+
+fn infer_location_for_path(
+    cli: &Cli,
+    database: &ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    path: &Path,
+) -> Result<InventoryLocationScope, AppError> {
+    let root_mounts = active_root_mounts(cli, database, state, path)?;
+    let mut matches = state
+        .locations
+        .iter()
+        .filter_map(|location| {
+            let root_id = location.archive_root_id.as_deref()?;
+            let (mount_root, fingerprint_status) = root_mounts.get(root_id)?;
+            let relative = location.relative_path.as_ref()?.to_path_buf()?;
+            let location_path = mount_root.join(relative);
+            path.starts_with(&location_path).then(|| {
+                (
+                    location_path.components().count(),
+                    location.location_id.clone(),
+                    location.clone(),
+                    location_path,
+                    fingerprint_status.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let Some(best) = matches.first() else {
+        return Err(AppError::Input(
+            "path is not inside a known mounted Location; specify a Location".to_owned(),
+        ));
+    };
+    if matches.get(1).is_some_and(|other| other.0 == best.0) {
+        return Err(AppError::Input(
+            "path matches multiple Locations equally; specify a Location by name or ID".to_owned(),
+        ));
+    }
+    Ok(InventoryLocationScope {
+        location: best.2.clone(),
+        location_path: best.3.clone(),
+        scan_path: path.to_path_buf(),
+        fingerprint_status: best.4.clone(),
+    })
+}
+
+fn active_root_mounts(
+    cli: &Cli,
+    database: &ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    path: &Path,
+) -> Result<BTreeMap<String, (PathBuf, String)>, AppError> {
+    let mounted = archive_ledger::discover_mounted_filesystem(path)?;
     let mut root_mounts = BTreeMap::new();
     if let (Some(kind), Some(fingerprint)) = (
         mounted.fingerprint_kind.as_deref(),
@@ -4216,80 +4547,134 @@ fn infer_cwd_location(
             .archive_roots
             .iter()
             .filter(|root| {
-                root.fingerprint_kind.as_deref() == Some(kind)
+                root.status == "active"
+                    && root.identity_state == "confirmed"
+                    && root.fingerprint_kind.as_deref() == Some(kind)
                     && root.filesystem_fingerprint.as_deref() == Some(fingerprint)
             })
             .collect::<Vec<_>>();
-        if matching.len() != 1 || matching[0].identity_state != "confirmed" {
+        if matching.len() != 1 {
             return Err(AppError::Input(
-                "cwd filesystem identity does not uniquely match an active Archive Root; specify a Location"
+                "filesystem identity does not uniquely match an active Archive Root; specify and check the Device"
                     .to_owned(),
             ));
         }
         root_mounts.insert(
             matching[0].archive_root_id.clone(),
-            mounted.mount_root.clone(),
+            (mounted.mount_root, "match".to_owned()),
         );
-    } else {
-        let connection =
-            Connection::open(database.path()).map_err(|source| status_sql(database, source))?;
-        let mut statement = connection
-            .prepare(
-                "SELECT archive_root_id, mount_root_uri
-                 FROM device_mounts
-                 WHERE host_id = ?1 AND status = 'mounted' AND archive_root_id IS NOT NULL
-                 ORDER BY observed_time_utc_ms DESC, mount_id DESC",
-            )
-            .map_err(|source| status_sql(database, source))?;
-        let observations = statement
-            .query_map([&cli.host], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|source| status_sql(database, source))?;
-        for observation in observations {
-            let (root_id, mount_root) =
-                observation.map_err(|source| status_sql(database, source))?;
-            let root_is_unidentified = state.archive_roots.iter().any(|root| {
-                root.archive_root_id == root_id && root.identity_state == "unavailable"
-            });
-            let mount_root = PathBuf::from(mount_root);
-            if root_is_unidentified
-                && mount_root == mounted.mount_root
-                && !root_mounts.contains_key(&root_id)
-            {
-                root_mounts.insert(root_id, mount_root);
-            }
+        return Ok(root_mounts);
+    }
+
+    let connection =
+        Connection::open(database.path()).map_err(|source| status_sql(database, source))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT archive_root_id, mount_root_uri
+             FROM device_mounts
+             WHERE host_id = ?1 AND status = 'mounted' AND archive_root_id IS NOT NULL
+             ORDER BY observed_time_utc_ms DESC, mount_id DESC",
+        )
+        .map_err(|source| status_sql(database, source))?;
+    let observations = statement
+        .query_map([&cli.host], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| status_sql(database, source))?;
+    for observation in observations {
+        let (root_id, mount_root) = observation.map_err(|source| status_sql(database, source))?;
+        let root_is_unidentified = state.archive_roots.iter().any(|root| {
+            root.archive_root_id == root_id
+                && root.status == "active"
+                && root.identity_state == "unavailable"
+        });
+        let mount_root = PathBuf::from(mount_root);
+        if root_is_unidentified
+            && mount_root == mounted.mount_root
+            && !root_mounts.contains_key(&root_id)
+        {
+            root_mounts.insert(root_id, (mount_root, "unavailable".to_owned()));
         }
     }
-    let mut matches = state
-        .locations
-        .iter()
-        .filter_map(|location| {
-            let root_id = location.archive_root_id.as_deref()?;
-            let mount_root = root_mounts.get(root_id)?;
-            let relative = location.relative_path.as_ref()?.to_path_buf()?;
-            let location_path = mount_root.join(relative);
-            cwd.starts_with(&location_path).then(|| {
-                (
-                    location_path.components().count(),
-                    location.location_id.clone(),
-                    location.clone(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
-    let Some(best) = matches.first() else {
+    if root_mounts.is_empty() {
         return Err(AppError::Input(
-            "cwd is not inside a known mounted Location; specify a Location".to_owned(),
-        ));
-    };
-    if matches.get(1).is_some_and(|other| other.0 == best.0) {
-        return Err(AppError::Input(
-            "cwd matches multiple Locations equally; specify a Location by name or ID".to_owned(),
+            "filesystem has no stable identity and no matching prior mount observation; specify and check the Device"
+                .to_owned(),
         ));
     }
-    Ok(best.2.clone())
+    Ok(root_mounts)
+}
+
+fn scope_for_location_at_path(
+    cli: &Cli,
+    database: &ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    location: &LocationSnapshot,
+    path: &Path,
+) -> Result<InventoryLocationScope, AppError> {
+    let roots = active_root_mounts(cli, database, state, path)?;
+    let root_id = location
+        .archive_root_id
+        .as_deref()
+        .ok_or_else(|| AppError::Input("filesystem Location has no Archive Root".to_owned()))?;
+    let (mount_root, fingerprint_status) = roots.get(root_id).ok_or_else(|| {
+        AppError::Input(format!(
+            "mounted filesystem does not match the Archive Root for {}",
+            location.display_name
+        ))
+    })?;
+    let relative = location
+        .relative_path
+        .as_ref()
+        .ok_or_else(|| AppError::Input("filesystem Location has no relative path".to_owned()))?
+        .to_path_buf()
+        .ok_or_else(|| {
+            AppError::Input("Location path cannot be represented on this platform".to_owned())
+        })?;
+    let location_path = mount_root.join(relative);
+    if !path.starts_with(&location_path) {
+        return Err(AppError::Input(format!(
+            "inventory path {} is outside Location {} at {}",
+            path.display(),
+            location.display_name,
+            location_path.display()
+        )));
+    }
+    Ok(InventoryLocationScope {
+        location: location.clone(),
+        location_path,
+        scan_path: path.to_path_buf(),
+        fingerprint_status: fingerprint_status.clone(),
+    })
+}
+
+fn latest_observed_mount(
+    database: &ProjectionDb,
+    host_id: &str,
+    location: &LocationSnapshot,
+) -> Result<PathBuf, AppError> {
+    let root_id = location
+        .archive_root_id
+        .as_deref()
+        .ok_or_else(|| AppError::Input("filesystem Location has no Archive Root".to_owned()))?;
+    Connection::open(database.path())
+        .map_err(|source| status_sql(database, source))?
+        .query_row(
+            "SELECT mount_root_uri FROM device_mounts
+             WHERE host_id = ?1 AND archive_root_id = ?2 AND status = 'mounted'
+             ORDER BY observed_time_utc_ms DESC, mount_id DESC LIMIT 1",
+            params![host_id, root_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|source| status_sql(database, source))?
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            AppError::Input(format!(
+                "no mount has been observed for {}; mount the Device or use --path",
+                location.display_name
+            ))
+        })
 }
 
 fn infer_collection_at_location(

@@ -1831,6 +1831,8 @@ struct DeviceMountObservedPayload {
 #[derive(Debug, Deserialize)]
 struct ScanStartedPayload {
     scan_id: String,
+    #[serde(default = "default_scan_mode")]
+    scan_mode: String,
     location_id: String,
     collection_id: String,
     device_id: String,
@@ -1841,6 +1843,10 @@ struct ScanStartedPayload {
     scope_json: Value,
     exclusions_json: Value,
     exclusions_hash: String,
+}
+
+fn default_scan_mode() -> String {
+    "complete".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3103,6 +3109,9 @@ fn project_scan_started(
             "scan start requires a non-conflicting device fingerprint",
         ));
     }
+    if !matches!(value.scan_mode.as_str(), "add" | "complete") {
+        return Err(invalid_payload(record, "invalid scan mode"));
+    }
     if record.envelope.location_id.as_deref() != Some(value.location_id.as_str())
         || record.envelope.device_id.as_deref() != Some(value.device_id.as_str())
     {
@@ -3141,18 +3150,19 @@ fn project_scan_started(
     }
     transaction.execute(
         "INSERT INTO scan_runs(
-            scan_id, job_id, location_id, collection_id,
+            scan_id, job_id, location_id, collection_id, scan_mode,
             logical_prefix_bytes, logical_prefix_encoding, logical_prefix_display,
             status, started_time_utc_ms, started_event_seq, coverage_version,
             scope_json, exclusions_json, exclusions_hash, error_summary_json,
             started_event_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, ?9, ?10,
-                   ?11, ?12, ?13, '{}', ?14)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?10, ?11,
+                   ?12, ?13, ?14, '{}', ?15)",
         params![
             value.scan_id,
             record.envelope.job_id,
             value.location_id,
             value.collection_id,
+            value.scan_mode,
             logical_prefix,
             value
                 .logical_prefix
@@ -3195,6 +3205,7 @@ fn project_scan_missing_candidate(
             "SELECT EXISTS(
                 SELECT 1 FROM scan_runs
                 WHERE scan_id = ?1 AND location_id = ?2 AND status = 'running'
+                  AND scan_mode = 'complete'
              )",
             params![value.scan_id, value.location_id],
             |row| row.get(0),
@@ -3248,10 +3259,11 @@ fn project_scan_completed(
         scope_json,
         exclusions_json,
         exclusions_hash,
-    ): (String, String, i64, i64, String, String, String) = transaction
+        scan_mode,
+    ): (String, String, i64, i64, String, String, String, String) = transaction
         .query_row(
             "SELECT location_id, collection_id, started_event_seq, coverage_version,
-                    scope_json, exclusions_json, exclusions_hash
+                    scope_json, exclusions_json, exclusions_hash, scan_mode
              FROM scan_runs WHERE scan_id = ?1 AND status = 'running'",
             [&value.scan_id],
             |row| {
@@ -3263,6 +3275,7 @@ fn project_scan_completed(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -3279,7 +3292,7 @@ fn project_scan_completed(
             "scan completion coverage does not match its start",
         ));
     }
-    let interleaved = if value.status == "complete" {
+    let interleaved = if value.status == "complete" && scan_mode == "complete" {
         transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1
@@ -3339,6 +3352,27 @@ fn project_scan_completed(
             record,
             &value,
             &value.status,
+            value.error_count,
+            &value.error_summary,
+        );
+    }
+
+    if scan_mode == "add" {
+        if value.observations_count != 0
+            || value.observations_digest.is_some()
+            || value.missing_candidate_count != 0
+            || value.missing_candidate_digest.is_some()
+        {
+            return Err(invalid_payload(
+                record,
+                "an add run cannot activate missing candidates",
+            ));
+        }
+        return project_incomplete_scan(
+            transaction,
+            record,
+            &value,
+            "complete",
             value.error_count,
             &value.error_summary,
         );

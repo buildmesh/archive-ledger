@@ -93,10 +93,31 @@ pub struct ScanConfig {
     pub location_id: String,
     pub device_id: String,
     pub archive_root_id: String,
+    /// Location-relative prefix of `root_path`, used by positive-only add runs.
+    pub location_prefix: Option<PathBuf>,
     pub logical_prefix: Option<PathBuf>,
     pub exclusions: Vec<PathBuf>,
     pub fingerprint_status: String,
     pub batch_entries: usize,
+    pub scan_mode: ScanMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanMode {
+    /// Record only files that are present. Never infer that an unseen file is missing.
+    Add,
+    /// Reconcile the complete declared scope, including safe missing-file detection.
+    Complete,
+}
+
+impl ScanMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Complete => "complete",
+        }
+    }
 }
 
 impl ScanConfig {
@@ -130,6 +151,14 @@ impl ScanConfig {
         }
         if let Some(prefix) = &self.logical_prefix {
             validate_relative_path("logical_prefix", prefix)?;
+        }
+        if let Some(prefix) = &self.location_prefix {
+            validate_relative_path("location_prefix", prefix)?;
+            if self.scan_mode != ScanMode::Add {
+                return Err(ScanError::InvalidConfig(
+                    "location_prefix is supported only for positive-only add runs".to_owned(),
+                ));
+            }
         }
         for exclusion in &self.exclusions {
             validate_relative_path("exclusion", exclusion)?;
@@ -191,6 +220,7 @@ pub struct LocationScanner<'a> {
     projection: &'a ProjectionDb,
     config: ScanConfig,
     logical_prefix: Option<EncodedPath>,
+    location_prefix: Option<EncodedPath>,
     scope_json: Value,
     exclusions_json: Value,
     exclusions_json_text: String,
@@ -341,6 +371,10 @@ impl<'a> LocationScanner<'a> {
             .logical_prefix
             .as_ref()
             .map(|path| encode_relative_path(path));
+        let location_prefix = config
+            .location_prefix
+            .as_ref()
+            .map(|path| encode_relative_path(path));
         let exclusions: Vec<_> = config
             .exclusions
             .iter()
@@ -348,12 +382,18 @@ impl<'a> LocationScanner<'a> {
             .collect();
         let scope_json = json!({
             "version": COVERAGE_VERSION,
+            "scan_mode": config.scan_mode.as_str(),
             "resolved_root_path": path_json(&encode_absolute_path(&config.root_path)),
             "root_filesystem_identity": root_filesystem_identity(&config.root_path)?,
             "logical_prefix": logical_prefix.as_ref().map(path_json),
+            "location_prefix": location_prefix.as_ref().map(path_json),
             "filesystem_boundary": "same_device",
             "traversal_version": TRAVERSAL_VERSION,
-            "source_stability": "double_metadata_enumeration",
+            "source_stability": if config.scan_mode == ScanMode::Complete {
+                "double_metadata_enumeration"
+            } else {
+                "positive_observations_only"
+            },
         });
         let exclusions_json = Value::Array(
             exclusions
@@ -377,6 +417,7 @@ impl<'a> LocationScanner<'a> {
             projection,
             config,
             logical_prefix,
+            location_prefix,
             scope_json,
             exclusions_json,
             exclusions_json_text,
@@ -469,11 +510,13 @@ impl<'a> LocationScanner<'a> {
         let now = now_utc_ms()?;
         let params_json = serde_json::to_string(&json!({
             "scan_id": self.config.scan_id,
+            "scan_mode": self.config.scan_mode.as_str(),
             "root_path": self.config.root_path.to_string_lossy(),
             "collection_id": self.config.collection_id,
             "location_id": self.config.location_id,
             "device_id": self.config.device_id,
             "archive_root_id": self.config.archive_root_id,
+            "location_prefix": self.config.location_prefix.as_ref().map(|path| path.to_string_lossy()),
             "logical_prefix": self.config.logical_prefix.as_ref().map(|path| path.to_string_lossy()),
             "exclusion_paths": self.config.exclusions.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
             "fingerprint_status": self.config.fingerprint_status,
@@ -536,11 +579,12 @@ impl<'a> LocationScanner<'a> {
                     processed_files += 1;
                     summary.files_seen += 1;
                     summary.bytes_seen = summary.bytes_seen.saturating_add(file.size_bytes);
+                    let location_path = self.location_path(&file.relative_path)?;
                     let known = session.known_entry(
                         &self.config.scan_id,
                         &self.config.collection_id,
                         &self.config.location_id,
-                        &file.relative_path,
+                        &location_path,
                     )?;
                     let unchanged = known.as_ref().is_some_and(|known| {
                         !known.has_effective_missing_candidate
@@ -556,7 +600,7 @@ impl<'a> LocationScanner<'a> {
                         if !known.observed_by_current_scan {
                             summary.unchanged_paths += 1;
                         }
-                        pending_seen.push(seen_path(&file.relative_path, &known));
+                        pending_seen.push(seen_path(&location_path, &known));
                     } else {
                         match self.events_for_file(&file, known.as_ref())? {
                             FileEvents::Stable {
@@ -633,6 +677,14 @@ impl<'a> LocationScanner<'a> {
                 status: ScanStatus::Partial,
                 summary,
             });
+        }
+
+        // An add run proves only positive observations. Finalize it before
+        // candidate generation and complete-coverage confirmation so absence
+        // from an add traversal can never become a missing claim.
+        if self.config.scan_mode == ScanMode::Add {
+            let status = self.complete_scan("complete", &summary, None)?;
+            return Ok(ScanResult { status, summary });
         }
 
         self.generate_missing_candidates()?;
@@ -784,6 +836,7 @@ impl<'a> LocationScanner<'a> {
             .root_path
             .join(raw_relative_path(&file.relative_path)?);
         let logical_path = self.logical_path(&file.relative_path)?;
+        let location_path = self.location_path(&file.relative_path)?;
         let file_ref_id = known
             .map(|entry| entry.file_ref_id.clone())
             .unwrap_or_else(|| {
@@ -803,18 +856,19 @@ impl<'a> LocationScanner<'a> {
                     "copy",
                     &[
                         self.config.location_id.as_bytes(),
-                        file.relative_path.encoding.as_str().as_bytes(),
-                        &file.relative_path.bytes,
+                        location_path.encoding.as_str().as_bytes(),
+                        &location_path.bytes,
                     ],
                 )
             });
-        let item_key = scan_item_key(&file.relative_path);
+        let item_key = scan_item_key(&location_path);
         match hash_file_stable(&absolute, file) {
             HashOutcome::Stable(content) => {
                 let object_id = format!("obj_blake3_{}", content.blake3_hex);
                 let events = self.positive_events(
                     file,
                     &logical_path,
+                    &location_path,
                     &file_ref_id,
                     &copy_claim_id,
                     Some(&object_id),
@@ -825,7 +879,7 @@ impl<'a> LocationScanner<'a> {
                     events,
                     seen: ScanSeenPath {
                         item_key,
-                        path: file.relative_path.clone(),
+                        path: location_path,
                         file_ref_id: Some(file_ref_id),
                         copy_claim_id: Some(copy_claim_id),
                     },
@@ -836,6 +890,7 @@ impl<'a> LocationScanner<'a> {
                 let events = self.positive_events(
                     file,
                     &logical_path,
+                    &location_path,
                     &file_ref_id,
                     &copy_claim_id,
                     None,
@@ -846,7 +901,7 @@ impl<'a> LocationScanner<'a> {
                     events,
                     seen: ScanSeenPath {
                         item_key,
-                        path: file.relative_path.clone(),
+                        path: location_path,
                         file_ref_id: Some(file_ref_id),
                         copy_claim_id: Some(copy_claim_id),
                     },
@@ -861,13 +916,14 @@ impl<'a> LocationScanner<'a> {
         &self,
         file: &DiscoveredFile,
         logical_path: &EncodedPath,
+        location_path: &EncodedPath,
         file_ref_id: &str,
         copy_claim_id: &str,
         object_id: Option<&str>,
         content: Option<&HashedContent>,
         read_error: Option<(u64, String)>,
     ) -> Vec<EventRequest> {
-        let fields = EventFields::new(&self.config, &file.relative_path);
+        let fields = EventFields::new(&self.config, location_path);
         let mut events = Vec::new();
         if let (Some(object_id), Some(content)) = (object_id, content) {
             events.push(scan_event(
@@ -919,7 +975,7 @@ impl<'a> LocationScanner<'a> {
             json!({
                 "file_ref_id": file_ref_id,
                 "location_id": self.config.location_id,
-                "observed_path": path_json(&file.relative_path),
+                "observed_path": path_json(location_path),
                 "representation": "ordinary_file",
                 "object_id": object_id,
                 "external_identity_id": null,
@@ -945,7 +1001,7 @@ impl<'a> LocationScanner<'a> {
             json!({
                 "copy_claim_id": copy_claim_id,
                 "location_id": self.config.location_id,
-                "relative_path": path_json(&file.relative_path),
+                "relative_path": path_json(location_path),
                 "object_id": object_id,
                 "external_identity_id": null,
                 "claim_basis": if object_id.is_some() { "observed_bytes" } else { "observed_metadata" },
@@ -984,7 +1040,7 @@ impl<'a> LocationScanner<'a> {
         events.push(scan_event(
             "copy_verified",
             json!({
-                "verification_id": stable_id("verify", &[self.config.scan_id.as_bytes(), &file.relative_path.bytes]),
+                "verification_id": stable_id("verify", &[self.config.scan_id.as_bytes(), &location_path.bytes]),
                 "copy_claim_id": copy_claim_id,
                 "object_id": object_id,
                 "location_id": self.config.location_id,
@@ -995,7 +1051,7 @@ impl<'a> LocationScanner<'a> {
                 "size_bytes": file.size_bytes,
                 "bytes_read": bytes_read,
                 "duration_ms": duration_ms,
-                "path_observed": path_json(&file.relative_path),
+                "path_observed": path_json(location_path),
                 "device_fingerprint_status": self.config.fingerprint_status,
                 "error_code": error_code,
                 "error_detail": error_detail,
@@ -1019,27 +1075,40 @@ impl<'a> LocationScanner<'a> {
     }
 
     fn logical_path(&self, relative: &EncodedPath) -> Result<EncodedPath> {
-        let Some(prefix) = &self.logical_prefix else {
-            return Ok(relative.clone());
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStringExt;
-
-            let mut bytes = prefix.bytes.clone();
-            bytes.push(b'/');
-            bytes.extend_from_slice(&relative.bytes);
-            Ok(encode_relative_path(&PathBuf::from(
-                std::ffi::OsString::from_vec(bytes),
-            )))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (prefix, relative);
-            Err(ScanError::UnsupportedPlatform)
-        }
+        join_encoded_prefix(self.logical_prefix.as_ref(), relative)
     }
 
+    fn location_path(&self, relative: &EncodedPath) -> Result<EncodedPath> {
+        join_encoded_prefix(self.location_prefix.as_ref(), relative)
+    }
+}
+
+fn join_encoded_prefix(
+    prefix: Option<&EncodedPath>,
+    relative: &EncodedPath,
+) -> Result<EncodedPath> {
+    let Some(prefix) = prefix else {
+        return Ok(relative.clone());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut bytes = prefix.bytes.clone();
+        bytes.push(b'/');
+        bytes.extend_from_slice(&relative.bytes);
+        Ok(encode_relative_path(&PathBuf::from(
+            std::ffi::OsString::from_vec(bytes),
+        )))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (prefix, relative);
+        Err(ScanError::UnsupportedPlatform)
+    }
+}
+
+impl LocationScanner<'_> {
     fn missing_candidate_event(
         &self,
         target: &crate::projection::ScanMissingTarget,
@@ -1086,6 +1155,7 @@ impl<'a> LocationScanner<'a> {
             "scan_completed",
             json!({
                 "scan_id": self.config.scan_id,
+                "scan_mode": self.config.scan_mode.as_str(),
                 "status": status,
                 "coverage_version": COVERAGE_VERSION,
                 "scope_json": self.scope_json,
@@ -1152,6 +1222,7 @@ impl<'a> LocationScanner<'a> {
             "scan_started",
             json!({
                 "scan_id": self.config.scan_id,
+                "scan_mode": self.config.scan_mode.as_str(),
                 "location_id": self.config.location_id,
                 "collection_id": self.config.collection_id,
                 "logical_prefix": self.logical_prefix.as_ref().map(path_json),
@@ -1634,6 +1705,71 @@ mod tests {
         assert!(freshness
             .uncertainty
             .contains(&"latest_scan_incomplete".to_owned()));
+    }
+
+    #[test]
+    fn add_records_new_files_without_missing_or_complete_coverage() {
+        let temp = TempDir::new().unwrap();
+        let fixture = temp.path().join("files");
+        fs::create_dir(&fixture).unwrap();
+        fs::write(fixture.join("kept.txt"), b"kept").unwrap();
+        fs::write(fixture.join("later-removed.txt"), b"removed").unwrap();
+        let (store, database) = setup(&temp);
+        scanner(&store, &database, &fixture, "scan_initial", "job_initial")
+            .run()
+            .unwrap();
+        fs::remove_file(fixture.join("later-removed.txt")).unwrap();
+        fs::write(fixture.join("new.txt"), b"new").unwrap();
+
+        let result = scanner_with_mode(
+            &store,
+            &database,
+            &fixture,
+            "add_positive",
+            "job_add_positive",
+            ScanMode::Add,
+        )
+        .run()
+        .unwrap();
+
+        assert_eq!(result.status, ScanStatus::Complete);
+        assert_eq!(result.summary.new_paths, 1);
+        assert_eq!(result.summary.missing_paths, 0);
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT COUNT(*) FROM scan_missing_candidates WHERE scan_id = 'add_positive'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT COUNT(*) FROM copy_claims WHERE state = 'missing'"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT COUNT(*) FROM copy_claims WHERE state = 'present'"
+            ),
+            3
+        );
+        assert_eq!(
+            text_scalar(
+                &database,
+                "SELECT last_complete_scan_id FROM copy_claims WHERE relative_path_display = 'later-removed.txt'"
+            ),
+            "scan_initial"
+        );
+        assert_eq!(
+            text_scalar(
+                &database,
+                "SELECT scan_mode FROM scan_runs WHERE scan_id = 'add_positive'"
+            ),
+            "add"
+        );
     }
 
     #[test]
@@ -2538,6 +2674,45 @@ mod tests {
         job_id: &str,
         exclusions: Vec<PathBuf>,
     ) -> LocationScanner<'a> {
+        scanner_with_mode_and_exclusions(
+            store,
+            database,
+            root,
+            scan_id,
+            job_id,
+            ScanMode::Complete,
+            exclusions,
+        )
+    }
+
+    fn scanner_with_mode<'a>(
+        store: &'a EventStore,
+        database: &'a ProjectionDb,
+        root: &Path,
+        scan_id: &str,
+        job_id: &str,
+        scan_mode: ScanMode,
+    ) -> LocationScanner<'a> {
+        scanner_with_mode_and_exclusions(
+            store,
+            database,
+            root,
+            scan_id,
+            job_id,
+            scan_mode,
+            Vec::new(),
+        )
+    }
+
+    fn scanner_with_mode_and_exclusions<'a>(
+        store: &'a EventStore,
+        database: &'a ProjectionDb,
+        root: &Path,
+        scan_id: &str,
+        job_id: &str,
+        scan_mode: ScanMode,
+        exclusions: Vec<PathBuf>,
+    ) -> LocationScanner<'a> {
         LocationScanner::new(
             store,
             database,
@@ -2549,10 +2724,12 @@ mod tests {
                 location_id: "location_fixture".to_owned(),
                 device_id: "device_fixture".to_owned(),
                 archive_root_id: "root_fixture".to_owned(),
+                location_prefix: None,
                 logical_prefix: None,
                 exclusions,
                 fingerprint_status: "match".to_owned(),
                 batch_entries: 2,
+                scan_mode,
             },
         )
         .unwrap()
