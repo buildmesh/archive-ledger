@@ -375,6 +375,39 @@ impl RegistryPath {
         #[allow(unreachable_code)]
         Self::utf8(path.to_string_lossy())
     }
+
+    pub fn to_path_buf(&self) -> Option<PathBuf> {
+        match self.encoding.as_str() {
+            "utf8" => self.text.as_ref().map(PathBuf::from),
+            #[cfg(unix)]
+            "unix_bytes" => {
+                use std::os::unix::ffi::OsStringExt as _;
+                self.base64
+                    .as_ref()
+                    .and_then(|value| STANDARD.decode(value).ok())
+                    .map(std::ffi::OsString::from_vec)
+                    .map(PathBuf::from)
+            }
+            #[cfg(windows)]
+            "windows_utf16le" => {
+                use std::os::windows::ffi::OsStringExt as _;
+                let bytes = self
+                    .base64
+                    .as_ref()
+                    .and_then(|value| STANDARD.decode(value).ok())?;
+                let mut chunks = bytes.chunks_exact(2);
+                let wide = chunks
+                    .by_ref()
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect::<Vec<_>>();
+                chunks
+                    .remainder()
+                    .is_empty()
+                    .then(|| PathBuf::from(std::ffi::OsString::from_wide(&wide)))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

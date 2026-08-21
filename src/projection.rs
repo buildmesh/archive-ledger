@@ -2781,11 +2781,19 @@ fn project_file_ref(
             path_state, observed_size_bytes, first_seen_event_id, last_seen_event_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
          ON CONFLICT(file_ref_id) DO UPDATE SET
-            object_id = excluded.object_id,
+            object_id = CASE
+              WHEN excluded.object_id IS NOT NULL THEN excluded.object_id
+              WHEN excluded.external_identity_id = file_refs.external_identity_id
+                THEN file_refs.object_id
+              ELSE NULL END,
             external_identity_id = excluded.external_identity_id,
-            identity_state = excluded.identity_state,
+            identity_state = CASE
+              WHEN excluded.object_id IS NULL
+               AND excluded.external_identity_id = file_refs.external_identity_id
+               AND file_refs.object_id IS NOT NULL THEN file_refs.identity_state
+              ELSE excluded.identity_state END,
             path_state = excluded.path_state,
-            observed_size_bytes = excluded.observed_size_bytes,
+            observed_size_bytes = COALESCE(excluded.observed_size_bytes, file_refs.observed_size_bytes),
             last_seen_event_id = excluded.last_seen_event_id",
         params![
             value.file_ref_id,

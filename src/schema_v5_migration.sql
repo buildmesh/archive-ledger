@@ -51,3 +51,8 @@ SELECT import_id, job_id, repo_path_bytes, repo_path_encoding, repo_path_display
 FROM annex_imports_v4;
 
 DROP TABLE annex_imports_v4;
+
+CREATE INDEX annex_imports_location ON annex_imports(location_id, collection_id);
+CREATE INDEX external_availability_location_state
+    ON external_availability(location_id, state)
+    WHERE location_id IS NOT NULL;

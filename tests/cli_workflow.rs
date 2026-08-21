@@ -311,6 +311,38 @@ mod unix {
         );
         assert_eq!(second["device"]["device_id"], first["device"]["device_id"]);
         assert_eq!(second["site"]["site_id"], first["site"]["site_id"]);
+        let empty_collection =
+            success(central_archive(&temp).args(["--json", "collection", "status", "Documents"]));
+        assert_eq!(json(&empty_collection)["file_count"], 0);
+        let empty_location = success(central_archive(&temp).args([
+            "--json",
+            "location",
+            "status",
+            second["location"]["location_id"].as_str().unwrap(),
+        ]));
+        assert_eq!(json(&empty_location)["present_count"], 0);
+        let extra = mount_b.join("annex/extra");
+        fs::create_dir(&extra).unwrap();
+        let mut extra_location = central_archive(&temp);
+        use_fake_findmnt(&mut extra_location, &bin, &mount_b, Some("test-uuid"));
+        let extra_location = success(
+            extra_location
+                .arg("--json")
+                .arg("location")
+                .arg("init")
+                .arg(&extra)
+                .args([
+                    "--collection",
+                    "Photos",
+                    "--location-name",
+                    "Photos extra on SD01",
+                    "--non-interactive",
+                ]),
+        );
+        assert_eq!(
+            json(&extra_location)["collection"]["display_name"],
+            "Photos"
+        );
 
         let unknown = mount_a.join("unknown");
         fs::create_dir(&unknown).unwrap();
@@ -348,7 +380,7 @@ mod unix {
         assert_eq!(count("archive_roots"), 1);
         assert_eq!(count("devices"), 1);
         assert_eq!(count("sites"), 1);
-        assert_eq!(count("locations"), 2);
+        assert_eq!(count("locations"), 3);
         assert_eq!(count("collections"), 2);
     }
 
@@ -438,6 +470,69 @@ mod unix {
         assert_eq!(second["annex_import"]["summary"]["absent"], 2);
         assert_ne!(second["location"]["location_id"], first_location);
 
+        let collection_status =
+            success(central_archive(&temp).args(["--json", "collection", "status", "Photos"]));
+        let collection_status = json(&collection_status);
+        assert_eq!(collection_status["file_count"], 2);
+        assert_eq!(collection_status["unique_object_count"], 1);
+        assert_eq!(collection_status["unresolved_identity_count"], 1);
+        assert_eq!(collection_status["location_count"], 2);
+
+        let first_status =
+            success(central_archive(&temp).args(["--json", "location", "status", first_location]));
+        let first_status = json(&first_status);
+        assert_eq!(first_status["logical_file_count"], 2);
+        assert_eq!(first_status["present_count"], 1);
+        assert_eq!(first_status["unresolved_present_count"], 1);
+        assert_eq!(first_status["unresolved_missing_count"], 1);
+
+        let mut inferred_location = central_archive(&temp);
+        use_fake_findmnt(&mut inferred_location, &bin, &mount_a, Some("MEDIA-MAIN"));
+        let inferred_location = success(
+            inferred_location
+                .current_dir(&source)
+                .args(["--json", "location", "status"]),
+        );
+        assert_eq!(json(&inferred_location)["location_id"], first_location);
+        let mut inferred_collection = central_archive(&temp);
+        use_fake_findmnt(&mut inferred_collection, &bin, &mount_a, Some("MEDIA-MAIN"));
+        let inferred_collection = success(inferred_collection.current_dir(&source).args([
+            "--json",
+            "collection",
+            "status",
+        ]));
+        assert_eq!(json(&inferred_collection)["collection_id"], collection_id);
+
+        success(central_archive(&temp).args([
+            "site",
+            "add",
+            "--id",
+            "site_offsite",
+            "--name",
+            "Offsite",
+            "--kind",
+            "storage",
+        ]));
+        success(central_archive(&temp).args(["site", "rename", "Home", "House"]));
+        success(central_archive(&temp).args(["device", "rename", "Main Computer", "Desktop"]));
+        success(central_archive(&temp).args([
+            "location",
+            "rename",
+            first_location,
+            "Photos on Desktop",
+        ]));
+        success(central_archive(&temp).args(["collection", "rename", "Photos", "Media Photos"]));
+        success(
+            central_archive(&temp).args(["device", "move", "--device", "SD01", "--to", "Offsite"]),
+        );
+        let renamed = success(central_archive(&temp).args([
+            "--json",
+            "collection",
+            "status",
+            "Media Photos",
+        ]));
+        assert_eq!(json(&renamed)["collection_id"], collection_id);
+
         let database_path = temp
             .path()
             .join("data/archive-ledger/archives/arc_media/archive.db");
@@ -486,6 +581,24 @@ mod unix {
             )
             .unwrap();
         assert_eq!(split_import_locations, 0);
+        let moved_site: String = connection
+            .query_row(
+                "SELECT s.display_name FROM devices d
+                 JOIN sites s ON s.site_id = d.current_site_id
+                 WHERE d.display_name = 'SD01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_site, "Offsite");
+        let renamed_location_id: String = connection
+            .query_row(
+                "SELECT location_id FROM locations WHERE display_name = 'Photos on Desktop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(renamed_location_id, first_location);
         assert_eq!(git_stdout(&source, &["rev-parse", "HEAD"]), source_head);
         assert_eq!(
             git_stdout(&source, &["status", "--porcelain=v1"]),

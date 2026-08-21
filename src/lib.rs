@@ -10,6 +10,7 @@ pub mod projection;
 pub mod registry;
 pub mod review;
 pub mod scan;
+pub mod status;
 pub mod storage;
 
 pub use annex::{
@@ -52,4 +53,5 @@ pub use review::{
     ObjectHashReview, ObjectReview, ReviewError,
 };
 pub use scan::{LocationScanner, ScanConfig, ScanError, ScanResult, ScanStatus, ScanSummary};
+pub use status::{CollectionStatus, LocationStatus, StatusError};
 pub use storage::{discover_mounted_filesystem, MountedFilesystem, StorageDiscoveryError};

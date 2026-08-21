@@ -15,7 +15,7 @@ use archive_ledger::{
     PolicyFindingFilter, PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig,
     ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError,
     RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError,
-    ScanStatus, SiteSnapshot, StorageDiscoveryError,
+    ScanStatus, SiteSnapshot, StatusError, StorageDiscoveryError,
 };
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
@@ -219,7 +219,7 @@ enum Command {
     /// Manage sites through canonical full-snapshot events.
     Site {
         #[command(subcommand)]
-        command: RegistryEntityCommand,
+        command: SiteCommand,
     },
     /// Manage collections through canonical full-snapshot events.
     Collection {
@@ -229,7 +229,7 @@ enum Command {
     /// Manage devices through canonical full-snapshot events.
     Device {
         #[command(subcommand)]
-        command: RegistryEntityCommand,
+        command: DeviceCommand,
     },
     /// Manage archive roots through canonical full-snapshot events.
     Root {
@@ -606,12 +606,19 @@ enum RegistryEntityCommand {
 enum CollectionCommand {
     /// Create a Collection and its initial filesystem Location from cwd or --path.
     Init(CollectionInitArgs),
+    /// Rename a Collection without changing its stable ID.
+    Rename {
+        collection: String,
+        new_name: String,
+    },
+    /// Show a fast SQLite-only Collection summary; infer from cwd when omitted.
+    Status { collection: Option<String> },
     /// List active Collections.
     List {
         #[arg(long)]
         all: bool,
     },
-    /// Show one Collection by stable ID.
+    /// Show one Collection by name or stable ID.
     Show { id: String },
     /// Add a Collection with friendly flags, or provide a complete JSON snapshot.
     Add(Box<RegistryAddArgs>),
@@ -664,8 +671,14 @@ struct CollectionInitArgs {
 
 #[derive(Debug, Subcommand)]
 enum LocationCommand {
+    /// Register this directory as another filesystem Location of a Collection.
+    Init(LocationInitArgs),
     /// Import a git-annex repository as one partial Location of a Collection.
     ImportAnnex(LocationImportAnnexArgs),
+    /// Rename a Location without changing its stable ID or path.
+    Rename { location: String, new_name: String },
+    /// Show a fast SQLite-only Location summary; infer from cwd when omitted.
+    Status { location: Option<String> },
     /// Inspect a mounted path without registering or changing it.
     Discover { path: PathBuf },
     /// List active Locations.
@@ -673,7 +686,7 @@ enum LocationCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Show one Location by stable ID.
+    /// Show one Location by name or stable ID.
     Show { id: String },
     /// Add a Location with friendly flags, or provide a complete JSON snapshot.
     Add(Box<RegistryAddArgs>),
@@ -684,6 +697,111 @@ enum LocationCommand {
         snapshot: String,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct LocationInitArgs {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    #[arg(long)]
+    collection: String,
+    #[arg(long)]
+    device: Option<String>,
+    #[arg(long)]
+    site: Option<String>,
+    #[arg(long)]
+    location_name: Option<String>,
+    #[arg(long)]
+    root_name: Option<String>,
+    #[arg(long)]
+    allow_unidentified_root: bool,
+    #[arg(long)]
+    non_interactive: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum SiteCommand {
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    Show {
+        id: String,
+    },
+    Add(Box<RegistryAddArgs>),
+    Rename {
+        site: String,
+        new_name: String,
+    },
+    Update {
+        snapshot: String,
+    },
+    Retire {
+        snapshot: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeviceCommand {
+    Discover {
+        path: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    Show {
+        id: String,
+    },
+    Add(Box<RegistryAddArgs>),
+    Rename {
+        device: String,
+        new_name: String,
+    },
+    /// Record that a Device is now stored at another Site.
+    Move {
+        #[arg(
+            value_name = "DEVICE",
+            required_unless_present = "device_option",
+            conflicts_with = "device_option"
+        )]
+        device_positional: Option<String>,
+        #[arg(
+            long = "device",
+            value_name = "DEVICE",
+            required_unless_present = "device_positional",
+            conflicts_with = "device_positional"
+        )]
+        device_option: Option<String>,
+        #[arg(long)]
+        to: String,
+    },
+    Update {
+        snapshot: String,
+    },
+    Retire {
+        snapshot: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    CheckIn {
+        device_id: String,
+        #[arg(long)]
+        fingerprint_status: String,
+    },
+    Mount {
+        device_id: String,
+        #[arg(long)]
+        mount_id: String,
+        #[arg(long)]
+        mount_root_uri: String,
+        #[arg(long)]
+        status: String,
+        #[arg(long)]
+        fingerprint_status: String,
     },
 }
 
@@ -851,6 +969,7 @@ enum AppError {
     Scan(ScanError),
     Annex(AnnexImportError),
     Storage(StorageDiscoveryError),
+    Status(StatusError),
     Io(std::io::Error),
     Json(serde_json::Error),
     Clock,
@@ -870,6 +989,7 @@ impl AppError {
             Self::Scan(error) => error.code(),
             Self::Annex(error) => error.code(),
             Self::Storage(error) => error.code(),
+            Self::Status(error) => error.code(),
             Self::Io(_) => "io_error",
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
@@ -891,6 +1011,7 @@ impl std::fmt::Display for AppError {
             Self::Scan(error) => error.fmt(formatter),
             Self::Annex(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
+            Self::Status(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
@@ -956,6 +1077,12 @@ impl From<AnnexImportError> for AppError {
 impl From<StorageDiscoveryError> for AppError {
     fn from(error: StorageDiscoveryError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<StatusError> for AppError {
+    fn from(error: StatusError) -> Self {
+        Self::Status(error)
     }
 }
 
@@ -1181,11 +1308,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         },
         Command::AnnexRemote { command } => execute_annex_remote(cli, &database, command),
         Command::Job { command } => execute_job(cli, &database, command),
-        Command::Site { command } => execute_registry(cli, &database, RegistryKind::Site, command),
+        Command::Site { command } => execute_site(cli, &database, command),
         Command::Collection { command } => execute_collection(cli, &database, command),
-        Command::Device { command } => {
-            execute_registry(cli, &database, RegistryKind::Device, command)
-        }
+        Command::Device { command } => execute_device(cli, &database, command),
         Command::Root { command } => execute_registry(cli, &database, RegistryKind::Root, command),
         Command::Location { command } => execute_location(cli, &database, command),
         Command::RiskDomain { command } => {
@@ -3520,6 +3645,171 @@ fn prompt_confirmation(label: &str) -> Result<bool, AppError> {
     ))
 }
 
+fn execute_site(cli: &Cli, database: &ProjectionDb, command: &SiteCommand) -> Result<u8, AppError> {
+    match command {
+        SiteCommand::Rename { site, new_name } => {
+            execute_registry_rename(cli, database, RegistryKind::Site, site, new_name)
+        }
+        SiteCommand::List { all } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Site,
+            &RegistryEntityCommand::List { all: *all },
+        ),
+        SiteCommand::Show { id } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Site,
+            &RegistryEntityCommand::Show { id: id.clone() },
+        ),
+        SiteCommand::Add(args) => execute_registry(
+            cli,
+            database,
+            RegistryKind::Site,
+            &RegistryEntityCommand::Add(args.clone()),
+        ),
+        SiteCommand::Update { snapshot } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Site,
+            &RegistryEntityCommand::Update {
+                snapshot: snapshot.clone(),
+            },
+        ),
+        SiteCommand::Retire { snapshot, yes } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Site,
+            &RegistryEntityCommand::Retire {
+                snapshot: snapshot.clone(),
+                yes: *yes,
+            },
+        ),
+    }
+}
+
+fn execute_device(
+    cli: &Cli,
+    database: &ProjectionDb,
+    command: &DeviceCommand,
+) -> Result<u8, AppError> {
+    match command {
+        DeviceCommand::Rename { device, new_name } => {
+            execute_registry_rename(cli, database, RegistryKind::Device, device, new_name)
+        }
+        DeviceCommand::Move {
+            device_positional,
+            device_option,
+            to,
+        } => execute_device_move(
+            cli,
+            database,
+            device_positional
+                .as_deref()
+                .or(device_option.as_deref())
+                .expect("clap requires one Device selector"),
+            to,
+        ),
+        DeviceCommand::Discover { path } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Discover { path: path.clone() },
+        ),
+        DeviceCommand::List { all } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::List { all: *all },
+        ),
+        DeviceCommand::Show { id } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Show { id: id.clone() },
+        ),
+        DeviceCommand::Add(args) => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Add(args.clone()),
+        ),
+        DeviceCommand::Update { snapshot } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Update {
+                snapshot: snapshot.clone(),
+            },
+        ),
+        DeviceCommand::Retire { snapshot, yes } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Retire {
+                snapshot: snapshot.clone(),
+                yes: *yes,
+            },
+        ),
+        DeviceCommand::CheckIn {
+            device_id,
+            fingerprint_status,
+        } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::CheckIn {
+                device_id: device_id.clone(),
+                fingerprint_status: fingerprint_status.clone(),
+            },
+        ),
+        DeviceCommand::Mount {
+            device_id,
+            mount_id,
+            mount_root_uri,
+            status,
+            fingerprint_status,
+        } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Mount {
+                device_id: device_id.clone(),
+                mount_id: mount_id.clone(),
+                mount_root_uri: mount_root_uri.clone(),
+                status: status.clone(),
+                fingerprint_status: fingerprint_status.clone(),
+            },
+        ),
+    }
+}
+
+fn execute_device_move(
+    cli: &Cli,
+    database: &ProjectionDb,
+    device_selector: &str,
+    site_selector: &str,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let mut device = select_device(&state.devices, device_selector)?
+        .ok_or_else(|| AppError::Input(format!("Device not found: {device_selector:?}")))?;
+    let site = select_site(&state.sites, site_selector)?
+        .ok_or_else(|| AppError::Input(format!("Site not found: {site_selector:?}")))?;
+    if device.current_site_id.as_deref() == Some(site.site_id.as_str()) {
+        return Err(AppError::Input(format!(
+            "Device {} is already at Site {}",
+            device.display_name, site.display_name
+        )));
+    }
+    device.current_site_id = Some(site.site_id.clone());
+    record_registry_change(
+        cli,
+        database,
+        RegistryChange::Device(RegistryAction::Move, device),
+    )?;
+    Ok(EXIT_OK)
+}
+
 fn execute_collection(
     cli: &Cli,
     database: &ProjectionDb,
@@ -3527,6 +3817,19 @@ fn execute_collection(
 ) -> Result<u8, AppError> {
     match command {
         CollectionCommand::Init(args) => execute_collection_init(cli, database, args),
+        CollectionCommand::Rename {
+            collection,
+            new_name,
+        } => execute_registry_rename(
+            cli,
+            database,
+            RegistryKind::Collection,
+            collection,
+            new_name,
+        ),
+        CollectionCommand::Status { collection } => {
+            execute_collection_status(cli, database, collection.as_deref())
+        }
         CollectionCommand::List { all } => execute_registry(
             cli,
             database,
@@ -3571,6 +3874,34 @@ fn execute_location(
     command: &LocationCommand,
 ) -> Result<u8, AppError> {
     match command {
+        LocationCommand::Init(args) => {
+            let state = database.registry_state(false)?;
+            let collection =
+                select_collection(&state.collections, &args.collection)?.ok_or_else(|| {
+                    AppError::Input(format!("Collection not found: {:?}", args.collection))
+                })?;
+            let setup = CollectionInitArgs {
+                path: args.path.clone(),
+                name: Some(collection.display_name.clone()),
+                device: args.device.clone(),
+                site: args.site.clone(),
+                location_name: args.location_name.clone(),
+                root_name: args.root_name.clone(),
+                allow_unidentified_root: args.allow_unidentified_root,
+                non_interactive: args.non_interactive,
+                import_annex: false,
+                batch_entries: 1_000,
+                job_id: None,
+                import_id: None,
+            };
+            execute_filesystem_setup(
+                cli,
+                database,
+                &setup,
+                collection.display_name.clone(),
+                Some(collection),
+            )
+        }
         LocationCommand::ImportAnnex(args) => {
             let state = database.registry_state(false)?;
             let collection =
@@ -3598,6 +3929,12 @@ fn execute_location(
                 collection.display_name.clone(),
                 Some(collection),
             )
+        }
+        LocationCommand::Rename { location, new_name } => {
+            execute_registry_rename(cli, database, RegistryKind::Location, location, new_name)
+        }
+        LocationCommand::Status { location } => {
+            execute_location_status(cli, database, location.as_deref())
         }
         LocationCommand::Discover { path } => execute_registry(
             cli,
@@ -3641,6 +3978,372 @@ fn execute_location(
             },
         ),
     }
+}
+
+fn execute_registry_rename(
+    cli: &Cli,
+    database: &ProjectionDb,
+    kind: RegistryKind,
+    selector: &str,
+    new_name: &str,
+) -> Result<u8, AppError> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(AppError::Input("new name must be non-empty".to_owned()));
+    }
+    let state = database.registry_state(false)?;
+    let change = match kind {
+        RegistryKind::Site => {
+            let mut value = select_site(&state.sites, selector)?
+                .ok_or_else(|| AppError::Input(format!("Site not found: {selector:?}")))?;
+            ensure_unique_display_name(
+                state
+                    .sites
+                    .iter()
+                    .map(|site| (&site.site_id, &site.display_name)),
+                &value.site_id,
+                new_name,
+                "Site",
+            )?;
+            if value.display_name == new_name {
+                return Err(AppError::Input("Site already has that name".to_owned()));
+            }
+            value.display_name = new_name.to_owned();
+            RegistryChange::Site(RegistryAction::Update, value)
+        }
+        RegistryKind::Collection => {
+            let mut value = select_collection(&state.collections, selector)?
+                .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?;
+            ensure_unique_display_name(
+                state
+                    .collections
+                    .iter()
+                    .map(|collection| (&collection.collection_id, &collection.display_name)),
+                &value.collection_id,
+                new_name,
+                "Collection",
+            )?;
+            if value.display_name == new_name {
+                return Err(AppError::Input(
+                    "Collection already has that name".to_owned(),
+                ));
+            }
+            value.display_name = new_name.to_owned();
+            RegistryChange::Collection(RegistryAction::Update, value)
+        }
+        RegistryKind::Device => {
+            let mut value = select_device(&state.devices, selector)?
+                .ok_or_else(|| AppError::Input(format!("Device not found: {selector:?}")))?;
+            ensure_unique_display_name(
+                state
+                    .devices
+                    .iter()
+                    .map(|device| (&device.device_id, &device.display_name)),
+                &value.device_id,
+                new_name,
+                "Device",
+            )?;
+            if value.display_name == new_name {
+                return Err(AppError::Input("Device already has that name".to_owned()));
+            }
+            value.display_name = new_name.to_owned();
+            RegistryChange::Device(RegistryAction::Update, value)
+        }
+        RegistryKind::Location => {
+            let mut value = select_location(&state.locations, selector)?
+                .ok_or_else(|| AppError::Input(format!("Location not found: {selector:?}")))?;
+            ensure_unique_display_name(
+                state
+                    .locations
+                    .iter()
+                    .map(|location| (&location.location_id, &location.display_name)),
+                &value.location_id,
+                new_name,
+                "Location",
+            )?;
+            if value.display_name == new_name {
+                return Err(AppError::Input("Location already has that name".to_owned()));
+            }
+            value.display_name = new_name.to_owned();
+            RegistryChange::Location(RegistryAction::Update, value)
+        }
+        _ => {
+            return Err(AppError::Input(
+                "rename is not available for this registry type".to_owned(),
+            ))
+        }
+    };
+    record_registry_change(cli, database, change)?;
+    Ok(EXIT_OK)
+}
+
+fn ensure_unique_display_name<'a>(
+    mut values: impl Iterator<Item = (&'a String, &'a String)>,
+    current_id: &str,
+    new_name: &str,
+    kind: &str,
+) -> Result<(), AppError> {
+    if values.any(|(id, name)| id != current_id && name == new_name) {
+        return Err(AppError::Input(format!(
+            "an active {kind} named {new_name:?} already exists"
+        )));
+    }
+    Ok(())
+}
+
+fn execute_collection_status(
+    cli: &Cli,
+    database: &ProjectionDb,
+    selector: Option<&str>,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let collection = if let Some(selector) = selector {
+        select_collection(&state.collections, selector)?
+            .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?
+    } else {
+        let location = infer_cwd_location(cli, database, &state)?;
+        infer_collection_at_location(database, &state, &location.location_id)?
+    };
+    let summary = database.collection_summary(&collection.collection_id)?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "Collection: {} ({})",
+            summary.collection_name, summary.collection_id
+        );
+        println!(
+            "  {} files, {} bytes logical; {} unique objects, {} bytes",
+            summary.file_count,
+            summary.logical_bytes,
+            summary.unique_object_count,
+            summary.unique_object_bytes
+        );
+        println!(
+            "  {} Locations; {} unresolved identities; {} files with unknown size",
+            summary.location_count,
+            summary.unresolved_identity_count,
+            summary.files_with_unknown_size
+        );
+        match (summary.violated_files, summary.uncertain_files) {
+            (Some(violated), Some(uncertain)) => {
+                println!("  current risk: {violated} violated, {uncertain} uncertain");
+            }
+            _ => println!("  current risk: not evaluated for the latest catalog state"),
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn execute_location_status(
+    cli: &Cli,
+    database: &ProjectionDb,
+    selector: Option<&str>,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let location = if let Some(selector) = selector {
+        select_location(&state.locations, selector)?
+            .ok_or_else(|| AppError::Input(format!("Location not found: {selector:?}")))?
+    } else {
+        infer_cwd_location(cli, database, &state)?
+    };
+    let summary = database.location_summary(&location.location_id)?;
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "Location: {} ({})",
+            summary.location_name, summary.location_id
+        );
+        if let Some(device_name) = &summary.device_name {
+            println!(
+                "  Device: {}{}",
+                device_name,
+                summary
+                    .site_name
+                    .as_ref()
+                    .map(|site| format!(" at {site}"))
+                    .unwrap_or_default()
+            );
+        }
+        println!("  {} logical file paths", summary.logical_file_count);
+        println!(
+            "  present: {} ({} bytes); missing: {} ({} bytes)",
+            summary.present_count,
+            summary.present_bytes,
+            summary.missing_count,
+            summary.missing_bytes
+        );
+        println!(
+            "  corrupt: {} ({} bytes); unknown: {} ({} bytes)",
+            summary.corrupt_count,
+            summary.corrupt_bytes,
+            summary.unknown_count,
+            summary.unknown_bytes
+        );
+        println!(
+            "  unresolved identities: {} present, {} missing",
+            summary.unresolved_present_count, summary.unresolved_missing_count
+        );
+        println!(
+            "  last complete inventory: {}; last verification: {}",
+            status_optional_time(summary.last_complete_inventory_utc_ms),
+            status_optional_time(summary.last_verification_utc_ms)
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+fn status_optional_time(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("{value} UTC ms"))
+        .unwrap_or_else(|| "never".to_owned())
+}
+
+fn infer_cwd_location(
+    cli: &Cli,
+    database: &ProjectionDb,
+    state: &archive_ledger::RegistryState,
+) -> Result<LocationSnapshot, AppError> {
+    let cwd = std::fs::canonicalize(std::env::current_dir()?)?;
+    let mounted = archive_ledger::discover_mounted_filesystem(&cwd)?;
+    let mut root_mounts = BTreeMap::new();
+    if let (Some(kind), Some(fingerprint)) = (
+        mounted.fingerprint_kind.as_deref(),
+        mounted.filesystem_fingerprint.as_deref(),
+    ) {
+        let matching = state
+            .archive_roots
+            .iter()
+            .filter(|root| {
+                root.fingerprint_kind.as_deref() == Some(kind)
+                    && root.filesystem_fingerprint.as_deref() == Some(fingerprint)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 || matching[0].identity_state != "confirmed" {
+            return Err(AppError::Input(
+                "cwd filesystem identity does not uniquely match an active Archive Root; specify a Location"
+                    .to_owned(),
+            ));
+        }
+        root_mounts.insert(
+            matching[0].archive_root_id.clone(),
+            mounted.mount_root.clone(),
+        );
+    } else {
+        let connection =
+            Connection::open(database.path()).map_err(|source| status_sql(database, source))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT archive_root_id, mount_root_uri
+                 FROM device_mounts
+                 WHERE host_id = ?1 AND status = 'mounted' AND archive_root_id IS NOT NULL
+                 ORDER BY observed_time_utc_ms DESC, mount_id DESC",
+            )
+            .map_err(|source| status_sql(database, source))?;
+        let observations = statement
+            .query_map([&cli.host], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| status_sql(database, source))?;
+        for observation in observations {
+            let (root_id, mount_root) =
+                observation.map_err(|source| status_sql(database, source))?;
+            let root_is_unidentified = state.archive_roots.iter().any(|root| {
+                root.archive_root_id == root_id && root.identity_state == "unavailable"
+            });
+            let mount_root = PathBuf::from(mount_root);
+            if root_is_unidentified
+                && mount_root == mounted.mount_root
+                && !root_mounts.contains_key(&root_id)
+            {
+                root_mounts.insert(root_id, mount_root);
+            }
+        }
+    }
+    let mut matches = state
+        .locations
+        .iter()
+        .filter_map(|location| {
+            let root_id = location.archive_root_id.as_deref()?;
+            let mount_root = root_mounts.get(root_id)?;
+            let relative = location.relative_path.as_ref()?.to_path_buf()?;
+            let location_path = mount_root.join(relative);
+            cwd.starts_with(&location_path).then(|| {
+                (
+                    location_path.components().count(),
+                    location.location_id.clone(),
+                    location.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let Some(best) = matches.first() else {
+        return Err(AppError::Input(
+            "cwd is not inside a known mounted Location; specify a Location".to_owned(),
+        ));
+    };
+    if matches.get(1).is_some_and(|other| other.0 == best.0) {
+        return Err(AppError::Input(
+            "cwd matches multiple Locations equally; specify a Location by name or ID".to_owned(),
+        ));
+    }
+    Ok(best.2.clone())
+}
+
+fn infer_collection_at_location(
+    database: &ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    location_id: &str,
+) -> Result<CollectionSnapshot, AppError> {
+    let connection =
+        Connection::open(database.path()).map_err(|source| status_sql(database, source))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT collection_id FROM (
+               SELECT f.collection_id
+               FROM path_observations p
+               JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+               WHERE p.location_id = ?1
+               UNION ALL
+               SELECT collection_id FROM annex_imports WHERE location_id = ?1
+               UNION ALL
+               SELECT collection_id FROM scan_runs WHERE location_id = ?1
+             ) ORDER BY collection_id",
+        )
+        .map_err(|source| status_sql(database, source))?;
+    let ids = statement
+        .query_map([location_id], |row| row.get::<_, String>(0))
+        .map_err(|source| status_sql(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| status_sql(database, source))?;
+    let collections = ids
+        .iter()
+        .filter_map(|id| {
+            state
+                .collections
+                .iter()
+                .find(|collection| collection.collection_id == *id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match collections.as_slice() {
+        [collection] => Ok(collection.clone()),
+        [] => Err(AppError::Input(
+            "cwd Location has no Collection inventory yet; specify a Collection".to_owned(),
+        )),
+        _ => Err(AppError::Input(
+            "cwd Location contains multiple Collections; specify one by name or ID".to_owned(),
+        )),
+    }
+}
+
+fn status_sql(database: &ProjectionDb, source: rusqlite::Error) -> AppError {
+    AppError::Status(StatusError::Sqlite {
+        path: database.path().to_path_buf(),
+        source,
+    })
 }
 
 fn execute_collection_init(
@@ -3940,12 +4643,32 @@ fn execute_filesystem_setup(
     let location = if let Some(location) = existing_location {
         location
     } else {
+        let default_name = format!("{collection_name} on {}", device.display_name);
+        let mut display_name = args.location_name.clone().unwrap_or(default_name.clone());
+        if state
+            .locations
+            .iter()
+            .any(|location| location.display_name == display_name)
+        {
+            if args.location_name.is_some() {
+                return Err(AppError::Input(format!(
+                    "an active Location named {display_name:?} already exists"
+                )));
+            }
+            display_name = format!("{default_name} ({})", relative_path.display);
+            if state
+                .locations
+                .iter()
+                .any(|location| location.display_name == display_name)
+            {
+                return Err(AppError::Input(
+                    "the default Location name is ambiguous; provide --location-name".to_owned(),
+                ));
+            }
+        }
         let location = LocationSnapshot {
             location_id: generated_id("location"),
-            display_name: args
-                .location_name
-                .clone()
-                .unwrap_or_else(|| format!("{collection_name} on {}", device.display_name)),
+            display_name,
             kind: "filesystem".to_owned(),
             archive_root_id: Some(root.archive_root_id.clone()),
             relative_path: Some(relative_path),
@@ -4180,6 +4903,19 @@ fn select_collection(
     )
 }
 
+fn select_location(
+    locations: &[LocationSnapshot],
+    selector: &str,
+) -> Result<Option<LocationSnapshot>, AppError> {
+    select_registry_entity(
+        locations,
+        selector,
+        |location| &location.location_id,
+        |location| &location.display_name,
+        "Location",
+    )
+}
+
 fn select_site(sites: &[SiteSnapshot], selector: &str) -> Result<Option<SiteSnapshot>, AppError> {
     select_registry_entity(
         sites,
@@ -4261,10 +4997,32 @@ fn execute_registry(
         RegistryEntityCommand::Show { id } => {
             let state = database.registry_state(true)?;
             let values = registry_values(kind, &state)?;
-            let value = values
-                .into_iter()
+            let value = if let Some(value) = values
+                .iter()
                 .find(|value| registry_id(value) == Some(id.as_str()))
-                .ok_or_else(|| AppError::Input(format!("registry entry not found: {id}")))?;
+            {
+                value.clone()
+            } else {
+                let named = values
+                    .iter()
+                    .filter(|value| {
+                        value
+                            .get("display_name")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(id.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                match named.as_slice() {
+                    [value] => value.clone(),
+                    [] => return Err(AppError::Input(format!("registry entry not found: {id}"))),
+                    _ => {
+                        return Err(AppError::Input(format!(
+                            "registry name is ambiguous; use a stable ID: {id}"
+                        )))
+                    }
+                }
+            };
             print_registry_values(kind, vec![value], cli.json)?;
         }
         RegistryEntityCommand::Add(args) => {
