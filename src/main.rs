@@ -239,7 +239,7 @@ enum Command {
     /// Manage storage locations through canonical full-snapshot events.
     Location {
         #[command(subcommand)]
-        command: RegistryEntityCommand,
+        command: LocationCommand,
     },
     /// Manage shared risk domains through canonical full-snapshot events.
     RiskDomain {
@@ -651,6 +651,70 @@ struct CollectionInitArgs {
     /// Never prompt; requires every unresolved value as a flag.
     #[arg(long)]
     non_interactive: bool,
+    /// Import this directory as a git-annex repository after setup.
+    #[arg(long)]
+    import_annex: bool,
+    #[arg(long, default_value_t = 1_000)]
+    batch_entries: usize,
+    #[arg(long, requires = "import_annex")]
+    job_id: Option<String>,
+    #[arg(long, requires = "import_annex")]
+    import_id: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum LocationCommand {
+    /// Import a git-annex repository as one partial Location of a Collection.
+    ImportAnnex(LocationImportAnnexArgs),
+    /// Inspect a mounted path without registering or changing it.
+    Discover { path: PathBuf },
+    /// List active Locations.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one Location by stable ID.
+    Show { id: String },
+    /// Add a Location with friendly flags, or provide a complete JSON snapshot.
+    Add(Box<RegistryAddArgs>),
+    /// Replace user-controlled fields with a complete JSON snapshot.
+    Update { snapshot: String },
+    /// Retire a Location with a complete JSON snapshot whose status is retired.
+    Retire {
+        snapshot: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct LocationImportAnnexArgs {
+    /// git-annex repository; defaults to the current directory.
+    #[arg(default_value = ".")]
+    repository: PathBuf,
+    /// Existing Collection name or stable ID.
+    #[arg(long)]
+    collection: String,
+    /// Existing Device ID/name, or a name for a new Device.
+    #[arg(long)]
+    device: Option<String>,
+    /// Existing Site ID/name, or a name for a new Site.
+    #[arg(long)]
+    site: Option<String>,
+    #[arg(long)]
+    location_name: Option<String>,
+    #[arg(long)]
+    root_name: Option<String>,
+    #[arg(long)]
+    allow_unidentified_root: bool,
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long, default_value_t = 1_000)]
+    batch_entries: usize,
+    #[arg(long)]
+    job_id: Option<String>,
+    #[arg(long)]
+    import_id: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1123,9 +1187,7 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             execute_registry(cli, &database, RegistryKind::Device, command)
         }
         Command::Root { command } => execute_registry(cli, &database, RegistryKind::Root, command),
-        Command::Location { command } => {
-            execute_registry(cli, &database, RegistryKind::Location, command)
-        }
+        Command::Location { command } => execute_location(cli, &database, command),
         Command::RiskDomain { command } => {
             execute_registry(cli, &database, RegistryKind::RiskDomain, command)
         }
@@ -1393,11 +1455,32 @@ fn execute_scan(cli: &Cli, database: &ProjectionDb, args: &ScanArgs) -> Result<u
     )
 }
 
+#[derive(Debug, Serialize)]
+struct AnnexCommandResult {
+    version: u32,
+    job_id: String,
+    import_id: String,
+    status: String,
+    annex_uuid: String,
+    git_head_commit: String,
+    summary: archive_ledger::AnnexSummary,
+}
+
 fn execute_annex_import(
     cli: &Cli,
     database: &ProjectionDb,
     args: &AnnexArgs,
 ) -> Result<u8, AppError> {
+    let (exit_code, output) = run_annex_import(cli, database, args)?;
+    print_annex_import(&output, cli.json)?;
+    Ok(exit_code)
+}
+
+fn run_annex_import(
+    cli: &Cli,
+    database: &ProjectionDb,
+    args: &AnnexArgs,
+) -> Result<(u8, AnnexCommandResult), AppError> {
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id
@@ -1448,9 +1531,6 @@ fn execute_annex_import(
         &import_id,
         "started",
     )?;
-    if !cli.json {
-        println!("Starting annex import {import_id} ({job_id})...");
-    }
     let result = importer.run_at_most(args.max_items)?;
     let status = if result.status == AnnexImportStatus::Complete {
         "complete"
@@ -1473,41 +1553,47 @@ fn execute_annex_import(
             status,
         )?;
     }
-    if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "version": 1,
-                "job_id": job_id,
-                "import_id": import_id,
-                "status": status,
-                "annex_uuid": result.annex_uuid,
-                "git_head_commit": result.git_head_commit,
-                "summary": result.summary,
-            }))?
-        );
+    let exit_code = if result.summary.mismatched > 0 || result.summary.read_errors > 0 {
+        EXIT_FINDINGS
     } else {
-        println!("Annex import {import_id} ({job_id}): {status}");
+        EXIT_OK
+    };
+    Ok((
+        exit_code,
+        AnnexCommandResult {
+            version: 1,
+            job_id,
+            import_id,
+            status: status.to_owned(),
+            annex_uuid: result.annex_uuid,
+            git_head_commit: result.git_head_commit,
+            summary: result.summary,
+        },
+    ))
+}
+
+fn print_annex_import(output: &AnnexCommandResult, json_output: bool) -> Result<(), AppError> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(output)?);
+    } else {
+        println!(
+            "Annex import {} ({}): {}",
+            output.import_id, output.job_id, output.status
+        );
         println!(
             "  {} entries; {} present, {} absent, {} unsupported, {} mismatched, {} read errors",
-            result.summary.entries_seen,
-            result.summary.present,
-            result.summary.absent,
-            result.summary.unsupported,
-            result.summary.mismatched,
-            result.summary.read_errors
+            output.summary.entries_seen,
+            output.summary.present,
+            output.summary.absent,
+            output.summary.unsupported,
+            output.summary.mismatched,
+            output.summary.read_errors
         );
-        if status == "running" {
-            println!("Resume with: archive job resume {job_id}");
+        if output.status == "running" {
+            println!("Resume with: archive job resume {}", output.job_id);
         }
     }
-    Ok(
-        if result.summary.mismatched > 0 || result.summary.read_errors > 0 {
-            EXIT_FINDINGS
-        } else {
-            EXIT_OK
-        },
-    )
+    Ok(())
 }
 
 fn execute_annex_remote(
@@ -3479,6 +3565,84 @@ fn execute_collection(
     }
 }
 
+fn execute_location(
+    cli: &Cli,
+    database: &ProjectionDb,
+    command: &LocationCommand,
+) -> Result<u8, AppError> {
+    match command {
+        LocationCommand::ImportAnnex(args) => {
+            let state = database.registry_state(false)?;
+            let collection =
+                select_collection(&state.collections, &args.collection)?.ok_or_else(|| {
+                    AppError::Input(format!("Collection not found: {:?}", args.collection))
+                })?;
+            let setup = CollectionInitArgs {
+                path: args.repository.clone(),
+                name: Some(collection.display_name.clone()),
+                device: args.device.clone(),
+                site: args.site.clone(),
+                location_name: args.location_name.clone(),
+                root_name: args.root_name.clone(),
+                allow_unidentified_root: args.allow_unidentified_root,
+                non_interactive: args.non_interactive,
+                import_annex: true,
+                batch_entries: args.batch_entries,
+                job_id: args.job_id.clone(),
+                import_id: args.import_id.clone(),
+            };
+            execute_filesystem_setup(
+                cli,
+                database,
+                &setup,
+                collection.display_name.clone(),
+                Some(collection),
+            )
+        }
+        LocationCommand::Discover { path } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Device,
+            &RegistryEntityCommand::Discover { path: path.clone() },
+        ),
+        LocationCommand::List { all } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Location,
+            &RegistryEntityCommand::List { all: *all },
+        ),
+        LocationCommand::Show { id } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Location,
+            &RegistryEntityCommand::Show { id: id.clone() },
+        ),
+        LocationCommand::Add(args) => execute_registry(
+            cli,
+            database,
+            RegistryKind::Location,
+            &RegistryEntityCommand::Add(args.clone()),
+        ),
+        LocationCommand::Update { snapshot } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Location,
+            &RegistryEntityCommand::Update {
+                snapshot: snapshot.clone(),
+            },
+        ),
+        LocationCommand::Retire { snapshot, yes } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Location,
+            &RegistryEntityCommand::Retire {
+                snapshot: snapshot.clone(),
+                yes: *yes,
+            },
+        ),
+    }
+}
+
 fn execute_collection_init(
     cli: &Cli,
     database: &ProjectionDb,
@@ -3505,6 +3669,17 @@ fn execute_collection_init(
             "Collection name must be non-empty".to_owned(),
         ));
     }
+    execute_filesystem_setup(cli, database, args, collection_name, None)
+}
+
+fn execute_filesystem_setup(
+    cli: &Cli,
+    database: &ProjectionDb,
+    args: &CollectionInitArgs,
+    collection_name: String,
+    existing_collection: Option<CollectionSnapshot>,
+) -> Result<u8, AppError> {
+    let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     for (flag, value) in [
         ("--location-name", args.location_name.as_deref()),
         ("--root-name", args.root_name.as_deref()),
@@ -3512,6 +3687,9 @@ fn execute_collection_init(
         if value.is_some_and(|value| value.trim().is_empty()) {
             return Err(AppError::Input(format!("{flag} must be non-empty")));
         }
+    }
+    if args.import_annex {
+        archive_ledger::validate_annex_repository(&args.path)?;
     }
 
     let mounted = archive_ledger::discover_mounted_filesystem(&args.path)?;
@@ -3528,10 +3706,11 @@ fn execute_collection_init(
     }
 
     let state = database.registry_state(false)?;
-    if state
-        .collections
-        .iter()
-        .any(|collection| collection.display_name == collection_name)
+    if existing_collection.is_none()
+        && state
+            .collections
+            .iter()
+            .any(|collection| collection.display_name == collection_name)
     {
         return Err(AppError::Input(format!(
             "an active Collection named {collection_name:?} already exists"
@@ -3785,59 +3964,65 @@ fn execute_collection_init(
         location
     };
 
-    let policy = state
-        .policies
-        .iter()
-        .find(|policy| policy.policy_id == "policy_starter")
-        .cloned()
-        .unwrap_or_else(|| PolicySnapshot {
-            policy_id: if state
-                .policies
-                .iter()
-                .any(|policy| policy.policy_id == "policy_starter")
-            {
-                generated_id("policy")
-            } else {
-                "policy_starter".to_owned()
-            },
-            display_name: "Two copies at two sites".to_owned(),
-            policy_version: 1,
-            requirements: PolicyRequirements {
-                min_qualifying_copies: 2,
-                min_devices: 2,
-                min_sites: 2,
-                require_offsite_copy: true,
-                require_offline_copy: false,
-                require_encrypted_offsite: false,
-                max_verification_age_days: 365,
-                max_observation_age_days: 365,
-                max_device_checkin_age_days: 365,
-            },
-            enabled: true,
+    let adding_to_existing_collection = existing_collection.is_some();
+    let collection = if let Some(collection) = existing_collection {
+        collection
+    } else {
+        let policy = state
+            .policies
+            .iter()
+            .find(|policy| policy.policy_id == "policy_starter")
+            .cloned()
+            .unwrap_or_else(|| PolicySnapshot {
+                policy_id: if state
+                    .policies
+                    .iter()
+                    .any(|policy| policy.policy_id == "policy_starter")
+                {
+                    generated_id("policy")
+                } else {
+                    "policy_starter".to_owned()
+                },
+                display_name: "Two copies at two sites".to_owned(),
+                policy_version: 1,
+                requirements: PolicyRequirements {
+                    min_qualifying_copies: 2,
+                    min_devices: 2,
+                    min_sites: 2,
+                    require_offsite_copy: true,
+                    require_offline_copy: false,
+                    require_encrypted_offsite: false,
+                    max_verification_age_days: 365,
+                    max_observation_age_days: 365,
+                    max_device_checkin_age_days: 365,
+                },
+                enabled: true,
+                status: "active".to_owned(),
+            });
+        if !state
+            .policies
+            .iter()
+            .any(|existing| existing.policy_id == policy.policy_id)
+        {
+            changes.push(RegistryChange::Policy(
+                RegistryAction::Register,
+                policy.clone(),
+            ));
+        }
+        let collection = CollectionSnapshot {
+            collection_id: generated_id("collection"),
+            display_name: collection_name,
+            description: Some(format!("Files under {}", mounted.path.display())),
+            home_site_id: Some(site.site_id.clone()),
+            policy_id: Some(policy.policy_id.clone()),
             status: "active".to_owned(),
-        });
-    if !state
-        .policies
-        .iter()
-        .any(|existing| existing.policy_id == policy.policy_id)
-    {
-        changes.push(RegistryChange::Policy(
+        };
+        changes.push(RegistryChange::Collection(
             RegistryAction::Register,
-            policy.clone(),
+            collection.clone(),
         ));
-    }
-    let collection = CollectionSnapshot {
-        collection_id: generated_id("collection"),
-        display_name: collection_name,
-        description: Some(format!("Files under {}", mounted.path.display())),
-        home_site_id: Some(site.site_id.clone()),
-        policy_id: Some(policy.policy_id.clone()),
-        status: "active".to_owned(),
+        collection
     };
-    changes.push(RegistryChange::Collection(
-        RegistryAction::Register,
-        collection.clone(),
-    ));
     changes.push(RegistryChange::DeviceMount(DeviceMount {
         mount_id: generated_id("mount"),
         device_id: device.device_id.clone(),
@@ -3865,6 +4050,24 @@ fn execute_collection_init(
     for change in changes {
         event_ids.push(registry.record(change)?.event_id);
     }
+    let (annex_exit_code, annex_import) = if args.import_annex {
+        let annex_args = AnnexArgs {
+            repository: mounted.path.clone(),
+            collection: collection.collection_id.clone(),
+            worktree_location: location.location_id.clone(),
+            cas_location: location.location_id.clone(),
+            device: device.device_id.clone(),
+            root: root.archive_root_id.clone(),
+            job_id: args.job_id.clone(),
+            import_id: args.import_id.clone(),
+            batch_entries: args.batch_entries,
+            max_items: None,
+        };
+        let (exit_code, output) = run_annex_import(cli, database, &annex_args)?;
+        (exit_code, Some(output))
+    } else {
+        (EXIT_OK, None)
+    };
     let output = json!({
         "version": 1,
         "collection": collection,
@@ -3874,14 +4077,28 @@ fn execute_collection_init(
         "archive_root": root,
         "mounted": mounted,
         "events": event_ids,
+        "annex_import": annex_import,
     });
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!(
-            "Created Collection {} with Location {} on Device {} at Site {}.",
-            collection.display_name, location.display_name, device.display_name, site.display_name
-        );
+        if adding_to_existing_collection {
+            println!(
+                "Configured Location {} for Collection {} on Device {} at Site {}.",
+                location.display_name,
+                collection.display_name,
+                device.display_name,
+                site.display_name
+            );
+        } else {
+            println!(
+                "Created Collection {} with Location {} on Device {} at Site {}.",
+                collection.display_name,
+                location.display_name,
+                device.display_name,
+                site.display_name
+            );
+        }
         println!(
             "Mounted root: {}; Location path within root: {}.",
             mounted.mount_root.display(),
@@ -3900,12 +4117,16 @@ fn execute_collection_init(
         } else {
             println!("Root identity: unavailable (not evidence of independent storage).");
         }
-        println!(
-            "Next: archive location add . --collection {}",
-            collection.collection_id
-        );
+        if let Some(annex_import) = &annex_import {
+            print_annex_import(annex_import, false)?;
+        } else {
+            println!(
+                "Next: archive location add . --collection {}",
+                collection.collection_id
+            );
+        }
     }
-    Ok(EXIT_OK)
+    Ok(annex_exit_code)
 }
 
 fn generated_id(prefix: &str) -> String {
@@ -3943,6 +4164,19 @@ fn select_device(
         |device| &device.device_id,
         |device| &device.display_name,
         "Device",
+    )
+}
+
+fn select_collection(
+    collections: &[CollectionSnapshot],
+    selector: &str,
+) -> Result<Option<CollectionSnapshot>, AppError> {
+    select_registry_entity(
+        collections,
+        selector,
+        |collection| &collection.collection_id,
+        |collection| &collection.display_name,
+        "Collection",
     )
 }
 

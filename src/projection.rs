@@ -1877,6 +1877,8 @@ struct AnnexImportStartedPayload {
     import_id: String,
     repo_path: LosslessPathPayload,
     collection_id: String,
+    #[serde(default)]
+    location_id: Option<String>,
     worktree_location_id: String,
     cas_location_id: String,
     device_id: String,
@@ -3679,14 +3681,20 @@ fn project_annex_import_started(
 ) -> std::result::Result<(), BatchError> {
     let value: AnnexImportStartedPayload = payload(record)?;
     let repo_path = value.repo_path.bytes(record)?;
+    let legacy_event = value.location_id.is_none();
+    let location_id = value
+        .location_id
+        .clone()
+        .unwrap_or_else(|| value.worktree_location_id.clone());
     transaction.execute(
         "INSERT INTO annex_imports(
             import_id, job_id, repo_path_bytes, repo_path_encoding, repo_path_display,
-            collection_id, worktree_location_id, cas_location_id, device_id,
+            collection_id, location_id, legacy_worktree_location_id,
+            legacy_cas_location_id, device_id,
             archive_root_id, annex_uuid, git_head_commit, status, summary_json,
             started_event_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                   'running', '{}', ?13)",
+                   ?13, 'running', '{}', ?14)",
         params![
             value.import_id,
             record.envelope.job_id,
@@ -3694,8 +3702,9 @@ fn project_annex_import_started(
             value.repo_path.encoding,
             value.repo_path.display,
             value.collection_id,
-            value.worktree_location_id,
-            value.cas_location_id,
+            location_id,
+            legacy_event.then_some(value.worktree_location_id),
+            legacy_event.then_some(value.cas_location_id),
             value.device_id,
             value.archive_root_id,
             value.annex_uuid,
@@ -4236,6 +4245,48 @@ mod tests {
                 [],
             )
             .unwrap();
+        transaction
+            .execute_batch(
+                "INSERT INTO sites(site_id, display_name, site_kind, status, last_event_id)
+                 VALUES ('site_migrate', 'Site', 'site', 'active', 'event_seed');
+                 INSERT INTO collections(collection_id, display_name, status, last_event_id)
+                 VALUES ('collection_migrate', 'Collection', 'active', 'event_seed');
+                 INSERT INTO devices(
+                   device_id, display_name, device_kind, identity_state, status,
+                   current_site_id, expected_availability, last_event_id
+                 ) VALUES (
+                   'device_migrate', 'Device', 'disk', 'unavailable', 'active',
+                   'site_migrate', 'intermittent', 'event_seed'
+                 );
+                 INSERT INTO archive_roots(
+                   archive_root_id, device_id, display_name, root_path_on_device_bytes,
+                   root_path_encoding, root_path_display, status, created_event_id
+                 ) VALUES (
+                   'root_migrate', 'device_migrate', 'Root', X'2f', 'utf8', '/',
+                   'active', 'event_seed'
+                 );
+                 INSERT INTO locations(
+                   location_id, display_name, kind, archive_root_id, relative_path_bytes,
+                   relative_path_encoding, relative_path_display, device_id,
+                   expected_availability, is_writable, status, created_event_id, last_event_id
+                 ) VALUES
+                   ('location_work', 'Worktree', 'filesystem', 'root_migrate', X'',
+                    'utf8', '', 'device_migrate', 'intermittent', 1, 'active',
+                    'event_seed', 'event_seed'),
+                   ('location_cas', 'CAS', 'filesystem', 'root_migrate', X'2e676974',
+                    'utf8', '.git', 'device_migrate', 'intermittent', 1, 'active',
+                    'event_seed', 'event_seed');
+                 INSERT INTO annex_imports(
+                   import_id, repo_path_bytes, repo_path_encoding, repo_path_display,
+                   collection_id, worktree_location_id, cas_location_id, device_id,
+                   archive_root_id, status, summary_json, started_event_id
+                 ) VALUES (
+                   'import_migrate', X'2f7265706f', 'utf8', '/repo',
+                   'collection_migrate', 'location_work', 'location_cas',
+                   'device_migrate', 'root_migrate', 'complete', '{}', 'event_seed'
+                 );",
+            )
+            .unwrap();
         transaction.commit().unwrap();
         drop(connection);
 
@@ -4252,6 +4303,34 @@ mod tests {
         assert!(root_columns.contains("filesystem_fingerprint"));
         assert!(root_columns.contains("fingerprint_kind"));
         assert!(root_columns.contains("identity_state"));
+        let annex_columns = connection
+            .prepare("PRAGMA table_info(annex_imports)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
+        assert!(annex_columns.contains("location_id"));
+        assert!(annex_columns.contains("legacy_worktree_location_id"));
+        assert!(annex_columns.contains("legacy_cas_location_id"));
+        assert!(!annex_columns.contains("worktree_location_id"));
+        let migrated_import: (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT location_id, legacy_worktree_location_id,
+                        legacy_cas_location_id
+                 FROM annex_imports WHERE import_id = 'import_migrate'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated_import,
+            (
+                "location_work".to_owned(),
+                Some("location_work".to_owned()),
+                Some("location_cas".to_owned())
+            )
+        );
     }
 
     #[test]

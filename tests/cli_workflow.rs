@@ -74,6 +74,10 @@ mod unix {
     }
 
     fn git(path: &Path, args: &[&str]) {
+        git_stdout(path, args);
+    }
+
+    fn git_stdout(path: &Path, args: &[&str]) -> Vec<u8> {
         let output = Command::new("git")
             .arg("-C")
             .arg(path)
@@ -85,10 +89,15 @@ mod unix {
             "git failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        output.stdout
     }
 
     fn annex_fixture(temp: &TempDir) -> std::path::PathBuf {
-        let repo = temp.path().join("annex-source");
+        annex_fixture_at(temp.path())
+    }
+
+    fn annex_fixture_at(parent: &Path) -> std::path::PathBuf {
+        let repo = parent.join("annex-source");
         fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.name", "Archive Ledger Test"]);
@@ -106,6 +115,16 @@ mod unix {
         fs::create_dir_all(object.parent().unwrap()).unwrap();
         fs::write(&object, content).unwrap();
         symlink(&relative, repo.join("photo.jpg")).unwrap();
+        let absent_content = b"not stored in this repository\n";
+        let absent_key = format!(
+            "SHA256E-s{}--{:x}.document.pdf",
+            absent_content.len(),
+            Sha256::digest(absent_content)
+        );
+        let absent_relative = std::path::PathBuf::from(format!(
+            ".git/annex/objects/cc/dd/{absent_key}/{absent_key}"
+        ));
+        symlink(&absent_relative, repo.join("document.pdf")).unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-m", "annex fixture"]);
 
@@ -331,6 +350,152 @@ mod unix {
         assert_eq!(count("sites"), 1);
         assert_eq!(count("locations"), 2);
         assert_eq!(count("collections"), 2);
+    }
+
+    #[test]
+    fn ergonomic_annex_import_uses_one_partial_location_per_repository() {
+        let temp = TempDir::new().unwrap();
+        let bin = install_fake_findmnt(&temp);
+        let mount_a = temp.path().join("mount-a");
+        let mount_b = temp.path().join("mount-b");
+        fs::create_dir_all(&mount_a).unwrap();
+        fs::create_dir_all(&mount_b).unwrap();
+        let source = annex_fixture_at(&mount_a);
+        let remote = mount_b.join("annex-remote");
+        let cloned = Command::new("git")
+            .arg("clone")
+            .arg(&source)
+            .arg(&remote)
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        git(&remote, &["branch", "git-annex", "origin/git-annex"]);
+        git(&remote, &["config", "annex.uuid", "annex-remote-fixture"]);
+        let source_head = git_stdout(&source, &["rev-parse", "HEAD"]);
+        let source_status = git_stdout(&source, &["status", "--porcelain=v1"]);
+        let remote_head = git_stdout(&remote, &["rev-parse", "HEAD"]);
+        let remote_status = git_stdout(&remote, &["status", "--porcelain=v1"]);
+
+        success(central_archive(&temp).args([
+            "init",
+            "--name",
+            "Media",
+            "--archive-id",
+            "arc_media",
+            "--non-interactive",
+        ]));
+        let mut first = central_archive(&temp);
+        use_fake_findmnt(&mut first, &bin, &mount_a, Some("MEDIA-MAIN"));
+        let first = success(
+            first
+                .arg("--json")
+                .arg("collection")
+                .arg("init")
+                .arg(&source)
+                .args([
+                    "--name",
+                    "Photos",
+                    "--device",
+                    "Main Computer",
+                    "--site",
+                    "Home",
+                    "--import-annex",
+                    "--non-interactive",
+                ]),
+        );
+        let first = json(&first);
+        assert_eq!(first["annex_import"]["summary"]["entries_seen"], 2);
+        assert_eq!(first["annex_import"]["summary"]["present"], 1);
+        assert_eq!(first["annex_import"]["summary"]["absent"], 1);
+        let collection_id = first["collection"]["collection_id"].as_str().unwrap();
+        let first_location = first["location"]["location_id"].as_str().unwrap();
+
+        let mut second = central_archive(&temp);
+        use_fake_findmnt(&mut second, &bin, &mount_b, Some("MEDIA-REMOTE"));
+        let second = success(
+            second
+                .arg("--json")
+                .arg("location")
+                .arg("import-annex")
+                .arg(&remote)
+                .args([
+                    "--collection",
+                    "Photos",
+                    "--device",
+                    "SD01",
+                    "--site",
+                    "Home",
+                    "--non-interactive",
+                ]),
+        );
+        let second = json(&second);
+        assert_eq!(second["collection"]["collection_id"], collection_id);
+        assert_eq!(second["annex_import"]["summary"]["present"], 0);
+        assert_eq!(second["annex_import"]["summary"]["absent"], 2);
+        assert_ne!(second["location"]["location_id"], first_location);
+
+        let database_path = temp
+            .path()
+            .join("data/archive-ledger/archives/arc_media/archive.db");
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let counts: (i64, i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM collections),
+                   (SELECT COUNT(*) FROM locations),
+                   (SELECT COUNT(*) FROM devices),
+                   (SELECT COUNT(*) FROM file_refs),
+                   (SELECT COUNT(*) FROM objects),
+                   (SELECT COUNT(*) FROM copy_claims)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 2, 2, 2, 1, 1));
+        let availability: (i64, i64) = connection
+            .query_row(
+                "SELECT
+                   SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN state = 'missing' THEN 1 ELSE 0 END)
+                 FROM external_availability",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(availability, (1, 3));
+        let split_import_locations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM annex_imports
+                 WHERE legacy_worktree_location_id IS NOT NULL
+                    OR legacy_cas_location_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(split_import_locations, 0);
+        assert_eq!(git_stdout(&source, &["rev-parse", "HEAD"]), source_head);
+        assert_eq!(
+            git_stdout(&source, &["status", "--porcelain=v1"]),
+            source_status
+        );
+        assert_eq!(git_stdout(&remote, &["rev-parse", "HEAD"]), remote_head);
+        assert_eq!(
+            git_stdout(&remote, &["status", "--porcelain=v1"]),
+            remote_status
+        );
     }
 
     #[test]

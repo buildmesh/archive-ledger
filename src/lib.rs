@@ -13,8 +13,8 @@ pub mod scan;
 pub mod storage;
 
 pub use annex::{
-    AnnexImportConfig, AnnexImportError, AnnexImportResult, AnnexImportStatus, AnnexImporter,
-    AnnexSummary,
+    validate_annex_repository, AnnexImportConfig, AnnexImportError, AnnexImportResult,
+    AnnexImportStatus, AnnexImporter, AnnexSummary,
 };
 pub use catalog::{central_archive, CatalogError, CatalogRegistry, KnownArchive};
 pub use discovery::{

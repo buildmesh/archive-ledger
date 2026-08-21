@@ -167,6 +167,30 @@ pub struct AnnexImporter<'a> {
     config: AnnexImportConfig,
 }
 
+/// Confirms that a path is a readable git-annex repository without changing it.
+pub fn validate_annex_repository(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let path = path.as_ref();
+    let canonical = fs::canonicalize(path)
+        .map_err(|source| io_error("canonicalize annex repository", path, source))?;
+    if !canonical.is_dir() {
+        return Err(AnnexImportError::InvalidConfig(format!(
+            "repository is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    let annex_uuid = git_text(
+        &canonical,
+        "read annex UUID",
+        &["config", "--local", "--get", "annex.uuid"],
+    )?;
+    if annex_uuid.is_empty() {
+        return Err(AnnexImportError::InvalidConfig(
+            "repository has no annex.uuid".to_owned(),
+        ));
+    }
+    Ok(canonical)
+}
+
 impl<'a> AnnexImporter<'a> {
     pub fn new(
         store: &'a EventStore,
@@ -1685,6 +1709,8 @@ fn import_started_event(
             "import_id": config.import_id,
             "repo_path": path_json(&encode_absolute_path(&config.repo_path)),
             "collection_id": config.collection_id,
+            "location_id": (config.worktree_location_id == config.cas_location_id)
+                .then_some(&config.worktree_location_id),
             "worktree_location_id": config.worktree_location_id,
             "cas_location_id": config.cas_location_id,
             "device_id": config.device_id,
