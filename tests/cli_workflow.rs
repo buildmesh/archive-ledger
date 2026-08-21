@@ -20,6 +20,15 @@ mod unix {
         command
     }
 
+    fn central_archive(temp: &TempDir) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_archive"));
+        command
+            .env("XDG_DATA_HOME", temp.path().join("data"))
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("HOME", temp.path().join("home"));
+        command
+    }
+
     fn success(command: &mut Command) -> Output {
         let output = command.output().unwrap();
         assert!(
@@ -78,6 +87,106 @@ mod unix {
         git(&repo, &["commit", "-m", "annex metadata"]);
         git(&repo, &["checkout", "main"]);
         repo
+    }
+
+    #[test]
+    fn named_archives_are_central_and_default_selection_is_explicit() {
+        let temp = TempDir::new().unwrap();
+        let unrelated_cwd = temp.path().join("working-files");
+        fs::create_dir(&unrelated_cwd).unwrap();
+
+        let missing_name = central_archive(&temp)
+            .args(["init", "--non-interactive"])
+            .output()
+            .unwrap();
+        assert_eq!(missing_name.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&missing_name.stderr).contains("--name is required"));
+
+        let first = success(central_archive(&temp).current_dir(&unrelated_cwd).args([
+            "--json",
+            "init",
+            "--name",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let first = json(&first);
+        assert_eq!(first["archive_name"], "Personal");
+        assert_eq!(first["starter"], Value::Null);
+        assert_eq!(
+            first["database"].as_str().unwrap(),
+            temp.path()
+                .join("data/archive-ledger/archives/arc_personal/archive.db")
+                .to_str()
+                .unwrap()
+        );
+        assert!(!unrelated_cwd.join(".archive-ledger").exists());
+
+        let second = success(central_archive(&temp).args([
+            "--json",
+            "init",
+            "--name",
+            "Research",
+            "--archive-id",
+            "arc_research",
+            "--non-interactive",
+        ]));
+        assert_eq!(json(&second)["archive_name"], "Research");
+
+        success(central_archive(&temp).args(["rename", "Personal Archive"]));
+        let personal_status = central_archive(&temp)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(personal_status.status.code(), Some(10));
+        assert_eq!(json(&personal_status)["archive_name"], "Personal Archive");
+
+        success(central_archive(&temp).args([
+            "init",
+            "--name",
+            "Work",
+            "--archive-id",
+            "arc_work",
+            "--make-default",
+            "--non-interactive",
+        ]));
+        let work_status = central_archive(&temp)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(work_status.status.code(), Some(10));
+        assert_eq!(json(&work_status)["archive_id"], "arc_work");
+
+        success(central_archive(&temp).args(["use", "Research"]));
+        success(central_archive(&temp).args(["rename", "Research Archive"]));
+        let research_status = central_archive(&temp)
+            .args(["--json", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(research_status.status.code(), Some(10));
+        assert_eq!(json(&research_status)["archive_id"], "arc_research");
+        assert_eq!(json(&research_status)["archive_name"], "Research Archive");
+
+        let explicit = central_archive(&temp)
+            .env("ARCHIVE_LEDGER_ARCHIVE", "Research Archive")
+            .args(["--json", "--archive", "Personal Archive", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(explicit.status.code(), Some(10));
+        assert_eq!(json(&explicit)["archive_id"], "arc_personal");
+
+        let archive_root = temp
+            .path()
+            .join("data/archive-ledger/archives/arc_personal");
+        let by_path = central_archive(&temp)
+            .arg("--archive")
+            .arg(&archive_root)
+            .args(["--json", "events", "verify"])
+            .output()
+            .unwrap();
+        assert!(by_path.status.success());
+        assert_eq!(json(&by_path)["last_seq"], 2);
     }
 
     #[test]

@@ -6,16 +6,16 @@ use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use archive_ledger::{
-    utf8_path, AnnexImportConfig, AnnexImportError, AnnexImportStatus, AnnexImporter,
-    ArchiveRootSnapshot, CachedPolicyStatus, CollectionSnapshot, CopyFilter, CopyPageRequest,
-    DeviceCheckIn, DeviceMount, DeviceSnapshot, EventReferences, EventRequest, EventStore,
-    EventStoreConfig, EventStoreError, FileFilter, FilePageRequest, LocationScanner,
-    LocationSnapshot, MetadataDestinationSnapshot, MetadataError, MetadataProtector,
-    MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter,
-    PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb,
-    ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError, RegistryPath,
-    ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError, ScanStatus,
-    SiteSnapshot,
+    central_archive, utf8_path, AnnexImportConfig, AnnexImportError, AnnexImportStatus,
+    AnnexImporter, ArchiveRootSnapshot, CachedPolicyStatus, CatalogError, CatalogRegistry,
+    CollectionSnapshot, CopyFilter, CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot,
+    EventReferences, EventRequest, EventStore, EventStoreConfig, EventStoreError, FileFilter,
+    FilePageRequest, LocationScanner, LocationSnapshot, MetadataDestinationSnapshot, MetadataError,
+    MetadataProtector, MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding,
+    PolicyFindingFilter, PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig,
+    ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError,
+    RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError,
+    ScanStatus, SiteSnapshot,
 };
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
@@ -31,13 +31,17 @@ const EXIT_FINDINGS: u8 = 10;
 #[derive(Debug, Parser)]
 #[command(name = "archive", version, about = "Review and protect local archives")]
 struct Cli {
-    /// SQLite materialized-view database.
-    #[arg(long, global = true, default_value = ".archive-ledger/archive.db")]
-    database: PathBuf,
+    /// Select a known Archive by name/ID, or an Archive directory by path.
+    #[arg(long, global = true)]
+    archive: Option<String>,
 
-    /// Canonical event-store directory, used only by mutation commands.
-    #[arg(long, global = true, default_value = ".archive-ledger/canonical")]
-    events: PathBuf,
+    /// Explicit SQLite path for an existing legacy/custom catalog (requires --events).
+    #[arg(long, global = true)]
+    database: Option<PathBuf>,
+
+    /// Explicit event-store path for an existing legacy/custom catalog (requires --database).
+    #[arg(long, global = true)]
+    events: Option<PathBuf>,
 
     #[arg(long, global = true, default_value = "local-user")]
     actor: String,
@@ -53,33 +57,129 @@ struct Cli {
     command: Command,
 }
 
+impl Cli {
+    fn database_path(&self) -> &Path {
+        self.database
+            .as_deref()
+            .expect("catalog paths are resolved before use")
+    }
+
+    fn events_path(&self) -> &Path {
+        self.events
+            .as_deref()
+            .expect("catalog paths are resolved before use")
+    }
+}
+
+fn resolve_catalog_paths(cli: &mut Cli) -> Result<(), AppError> {
+    match (&cli.database, &cli.events) {
+        (Some(_), Some(_)) => {
+            if cli.archive.is_some() {
+                return Err(AppError::Input(
+                    "--archive cannot be combined with --database/--events".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(AppError::Input(
+                "--database and --events must be provided together".to_owned(),
+            ));
+        }
+        (None, None) => {}
+    }
+
+    let environment_selector = std::env::var("ARCHIVE_LEDGER_ARCHIVE")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let selector = cli.archive.as_deref().or(environment_selector.as_deref());
+    let selected = if let Some(selector) = selector.filter(|value| selector_is_path(value)) {
+        let root = std::fs::canonicalize(selector).map_err(|error| {
+            AppError::Input(format!(
+                "cannot resolve Archive directory {selector}: {error}"
+            ))
+        })?;
+        archive_ledger::KnownArchive {
+            archive_id: String::new(),
+            display_name: selector.to_owned(),
+            root,
+        }
+    } else {
+        CatalogRegistry::load()?.resolve(selector)?
+    };
+    cli.database = Some(selected.database_path());
+    cli.events = Some(selected.events_path());
+    Ok(())
+}
+
+fn selector_is_path(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        || value.starts_with('.')
+        || value.contains(std::path::MAIN_SEPARATOR)
+        || (std::path::MAIN_SEPARATOR != '/' && value.contains('/'))
+}
+
+fn inspect_archive_root(selector: &str) -> Result<archive_ledger::KnownArchive, AppError> {
+    let root = std::fs::canonicalize(selector).map_err(|error| {
+        AppError::Input(format!(
+            "cannot resolve Archive directory {selector}: {error}"
+        ))
+    })?;
+    let database_path = root.join("archive.db");
+    let events_path = root.join("canonical");
+    if !events_path.is_dir() {
+        return Err(AppError::Input(format!(
+            "Archive directory {} has no canonical event store",
+            root.display()
+        )));
+    }
+    let status =
+        ProjectionDb::open_existing(&database_path, ProjectionConfig::default())?.status()?;
+    Ok(archive_ledger::KnownArchive {
+        archive_id: status.archive_id,
+        display_name: status.archive_display_name,
+        root,
+    })
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a new empty event store and SQLite projection.
+    /// Create a new named Archive catalog without inspecting the current directory.
     Init {
+        /// Human-readable Archive name; prompted for on a terminal when omitted.
+        #[arg(long)]
+        name: Option<String>,
+        /// Make this Archive the per-user default even if another default exists.
+        #[arg(long)]
+        make_default: bool,
         /// Stable archive ID; generated when omitted.
         #[arg(long)]
         archive_id: Option<String>,
         /// Prompt for a starter single-machine topology when attached to a terminal.
-        #[arg(long, conflicts_with = "non_interactive")]
+        #[arg(long, conflicts_with = "non_interactive", hide = true)]
         guided: bool,
-        /// Never prompt. Use --root-path to create the same starter topology.
+        /// Never prompt; requires --name for a centrally stored Archive.
         #[arg(long)]
         non_interactive: bool,
         /// Create a starter site/device/root/location/collection/policy for this mounted path.
-        #[arg(long)]
+        #[arg(long, hide = true)]
         root_path: Option<PathBuf>,
-        #[arg(long, default_value = "Home")]
+        #[arg(long, default_value = "Home", hide = true)]
         site_name: String,
-        #[arg(long, default_value = "Primary disk")]
+        #[arg(long, default_value = "Primary disk", hide = true)]
         device_name: String,
-        #[arg(long, default_value = "Archive files")]
+        #[arg(long, default_value = "Archive files", hide = true)]
         collection_name: String,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         fingerprint: Option<String>,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         fingerprint_kind: Option<String>,
     },
+    /// Select the default Archive for later commands.
+    Use { archive: String },
+    /// Rename the selected Archive without changing its stable ID.
+    Rename { new_name: String },
     /// Show fast cached preservation status from SQLite.
     Status,
     /// Find, inspect, and audit logical files.
@@ -626,6 +726,7 @@ struct ReportSummaryArgs {
 
 #[derive(Debug)]
 enum AppError {
+    Catalog(CatalogError),
     EventStore(EventStoreError),
     Projection(ProjectionError),
     Review(ReviewError),
@@ -643,6 +744,7 @@ enum AppError {
 impl AppError {
     fn code(&self) -> &'static str {
         match self {
+            Self::Catalog(error) => error.code(),
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
             Self::Review(error) => error.code(),
@@ -662,6 +764,7 @@ impl AppError {
 impl std::fmt::Display for AppError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Catalog(error) => error.fmt(formatter),
             Self::EventStore(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::Review(error) => error.fmt(formatter),
@@ -675,6 +778,12 @@ impl std::fmt::Display for AppError {
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
             Self::Input(message) => formatter.write_str(message),
         }
+    }
+}
+
+impl From<CatalogError> for AppError {
+    fn from(error: CatalogError) -> Self {
+        Self::Catalog(error)
     }
 }
 
@@ -759,6 +868,8 @@ struct PolicyReportOutput {
 #[derive(Debug, Serialize)]
 struct StatusOutput {
     version: u32,
+    archive_id: String,
+    archive_name: String,
     policy: CachedPolicyStatus,
     metadata: archive_ledger::MetadataProtectionStatus,
 }
@@ -808,7 +919,7 @@ struct VerificationSummary {
 
 fn main() -> ExitCode {
     let json_requested = std::env::args().any(|argument| argument == "--json");
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
             if json_requested {
@@ -823,7 +934,7 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_ERROR);
         }
     };
-    match execute(&cli) {
+    match execute(&mut cli) {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             if cli.json {
@@ -842,8 +953,38 @@ fn main() -> ExitCode {
     }
 }
 
-fn execute(cli: &Cli) -> Result<u8, AppError> {
+fn execute(cli: &mut Cli) -> Result<u8, AppError> {
+    if let Command::Use { archive } = &cli.command {
+        let mut registry = CatalogRegistry::load()?;
+        let selected = if selector_is_path(archive) {
+            let selected = inspect_archive_root(archive)?;
+            registry.register(selected.clone(), true)?;
+            selected
+        } else {
+            registry.set_default(archive)?
+        };
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "archive_id": selected.archive_id,
+                    "archive_name": selected.display_name,
+                    "root": selected.root,
+                    "default": true,
+                }))?
+            );
+        } else {
+            println!(
+                "Default Archive is now {} ({}).",
+                selected.display_name, selected.archive_id
+            );
+        }
+        return Ok(EXIT_OK);
+    }
     if let Command::Init {
+        name,
+        make_default,
         archive_id,
         guided,
         non_interactive,
@@ -857,6 +998,8 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
     {
         return execute_init(
             cli,
+            name.as_deref(),
+            *make_default,
             archive_id.as_deref(),
             *guided,
             *non_interactive,
@@ -888,6 +1031,7 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
         }
         return Ok(EXIT_OK);
     }
+    resolve_catalog_paths(cli)?;
     if let Command::Events {
         command: EventsCommand::Verify,
     } = &cli.command
@@ -897,9 +1041,11 @@ fn execute(cli: &Cli) -> Result<u8, AppError> {
     if let Command::Db { command } = &cli.command {
         return execute_db(cli, command);
     }
-    let database = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
+    let database = ProjectionDb::open_existing(cli.database_path(), ProjectionConfig::default())?;
     match &cli.command {
         Command::Init { .. } => unreachable!("init returned before opening an existing database"),
+        Command::Use { .. } => unreachable!("use returned before opening SQLite"),
+        Command::Rename { new_name } => execute_archive_rename(cli, &database, new_name),
         Command::Status => execute_status(&database, cli.json),
         Command::File { command } => execute_file(&database, command, cli.json),
         Command::Object { command } => execute_object(&database, command, cli.json),
@@ -1030,7 +1176,8 @@ fn execute_db(cli: &Cli, command: &DbCommand) -> Result<u8, AppError> {
     let events = open_event_store(cli)?;
     match command {
         DbCommand::Apply => {
-            let database = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
+            let database =
+                ProjectionDb::open_existing(cli.database_path(), ProjectionConfig::default())?;
             let stats = database.apply(&events)?;
             if cli.json {
                 println!(
@@ -1053,10 +1200,11 @@ fn execute_db(cli: &Cli, command: &DbCommand) -> Result<u8, AppError> {
             }
         }
         DbCommand::Rebuild { target } => {
-            let current = ProjectionDb::open_existing(&cli.database, ProjectionConfig::default())?;
+            let current =
+                ProjectionDb::open_existing(cli.database_path(), ProjectionConfig::default())?;
             let archive_id = current.status()?.archive_id;
             drop(current);
-            let target = target.as_deref().unwrap_or(&cli.database);
+            let target = target.as_deref().unwrap_or_else(|| cli.database_path());
             let stats =
                 ProjectionDb::rebuild(&events, target, &archive_id, ProjectionConfig::default())?;
             if cli.json {
@@ -2459,6 +2607,7 @@ fn verify_operation_key(job_id: &str, input_version: &str, copy_id: &str, kind: 
 }
 
 fn execute_status(database: &ProjectionDb, as_json: bool) -> Result<u8, AppError> {
+    let projection = database.status()?;
     let status = database.cached_policy_status(now_utc_ms()?)?;
     let metadata = database.metadata_protection_status()?;
     let has_findings = metadata.unreplicated_events > 0
@@ -2474,11 +2623,17 @@ fn execute_status(database: &ProjectionDb, as_json: bool) -> Result<u8, AppError
             "{}",
             serde_json::to_string_pretty(&StatusOutput {
                 version: 1,
+                archive_id: projection.archive_id,
+                archive_name: projection.archive_display_name,
                 policy: status,
                 metadata,
             })?
         );
     } else {
+        println!(
+            "Archive: {} ({})",
+            projection.archive_display_name, projection.archive_id
+        );
         print_metadata_status(&metadata);
         print_cached_status(&status);
     }
@@ -2658,7 +2813,7 @@ fn execute_metadata_destination(
             if !cli.json {
                 println!(
                     "Next: git -C {} remote add {} {}",
-                    cli.events.display(),
+                    cli.events_path().display(),
                     args.remote,
                     args.locator
                 );
@@ -2828,14 +2983,14 @@ fn execute_events_verify(cli: &Cli) -> Result<u8, AppError> {
 }
 
 fn open_event_store(cli: &Cli) -> Result<EventStore, AppError> {
-    if !cli.events.is_dir() {
+    if !cli.events_path().is_dir() {
         return Err(AppError::Input(format!(
             "canonical event store not found at {}; refusing to create a replacement for an existing catalog (restore it or use init with empty targets)",
-            cli.events.display()
+            cli.events_path().display()
         )));
     }
     Ok(EventStore::open_or_create(
-        &cli.events,
+        cli.events_path(),
         EventStoreConfig {
             actor_id: cli.actor.clone(),
             host_id: cli.host.clone(),
@@ -2856,9 +3011,47 @@ fn print_mutation_seq(seq: u64, message: &str, as_json: bool) -> Result<(), AppE
     Ok(())
 }
 
+fn execute_archive_rename(
+    cli: &Cli,
+    database: &ProjectionDb,
+    new_name: &str,
+) -> Result<u8, AppError> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(AppError::Input("Archive name must not be empty".to_owned()));
+    }
+    let archive_id = database.status()?.archive_id;
+    let events = open_event_store(cli)?;
+    let record = events.append(EventRequest::new(
+        "archive_updated",
+        json!({"archive_id": archive_id, "display_name": new_name}),
+    ))?;
+    database.apply(&events)?;
+    CatalogRegistry::load()?.rename(&archive_id, new_name)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "archive_id": archive_id,
+                "archive_name": new_name,
+                "event_seq": record.envelope.seq,
+            }))?
+        );
+    } else {
+        println!(
+            "Renamed Archive to {new_name} at sequence {}.",
+            record.envelope.seq
+        );
+    }
+    Ok(EXIT_OK)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_init(
     cli: &Cli,
+    name: Option<&str>,
+    make_default: bool,
     archive_id: Option<&str>,
     guided: bool,
     non_interactive: bool,
@@ -2869,16 +3062,65 @@ fn execute_init(
     fingerprint: Option<&str>,
     fingerprint_kind: Option<&str>,
 ) -> Result<u8, AppError> {
-    if cli.database.exists() || cli.events.exists() {
+    if cli.archive.is_some() {
         return Err(AppError::Input(
-            "init target already exists; choose empty --database and --events paths".to_owned(),
+            "--archive selects an existing catalog and cannot be used with init".to_owned(),
+        ));
+    }
+    let explicit_paths = match (&cli.database, &cli.events) {
+        (Some(database), Some(events)) => Some((database.clone(), events.clone())),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::Input(
+                "--database and --events must be provided together".to_owned(),
+            ))
+        }
+    };
+    let central = explicit_paths.is_none();
+    if central
+        && (guided || root_path.is_some() || fingerprint.is_some() || fingerprint_kind.is_some())
+    {
+        return Err(AppError::Input(
+            "archive init no longer creates file topology; run archive collection init from the content directory after initialization"
+                .to_owned(),
         ));
     }
     let archive_id = archive_id
         .map(str::to_owned)
         .unwrap_or_else(|| format!("arc_{}", ulid::Ulid::new().to_string().to_ascii_lowercase()));
-    let should_prompt =
-        guided || (!non_interactive && root_path.is_none() && std::io::stdin().is_terminal());
+    let archive_name = match name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => name.to_owned(),
+        None if central && !non_interactive && std::io::stdin().is_terminal() => {
+            prompt_default("Archive name", "Personal Archive")?
+        }
+        None if central => {
+            return Err(AppError::Input(
+                "--name is required when archive init is non-interactive".to_owned(),
+            ))
+        }
+        None => archive_id.clone(),
+    };
+    if archive_name.trim().is_empty() {
+        return Err(AppError::Input("Archive name must not be empty".to_owned()));
+    }
+    let known_archive = central
+        .then(|| central_archive(&archive_id, &archive_name))
+        .transpose()?;
+    let (database_path, events_path) = if let Some(paths) = explicit_paths {
+        paths
+    } else {
+        let archive = known_archive
+            .as_ref()
+            .expect("central Archive paths were constructed");
+        (archive.database_path(), archive.events_path())
+    };
+    if database_path.exists() || events_path.exists() {
+        return Err(AppError::Input(
+            "init target already exists; choose empty --database and --events paths".to_owned(),
+        ));
+    }
+    let should_prompt = !central
+        && (guided || (!non_interactive && root_path.is_none() && std::io::stdin().is_terminal()));
     let starter = if should_prompt {
         let default_root = std::env::current_dir()?.to_string_lossy().into_owned();
         let selected_root = prompt_default("Mounted archive path", &default_root)?;
@@ -2932,7 +3174,7 @@ fn execute_init(
         })
         .transpose()?;
     let events = EventStore::open_or_create(
-        &cli.events,
+        &events_path,
         EventStoreConfig {
             actor_id: cli.actor.clone(),
             host_id: cli.host.clone(),
@@ -2941,10 +3183,10 @@ fn execute_init(
     )?;
     archive_ledger::initialize_metadata_repository(events.root())?;
     let database =
-        ProjectionDb::open_or_create(&cli.database, &archive_id, ProjectionConfig::default())?;
+        ProjectionDb::open_or_create(&database_path, &archive_id, ProjectionConfig::default())?;
     events.append(EventRequest::new(
         "archive_initialized",
-        json!({"archive_id": archive_id}),
+        json!({"archive_id": archive_id, "display_name": archive_name}),
     ))?;
     database.apply(&events)?;
     let starter_ids = if let Some((
@@ -3067,22 +3309,26 @@ fn execute_init(
     } else {
         None
     };
+    if let Some(known_archive) = known_archive {
+        CatalogRegistry::load()?.register(known_archive, make_default)?;
+    }
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 1,
                 "archive_id": archive_id,
-                "database": cli.database,
-                "events": cli.events,
+                "archive_name": archive_name,
+                "database": database_path,
+                "events": events_path,
                 "applied_event_seq": database.status()?.cursor.applied_seq,
                 "starter": starter_ids,
             }))?
         );
     } else {
-        println!("Initialized archive {archive_id}");
-        println!("  database: {}", cli.database.display());
-        println!("  canonical events: {}", cli.events.display());
+        println!("Initialized Archive {archive_name} ({archive_id})");
+        println!("  database: {}", database_path.display());
+        println!("  canonical events: {}", events_path.display());
         if starter_ids.is_some() {
             println!("Starter topology created. Next: archive scan location_primary --collection collection_primary --path <mounted-path> --device device_primary --root root_primary");
             if starter_ids
@@ -3093,10 +3339,7 @@ fn execute_init(
             }
             println!("Then register an independent offsite copy and a metadata destination.");
         } else {
-            println!("Next: register sites, devices, locations, a collection, and a policy.");
-            println!(
-                "For a starter topology, rerun in an empty target with --root-path <mounted-path>."
-            );
+            println!("Next: cd to your files and run archive collection init --name <name>.");
         }
     }
     Ok(EXIT_OK)
@@ -3297,7 +3540,7 @@ fn record_registry_change(
     change: RegistryChange,
 ) -> Result<(), AppError> {
     let events = EventStore::open_or_create(
-        &cli.events,
+        cli.events_path(),
         EventStoreConfig {
             actor_id: cli.actor.clone(),
             host_id: cli.host.clone(),

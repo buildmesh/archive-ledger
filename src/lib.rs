@@ -1,6 +1,7 @@
 //! Core library for Archive Ledger.
 
 pub mod annex;
+pub mod catalog;
 pub mod discovery;
 pub mod event_store;
 pub mod metadata;
@@ -14,6 +15,7 @@ pub use annex::{
     AnnexImportConfig, AnnexImportError, AnnexImportResult, AnnexImportStatus, AnnexImporter,
     AnnexSummary,
 };
+pub use catalog::{central_archive, CatalogError, CatalogRegistry, KnownArchive};
 pub use discovery::{
     DiscoveredFile, DiscoveryError, DiscoveryItem, DiscoveryStats, EncodedPath, FileDiscovery,
     NamespaceFingerprint, PathEncoding,

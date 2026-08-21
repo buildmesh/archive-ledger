@@ -154,6 +154,7 @@ impl ProjectionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionStatus {
     pub archive_id: String,
+    pub archive_display_name: String,
     pub schema_version: u32,
     pub stream_id: String,
     pub cursor: EventCursor,
@@ -277,6 +278,7 @@ macro_rules! event_catalog {
 
 event_catalog! {
     "archive_initialized" => false,
+    "archive_updated" => false,
     "catalog_location_set" => false,
     "checkpoint_created" => false,
     "checkpoint_commit_observed" => false,
@@ -1420,6 +1422,7 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
 fn initialize_meta(transaction: &Transaction<'_>, archive_id: &str) -> rusqlite::Result<()> {
     let values = [
         ("archive_id", archive_id.to_owned()),
+        ("archive_display_name", archive_id.to_owned()),
         ("schema_version", SCHEMA_VERSION.to_string()),
         ("stream_id", STREAM_ID.to_owned()),
         ("applied_event_seq", "0".to_owned()),
@@ -1463,8 +1466,11 @@ fn read_status(connection: &Connection) -> rusqlite::Result<ProjectionStatus> {
     let schema_version = schema_version_text.parse().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
     })?;
+    let archive_id = meta_required(connection, "archive_id")?;
     Ok(ProjectionStatus {
-        archive_id: meta_required(connection, "archive_id")?,
+        archive_display_name: nonempty_meta(connection, "archive_display_name")?
+            .unwrap_or_else(|| archive_id.clone()),
+        archive_id,
         schema_version,
         stream_id: meta_required(connection, "stream_id")?,
         cursor: EventCursor {
@@ -1589,6 +1595,14 @@ struct CheckpointCreatedPayload {
 #[serde(deny_unknown_fields)]
 struct CatalogLocationPayload {
     location_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveMetadataPayload {
+    archive_id: String,
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1953,6 +1967,7 @@ fn project_semantic_event(
     verified_running_scans: &mut HashSet<(String, String)>,
 ) -> std::result::Result<(), BatchError> {
     match record.envelope.event_type.as_str() {
+        "archive_initialized" | "archive_updated" => project_archive_metadata(transaction, record),
         "catalog_location_set" => project_catalog_location(transaction, record),
         "checkpoint_commit_observed" => project_checkpoint_commit(transaction, record),
         "checkpoint_replication_observed" => project_checkpoint_replication(transaction, record),
@@ -2011,6 +2026,46 @@ fn project_semantic_event(
         "annex_import_completed" => project_annex_import_completed(transaction, record),
         _ => Ok(()),
     }
+}
+
+fn project_archive_metadata(
+    transaction: &Transaction<'_>,
+    record: &EventRecord,
+) -> std::result::Result<(), BatchError> {
+    let value: ArchiveMetadataPayload = payload(record)?;
+    let expected_id = meta_required(transaction, "archive_id")?;
+    if value.archive_id != expected_id {
+        return Err(BatchError::Projection(
+            ProjectionError::ArchiveIdentityMismatch {
+                actual: value.archive_id,
+                expected: expected_id,
+            },
+        ));
+    }
+    let display_name = match value.display_name {
+        Some(name) if !name.trim().is_empty() => name,
+        Some(_) => {
+            return Err(BatchError::Projection(ProjectionError::InvalidPayload {
+                event_type: record.envelope.event_type.clone(),
+                seq: record.envelope.seq,
+                message: "display_name must not be empty".to_owned(),
+            }))
+        }
+        None if record.envelope.event_type == "archive_initialized" => value.archive_id,
+        None => {
+            return Err(BatchError::Projection(ProjectionError::InvalidPayload {
+                event_type: record.envelope.event_type.clone(),
+                seq: record.envelope.seq,
+                message: "archive_updated requires display_name".to_owned(),
+            }))
+        }
+    };
+    transaction.execute(
+        "INSERT INTO archive_meta(key, value) VALUES ('archive_display_name', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [display_name],
+    )?;
+    Ok(())
 }
 
 fn project_site_snapshot(
@@ -4007,6 +4062,30 @@ mod tests {
     }
 
     #[test]
+    fn archive_display_name_replays_legacy_initialization_and_rename() {
+        let temp = TempDir::new().unwrap();
+        let store = event_store(&temp, 100);
+        store
+            .append(EventRequest::new(
+                "archive_initialized",
+                json!({"archive_id": "arc_test"}),
+            ))
+            .unwrap();
+        let database = database(&temp, ProjectionConfig::default());
+        database.apply(&store).unwrap();
+        assert_eq!(database.status().unwrap().archive_display_name, "arc_test");
+
+        store
+            .append(EventRequest::new(
+                "archive_updated",
+                json!({"archive_id": "arc_test", "display_name": "Personal"}),
+            ))
+            .unwrap();
+        database.apply(&store).unwrap();
+        assert_eq!(database.status().unwrap().archive_display_name, "Personal");
+    }
+
+    #[test]
     fn schema_v4_contains_every_specified_table_tier() {
         assert_eq!(parent_directory(Path::new("archive.db")), Path::new("."));
         let temp = TempDir::new().unwrap();
@@ -4469,6 +4548,7 @@ mod tests {
     fn policy_input_classification_is_exhaustive_and_distinguishes_bookkeeping() {
         let expected: BTreeSet<&str> = [
             "archive_initialized",
+            "archive_updated",
             "catalog_location_set",
             "checkpoint_created",
             "checkpoint_commit_observed",
