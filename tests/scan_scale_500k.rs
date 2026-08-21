@@ -80,6 +80,16 @@ fn complete_scan_and_atomic_missing_activation_scale_gate() {
     );
     assert_eq!(first.status, ScanStatus::Complete);
     assert_eq!(first.summary.files_seen, file_count as u64);
+    let stale_report_started = Instant::now();
+    let stale_report = database
+        .stale_presence_report(u64::MAX, Some("collection_scale"), Some(1))
+        .unwrap();
+    let stale_report_elapsed = stale_report_started.elapsed();
+    // The fixture intentionally uses empty files, so every path resolves to
+    // one deduplicated Object even though the query scans every copy claim.
+    assert_eq!(stale_report.stale_object_count, 1);
+    assert_eq!(stale_report.devices.len(), 1);
+    assert_eq!(stale_report.devices[0].stale_object_count, 1);
 
     let removal_started = Instant::now();
     for directory_number in 0..file_count.div_ceil(files_per_directory) {
@@ -127,10 +137,11 @@ fn complete_scan_and_atomic_missing_activation_scale_gate() {
     assert_eq!(activated, (file_count * 2) as i64);
 
     eprintln!(
-        "scan_scale_metrics files={file_count} fixture_ms={} interrupted_prefix_ms={} present_scan_ms={} removal_ms={} missing_scan_ms={} peak_rss_kib={} canonical_events={} canonical_bytes={} sqlite_bytes={}",
+        "scan_scale_metrics files={file_count} fixture_ms={} interrupted_prefix_ms={} present_scan_ms={} stale_report_ms={} removal_ms={} missing_scan_ms={} peak_rss_kib={} canonical_events={} canonical_bytes={} sqlite_bytes={}",
         fixture_elapsed.as_millis(),
         resume_elapsed.as_millis(),
         scan_elapsed.as_millis(),
+        stale_report_elapsed.as_millis(),
         removal_elapsed.as_millis(),
         missing_elapsed.as_millis(),
         peak_rss_kib().unwrap_or(0),

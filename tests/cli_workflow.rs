@@ -443,6 +443,59 @@ mod unix {
         assert_eq!(count("sites"), 1);
         assert_eq!(count("locations"), 3);
         assert_eq!(count("collections"), 2);
+
+        connection
+            .execute_batch(
+                "INSERT INTO policies(
+                   policy_id, display_name, policy_version, requirements_json,
+                   enabled, status, last_event_id
+                 ) VALUES (
+                   'policy_documents_short', 'Documents short horizon', 1,
+                   '{\"min_qualifying_copies\":2,\"min_devices\":2,\"min_sites\":2,\"require_offsite_copy\":true,\"require_offline_copy\":false,\"require_encrypted_offsite\":false,\"max_verification_age_days\":30,\"max_observation_age_days\":30,\"max_device_checkin_age_days\":30}',
+                   1, 'active', 'event_test_policy'
+                 );
+                 UPDATE collections SET policy_id = 'policy_documents_short'
+                 WHERE display_name = 'Documents';
+                 UPDATE copy_claims SET last_seen_time_utc_ms = 1,
+                                        last_complete_scan_id = NULL
+                 WHERE state = 'present';",
+            )
+            .unwrap();
+        let stale = central_archive(&temp)
+            .args(["--json", "report", "stale-presence", "--locations"])
+            .output()
+            .unwrap();
+        assert_eq!(stale.status.code(), Some(10));
+        let stale = json(&stale);
+        assert_eq!(stale["threshold_source"], "collection_policies");
+        assert_eq!(stale["minimum_age_days"], 30);
+        assert_eq!(stale["maximum_age_days"], 365);
+        assert_eq!(stale["stale_object_count"], 2);
+        assert_eq!(stale["devices"].as_array().unwrap().len(), 1);
+        assert_eq!(stale["devices"][0]["device_name"], "SD01");
+        assert_eq!(stale["devices"][0]["stale_object_count"], 2);
+        assert_eq!(
+            stale["devices"][0]["locations"][0]["location_name"],
+            "Photos on SD01"
+        );
+
+        let override_report = central_archive(&temp)
+            .args([
+                "--json",
+                "report",
+                "stale-presence",
+                "--older-than",
+                "7",
+                "--collection",
+                "Photos",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(override_report.status.code(), Some(10));
+        let override_report = json(&override_report);
+        assert_eq!(override_report["threshold_source"], "override");
+        assert_eq!(override_report["override_age_days"], 7);
+        assert_eq!(override_report["thresholds"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -546,6 +599,34 @@ mod unix {
         assert_eq!(first_status["present_count"], 1);
         assert_eq!(first_status["unresolved_present_count"], 1);
         assert_eq!(first_status["unresolved_missing_count"], 1);
+
+        let stale = central_archive(&temp)
+            .args([
+                "--json",
+                "report",
+                "stale-presence",
+                "--collection",
+                "Photos",
+                "--older-than",
+                "0",
+                "--locations",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(stale.status.code(), Some(10));
+        let stale = json(&stale);
+        assert_eq!(stale["stale_object_count"], 1);
+        assert_eq!(stale["unresolved_present_count"], 0);
+        assert_eq!(stale["unresolved_missing_count"], 1);
+        assert!(stale["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|device| device["locations"].as_array().unwrap())
+            .all(|location| location["suggested_action"]
+                .as_str()
+                .unwrap()
+                .contains("location import-annex")));
 
         let mut inferred_location = central_archive(&temp);
         use_fake_findmnt(&mut inferred_location, &bin, &mount_a, Some("MEDIA-MAIN"));

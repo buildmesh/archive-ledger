@@ -6,6 +6,7 @@ use archive_ledger::{
     DiscoveryItem, EventReferences, EventRequest, EventStore, EventStoreConfig, FileDiscovery,
     ProjectionConfig, ProjectionDb,
 };
+use rusqlite::Connection;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -159,6 +160,117 @@ fn discovery_projection_checkpoint_and_rebuild_scale_gate() {
         directory_size(&canonical),
         fs::metadata(&database_path).unwrap().len(),
         fs::metadata(&rebuild_path).unwrap().len(),
+    );
+}
+
+#[test]
+#[ignore = "explicit 500k stale-presence SQLite rollup scale gate"]
+fn stale_presence_rollup_scale_gate() {
+    let file_count: usize = std::env::var("ARCHIVE_LEDGER_STALE_SCALE_FILES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500_000);
+    let temp = TempDir::new().unwrap();
+    let database = ProjectionDb::open_or_create(
+        temp.path().join("stale-scale.db"),
+        "arc_stale_scale",
+        ProjectionConfig::default(),
+    )
+    .unwrap();
+    let mut connection = Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA synchronous = OFF;
+             INSERT INTO collections(collection_id, display_name, status, last_event_id)
+             VALUES ('collection_stale_scale', 'Scale', 'active', 'seed');
+             INSERT INTO devices(
+               device_id, display_name, device_kind, identity_state, status,
+               expected_availability, last_event_id
+             ) VALUES (
+               'device_stale_scale', 'Scale device', 'disk', 'confirmed',
+               'active', 'intermittent', 'seed'
+             );
+             INSERT INTO archive_roots(
+               archive_root_id, device_id, display_name, root_path_on_device_bytes,
+               root_path_encoding, root_path_display, status, created_event_id
+             ) VALUES (
+               'root_stale_scale', 'device_stale_scale', 'Scale root', X'2f',
+               'utf8', '/', 'active', 'seed'
+             );
+             INSERT INTO locations(
+               location_id, display_name, kind, archive_root_id,
+               relative_path_bytes, relative_path_encoding, relative_path_display,
+               device_id, expected_availability, is_writable, status,
+               created_event_id, last_event_id
+             ) VALUES (
+               'location_stale_scale', 'Scale location', 'filesystem',
+               'root_stale_scale', X'', 'utf8', '', 'device_stale_scale',
+               'intermittent', 1, 'active', 'seed', 'seed'
+             );
+             CREATE TEMP TABLE scale_numbers(value INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "WITH RECURSIVE numbers(value) AS (
+               VALUES(0) UNION ALL SELECT value + 1 FROM numbers WHERE value + 1 < ?1
+             ) INSERT INTO scale_numbers SELECT value FROM numbers",
+            [i64::try_from(file_count).unwrap()],
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute_batch(
+            "INSERT INTO objects(
+               object_id, canonical_hash_algo, canonical_hash_hex, size_bytes,
+               first_seen_event_id, first_seen_time_utc_ms
+             ) SELECT
+               'obj_scale_' || printf('%09d', value), 'blake3',
+               printf('%064x', value + 1), value % 4096, 'seed', 1
+             FROM scale_numbers;
+             INSERT INTO file_refs(
+               file_ref_id, collection_id, logical_path_bytes,
+               logical_path_encoding, logical_path_display, object_id,
+               identity_state, path_state, observed_size_bytes,
+               created_time_utc_ms, first_seen_event_id, last_seen_event_id
+             ) SELECT
+               'file_scale_' || printf('%09d', value), 'collection_stale_scale',
+               CAST('f' || printf('%09d', value) AS BLOB), 'utf8',
+               'f' || printf('%09d', value),
+               'obj_scale_' || printf('%09d', value), 'resolved', 'active',
+               value % 4096, 1, 'seed', 'seed'
+             FROM scale_numbers;
+             INSERT INTO copy_claims(
+               copy_claim_id, location_id, relative_path_bytes,
+               relative_path_encoding, relative_path_display, object_id,
+               claim_basis, state, state_event_seq, first_seen_event_id,
+               last_seen_event_id, last_seen_time_utc_ms
+             ) SELECT
+               'copy_scale_' || printf('%09d', value), 'location_stale_scale',
+               CAST('f' || printf('%09d', value) AS BLOB), 'utf8',
+               'f' || printf('%09d', value),
+               'obj_scale_' || printf('%09d', value), 'observed_bytes',
+               'present', value + 1, 'seed', 'seed', 1
+             FROM scale_numbers;",
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let started = Instant::now();
+    let report = database
+        .stale_presence_report(2 * 86_400_000, Some("collection_stale_scale"), Some(1))
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(report.stale_object_count, file_count as u64);
+    assert_eq!(report.devices.len(), 1);
+    assert_eq!(report.devices[0].stale_object_count, file_count as u64);
+    assert_eq!(report.devices[0].locations.len(), 1);
+    eprintln!(
+        "stale_presence_scale_metrics files={file_count} report_ms={} sqlite_bytes={}",
+        elapsed.as_millis(),
+        fs::metadata(database.path()).unwrap().len()
     );
 }
 

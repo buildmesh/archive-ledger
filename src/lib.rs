@@ -55,5 +55,8 @@ pub use review::{
 pub use scan::{
     LocationScanner, ScanConfig, ScanError, ScanMode, ScanResult, ScanStatus, ScanSummary,
 };
-pub use status::{CollectionStatus, LocationStatus, StatusError};
+pub use status::{
+    CollectionStatus, LocationStatus, StalePresenceDevice, StalePresenceLocation,
+    StalePresenceReport, StalePresenceThreshold, StatusError,
+};
 pub use storage::{discover_mounted_filesystem, MountedFilesystem, StorageDiscoveryError};

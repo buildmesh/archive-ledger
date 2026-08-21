@@ -983,6 +983,21 @@ enum ReportCommand {
     Policy(ReportSummaryArgs),
     /// Show checkpoint, commit, and independent replication coverage.
     Metadata,
+    /// Show which Devices and Locations have stale presence evidence.
+    StalePresence(StalePresenceArgs),
+}
+
+#[derive(Debug, Args)]
+struct StalePresenceArgs {
+    /// Show Location rollups beneath each Device.
+    #[arg(long)]
+    locations: bool,
+    /// Limit the report to one Collection name or ID.
+    #[arg(long)]
+    collection: Option<String>,
+    /// Override Collection policies with this age in days.
+    #[arg(long = "older-than")]
+    older_than_days: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -1412,6 +1427,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             }
             ReportCommand::Policy(args) => execute_policy_report(&database, args, cli.json),
             ReportCommand::Metadata => execute_metadata_status(&database, cli.json),
+            ReportCommand::StalePresence(args) => {
+                execute_stale_presence_report(&database, args, cli.json)
+            }
         },
         Command::MetadataDestination { command } => {
             execute_metadata_destination(cli, &database, command)
@@ -6014,6 +6032,127 @@ fn execute_policy_report(
         print_cached_status(&status);
         if args.collection.is_some() {
             println!("Policy totals cover every active collection assigned to the shown policy.");
+        }
+    }
+    Ok(if has_findings { EXIT_FINDINGS } else { EXIT_OK })
+}
+
+fn execute_stale_presence_report(
+    database: &ProjectionDb,
+    args: &StalePresenceArgs,
+    as_json: bool,
+) -> Result<u8, AppError> {
+    let collection_id = if let Some(selector) = args.collection.as_deref() {
+        let state = database.registry_state(false)?;
+        Some(
+            select_collection(&state.collections, selector)?
+                .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?
+                .collection_id,
+        )
+    } else {
+        None
+    };
+    let report = database.stale_presence_report(
+        now_utc_ms()?,
+        collection_id.as_deref(),
+        args.older_than_days,
+    )?;
+    let has_findings = report.stale_object_count > 0
+        || report.unresolved_present_count > 0
+        || report.unresolved_missing_count > 0
+        || report.unresolved_unknown_count > 0
+        || !report.unconfigured_collections.is_empty();
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        match (
+            report.threshold_source.as_str(),
+            report.minimum_age_days,
+            report.maximum_age_days,
+        ) {
+            ("override", Some(days), _) => {
+                println!("Presence is stale after {days} days (--older-than override).");
+            }
+            (_, Some(minimum), Some(maximum)) if minimum == maximum => {
+                println!(
+                    "Presence is stale after {minimum} days (Collection policy threshold)."
+                );
+            }
+            (_, Some(minimum), Some(maximum)) => {
+                println!(
+                    "Presence thresholds come from Collection policies and range from {minimum} to {maximum} days."
+                );
+            }
+            _ => println!(
+                "No applicable presence-age threshold is configured; use --older-than or assign Collection policies."
+            ),
+        }
+        if report.threshold_source == "collection_policies" {
+            for threshold in &report.thresholds {
+                println!(
+                    "  {}: {} days ({})",
+                    threshold.collection_name,
+                    threshold.max_observation_age_days,
+                    threshold.policy_name.as_deref().unwrap_or("policy")
+                );
+            }
+        }
+        if !report.unconfigured_collections.is_empty() {
+            println!(
+                "  No active policy: {}",
+                report.unconfigured_collections.join(", ")
+            );
+        }
+        if report.devices.is_empty() {
+            println!("No stale or unresolved presence records match this report.");
+        }
+        for device in &report.devices {
+            let site = device
+                .site_name
+                .as_ref()
+                .map(|site| format!(" at {site}"))
+                .unwrap_or_default();
+            println!(
+                "{}{}: {} stale Objects; {} unresolved present, {} unresolved missing, {} unresolved unknown ({})",
+                device.device_name,
+                site,
+                device.stale_object_count,
+                device.unresolved_present_count,
+                device.unresolved_missing_count,
+                device.unresolved_unknown_count,
+                device.expected_availability
+            );
+            if args.locations {
+                for location in &device.locations {
+                    println!(
+                        "  {}: {} stale Objects; {} unresolved present, {} unresolved missing, {} unresolved unknown",
+                        location.location_name,
+                        location.stale_object_count,
+                        location.unresolved_present_count,
+                        location.unresolved_missing_count,
+                        location.unresolved_unknown_count
+                    );
+                    println!(
+                        "    last complete inventory: {}; oldest stale observation: {}",
+                        status_optional_time(location.last_complete_inventory_utc_ms),
+                        status_optional_time(location.oldest_positive_observation_utc_ms)
+                    );
+                    println!("    Next: {}", location.suggested_action);
+                }
+            } else {
+                println!("  Next: {}", device.suggested_action);
+            }
+        }
+        if report.unmapped_unresolved_present_count > 0
+            || report.unmapped_unresolved_missing_count > 0
+            || report.unmapped_unresolved_unknown_count > 0
+        {
+            println!(
+                "Unmapped annex identities: {} present, {} missing, {} unknown; map remotes before choosing a Device.",
+                report.unmapped_unresolved_present_count,
+                report.unmapped_unresolved_missing_count,
+                report.unmapped_unresolved_unknown_count
+            );
         }
     }
     Ok(if has_findings { EXIT_FINDINGS } else { EXIT_OK })
