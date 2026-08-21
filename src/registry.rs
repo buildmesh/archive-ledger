@@ -224,7 +224,8 @@ impl ProjectionDb {
         let archive_roots = query_rows(
             &connection,
             "SELECT archive_root_id, device_id, display_name, root_path_encoding,
-                    root_path_on_device_bytes, root_path_display, status
+                    root_path_on_device_bytes, root_path_display, status,
+                    filesystem_fingerprint, fingerprint_kind, identity_state
              FROM archive_roots WHERE (?1 IS NULL OR status = ?1)
              ORDER BY display_name, archive_root_id",
             status,
@@ -235,6 +236,9 @@ impl ProjectionDb {
                     display_name: row.get(2)?,
                     root_path_on_device: registry_path_from_row(row, 3, 4, 5)?,
                     status: row.get(6)?,
+                    filesystem_fingerprint: row.get(7)?,
+                    fingerprint_kind: row.get(8)?,
+                    identity_state: row.get(9)?,
                 })
             },
             self.path(),
@@ -337,6 +341,40 @@ impl RegistryPath {
             base64: None,
         }
     }
+
+    pub fn from_path(path: &Path) -> Self {
+        if let Some(text) = path.to_str() {
+            return Self::utf8(text);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let bytes = path.as_os_str().as_bytes();
+            return Self {
+                encoding: "unix_bytes".to_owned(),
+                text: None,
+                base64: Some(STANDARD.encode(bytes)),
+                display: path.to_string_lossy().into_owned(),
+            };
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt as _;
+            let bytes = path
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            return Self {
+                encoding: "windows_utf16le".to_owned(),
+                text: None,
+                base64: Some(STANDARD.encode(bytes)),
+                display: path.to_string_lossy().into_owned(),
+            };
+        }
+        #[allow(unreachable_code)]
+        Self::utf8(path.to_string_lossy())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +433,12 @@ pub struct ArchiveRootSnapshot {
     pub display_name: String,
     pub root_path_on_device: RegistryPath,
     pub status: String,
+    #[serde(default)]
+    pub filesystem_fingerprint: Option<String>,
+    #[serde(default)]
+    pub fingerprint_kind: Option<String>,
+    #[serde(default = "unavailable_identity_state")]
+    pub identity_state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -444,9 +488,15 @@ pub struct DeviceCheckIn {
 pub struct DeviceMount {
     pub mount_id: String,
     pub device_id: String,
+    #[serde(default)]
+    pub archive_root_id: Option<String>,
     pub mount_root_uri: String,
     pub status: String,
     pub fingerprint_status: String,
+}
+
+fn unavailable_identity_state() -> String {
+    "unavailable".to_owned()
 }
 
 fn query_rows<T, F>(
@@ -504,6 +554,30 @@ fn registry_path_from_parts(
             base64: Some(STANDARD.encode(bytes)),
             display,
         })
+    }
+}
+
+fn registry_path_bytes(path: &RegistryPath) -> Result<Vec<u8>> {
+    match path.encoding.as_str() {
+        "utf8" => path
+            .text
+            .as_ref()
+            .filter(|_| path.base64.is_none())
+            .map(|text| text.as_bytes().to_vec())
+            .ok_or_else(|| RegistryError::Invalid("invalid UTF-8 registry path".to_owned())),
+        "unix_bytes" | "windows_utf16le" => path
+            .base64
+            .as_ref()
+            .filter(|_| path.text.is_none())
+            .ok_or_else(|| RegistryError::Invalid("invalid encoded registry path".to_owned()))
+            .and_then(|bytes| {
+                STANDARD
+                    .decode(bytes)
+                    .map_err(|_| RegistryError::Invalid("invalid base64 registry path".to_owned()))
+            }),
+        _ => Err(RegistryError::Invalid(
+            "unsupported registry path encoding".to_owned(),
+        )),
     }
 }
 
@@ -787,17 +861,106 @@ fn validate_change(path: &Path, change: &RegistryChange) -> Result<()> {
                 *action,
             )?;
             require_entity(&connection, "devices", "device_id", &value.device_id)?;
-            if *action != RegistryAction::Register {
-                let current: String = connection
+            if !matches!(
+                value.identity_state.as_str(),
+                "confirmed" | "unavailable" | "conflict"
+            ) {
+                return Err(RegistryError::Invalid(
+                    "invalid archive root identity_state".to_owned(),
+                ));
+            }
+            let has_fingerprint = value.filesystem_fingerprint.is_some();
+            let has_kind = value.fingerprint_kind.is_some();
+            if has_fingerprint != has_kind
+                || (value.identity_state == "confirmed" && !has_fingerprint)
+                || (value.identity_state == "unavailable" && has_fingerprint)
+            {
+                return Err(RegistryError::Invalid(
+                    "archive root identity evidence does not match identity_state".to_owned(),
+                ));
+            }
+            let path_bytes = registry_path_bytes(&value.root_path_on_device)?;
+            let duplicate_path: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM archive_roots
+                     WHERE device_id = ?1 AND root_path_encoding = ?2
+                       AND root_path_on_device_bytes = ?3 AND status = 'active'
+                       AND archive_root_id != ?4)",
+                    rusqlite::params![
+                        value.device_id,
+                        value.root_path_on_device.encoding,
+                        path_bytes,
+                        value.archive_root_id
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(path, source))?;
+            if duplicate_path {
+                return Err(RegistryError::Invalid(
+                    "an active Archive Root already uses this path on the Device".to_owned(),
+                ));
+            }
+            if value.identity_state == "confirmed" {
+                let duplicate_fingerprint: bool = connection
                     .query_row(
-                        "SELECT device_id FROM archive_roots WHERE archive_root_id = ?1",
-                        [&value.archive_root_id],
+                        "SELECT EXISTS(SELECT 1 FROM archive_roots
+                         WHERE fingerprint_kind = ?1 AND filesystem_fingerprint = ?2
+                           AND identity_state = 'confirmed' AND status = 'active'
+                           AND archive_root_id != ?3)",
+                        rusqlite::params![
+                            value.fingerprint_kind,
+                            value.filesystem_fingerprint,
+                            value.archive_root_id
+                        ],
                         |row| row.get(0),
                     )
                     .map_err(|source| sqlite_error(path, source))?;
-                if current != value.device_id {
+                if duplicate_fingerprint {
                     return Err(RegistryError::Invalid(
-                        "an archive root cannot move to another device".to_owned(),
+                        "an active Archive Root already has this confirmed filesystem identity"
+                            .to_owned(),
+                    ));
+                }
+            }
+            if *action != RegistryAction::Register {
+                let current: (
+                    String,
+                    String,
+                    Vec<u8>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                ) = connection
+                    .query_row(
+                        "SELECT device_id, root_path_encoding, root_path_on_device_bytes,
+                                filesystem_fingerprint, fingerprint_kind, identity_state
+                         FROM archive_roots WHERE archive_root_id = ?1",
+                        [&value.archive_root_id],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .map_err(|source| sqlite_error(path, source))?;
+                if current
+                    != (
+                        value.device_id.clone(),
+                        value.root_path_on_device.encoding.clone(),
+                        registry_path_bytes(&value.root_path_on_device)?,
+                        value.filesystem_fingerprint.clone(),
+                        value.fingerprint_kind.clone(),
+                        value.identity_state.clone(),
+                    )
+                {
+                    return Err(RegistryError::Invalid(
+                        "Archive Root updates must preserve Device, path, and filesystem identity evidence"
+                            .to_owned(),
                     ));
                 }
             }
@@ -871,6 +1034,25 @@ fn validate_change(path: &Path, change: &RegistryChange) -> Result<()> {
         }
         RegistryChange::DeviceMount(value) => {
             require_entity(&connection, "devices", "device_id", &value.device_id)?;
+            if let Some(archive_root_id) = &value.archive_root_id {
+                let root_device: String = connection
+                    .query_row(
+                        "SELECT device_id FROM archive_roots WHERE archive_root_id = ?1",
+                        [archive_root_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|source| sqlite_error(path, source))?
+                    .ok_or_else(|| RegistryError::NotFound {
+                        kind: "archive root",
+                        id: archive_root_id.clone(),
+                    })?;
+                if root_device != value.device_id {
+                    return Err(RegistryError::Invalid(
+                        "device mount root belongs to a different device".to_owned(),
+                    ));
+                }
+            }
             require_nonempty("mount_id", &value.mount_id)?;
             require_nonempty("mount_root_uri", &value.mount_root_uri)?;
             if !matches!(value.status.as_str(), "mounted" | "unmounted" | "mismatch")
@@ -1125,6 +1307,9 @@ mod tests {
                     display_name: "Root".to_owned(),
                     root_path_on_device: RegistryPath::utf8("/archive"),
                     status: "active".to_owned(),
+                    filesystem_fingerprint: None,
+                    fingerprint_kind: None,
+                    identity_state: "unavailable".to_owned(),
                 },
             ))
             .unwrap();

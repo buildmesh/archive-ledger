@@ -1126,7 +1126,11 @@ mod tests {
                 INSERT INTO devices VALUES
                   ('device_1', 'Archive disk', 'disk', NULL, 'fp', 'serial', 'confirmed', NULL,
                    'active', 'site_1', 'online', 'event_1', 250, 250, 'match', 'event_1');
-                INSERT INTO archive_roots VALUES
+                INSERT INTO archive_roots(
+                  archive_root_id, device_id, display_name, root_path_on_device_bytes,
+                  root_path_encoding, root_path_display, status, created_event_id,
+                  last_seen_event_id, last_seen_time_utc_ms
+                ) VALUES
                   ('root_1', 'device_1', 'Archive root', X'2f61726368697665', 'utf8', '/archive',
                    'active', 'event_1', 'event_1', 250);
                 INSERT INTO locations VALUES

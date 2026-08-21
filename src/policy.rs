@@ -2152,7 +2152,11 @@ mod tests {
                    'active', 'site_home', 'online', 'event_1', 900000, 900000, 'match', 'event_1'),
                   ('device_2', 'Remote disk', 'disk', NULL, 'fp2', 'serial', 'confirmed', NULL,
                    'active', 'site_remote', 'offline', 'event_1', 900000, 900000, 'match', 'event_1');
-                INSERT INTO archive_roots VALUES
+                INSERT INTO archive_roots(
+                  archive_root_id, device_id, display_name, root_path_on_device_bytes,
+                  root_path_encoding, root_path_display, status, created_event_id,
+                  last_seen_event_id, last_seen_time_utc_ms
+                ) VALUES
                   ('root_1', 'device_1', 'Home root', X'2f61726368697665', 'utf8', '/archive',
                    'active', 'event_1', 'event_1', 900000),
                   ('root_2', 'device_2', 'Remote root', X'2f6261636b7570', 'utf8', '/backup',

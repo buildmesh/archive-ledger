@@ -29,6 +29,35 @@ mod unix {
         command
     }
 
+    fn install_fake_findmnt(temp: &TempDir) -> std::path::PathBuf {
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let findmnt = bin.join("findmnt");
+        fs::write(
+            &findmnt,
+            b"#!/bin/sh\nuuid=${FAKE_UUID:-null}\nprintf '{\"filesystems\":[{\"target\":\"%s\",\"source\":\"/dev/test1\",\"fstype\":\"ext4\",\"uuid\":%s,\"partuuid\":null}]}\\n' \"$FAKE_MOUNT_TARGET\" \"$uuid\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&findmnt).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&findmnt, permissions).unwrap();
+        bin
+    }
+
+    fn use_fake_findmnt(command: &mut Command, bin: &Path, mount: &Path, uuid: Option<&str>) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        command
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("FAKE_MOUNT_TARGET", mount);
+        if let Some(uuid) = uuid {
+            command.env("FAKE_UUID", format!("\"{uuid}\""));
+        } else {
+            command.env_remove("FAKE_UUID");
+        }
+    }
+
     fn success(command: &mut Command) -> Output {
         let output = command.output().unwrap();
         assert!(
@@ -187,6 +216,121 @@ mod unix {
             .unwrap();
         assert!(by_path.status.success());
         assert_eq!(json(&by_path)["last_seq"], 2);
+    }
+
+    #[test]
+    fn collection_init_discovers_relative_paths_and_reuses_a_remounted_root() {
+        let temp = TempDir::new().unwrap();
+        let bin = install_fake_findmnt(&temp);
+        let mount_a = temp.path().join("mount-a");
+        let mount_b = temp.path().join("mount-b");
+        let photos = mount_a.join("annex/photos");
+        let documents = mount_b.join("annex/documents");
+        fs::create_dir_all(&photos).unwrap();
+        fs::create_dir_all(&documents).unwrap();
+
+        success(central_archive(&temp).args([
+            "init",
+            "--name",
+            "Setup",
+            "--archive-id",
+            "arc_setup",
+            "--non-interactive",
+        ]));
+
+        let mut missing_device = central_archive(&temp);
+        use_fake_findmnt(&mut missing_device, &bin, &mount_a, Some("TEST-UUID"));
+        let missing_device = missing_device
+            .arg("collection")
+            .arg("init")
+            .arg(&photos)
+            .args(["--name", "Probe", "--non-interactive"])
+            .output()
+            .unwrap();
+        assert_eq!(missing_device.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&missing_device.stderr).contains("--device"));
+
+        let mut first = central_archive(&temp);
+        use_fake_findmnt(&mut first, &bin, &mount_a, Some("TEST-UUID"));
+        let first = success(
+            first
+                .arg("--json")
+                .arg("collection")
+                .arg("init")
+                .arg(&photos)
+                .args([
+                    "--name",
+                    "Photos",
+                    "--device",
+                    "SD01",
+                    "--site",
+                    "Home",
+                    "--non-interactive",
+                ]),
+        );
+        let first = json(&first);
+        assert_eq!(first["mounted"]["relative_path"], "annex/photos");
+        assert_eq!(first["archive_root"]["filesystem_fingerprint"], "test-uuid");
+        assert_eq!(first["archive_root"]["fingerprint_kind"], "filesystem_uuid");
+        assert_eq!(first["location"]["display_name"], "Photos on SD01");
+
+        let mut second = central_archive(&temp);
+        use_fake_findmnt(&mut second, &bin, &mount_b, Some("test-uuid"));
+        let second = success(
+            second
+                .arg("--json")
+                .arg("collection")
+                .arg("init")
+                .arg(&documents)
+                .args(["--name", "Documents", "--non-interactive"]),
+        );
+        let second = json(&second);
+        assert_eq!(second["mounted"]["relative_path"], "annex/documents");
+        assert_eq!(
+            second["archive_root"]["archive_root_id"],
+            first["archive_root"]["archive_root_id"]
+        );
+        assert_eq!(second["device"]["device_id"], first["device"]["device_id"]);
+        assert_eq!(second["site"]["site_id"], first["site"]["site_id"]);
+
+        let unknown = mount_a.join("unknown");
+        fs::create_dir(&unknown).unwrap();
+        let mut unsafe_init = central_archive(&temp);
+        use_fake_findmnt(&mut unsafe_init, &bin, &mount_a, None);
+        let unsafe_init = unsafe_init
+            .arg("collection")
+            .arg("init")
+            .arg(&unknown)
+            .args([
+                "--name",
+                "Unknown",
+                "--device",
+                "SD01",
+                "--site",
+                "Home",
+                "--non-interactive",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(unsafe_init.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&unsafe_init.stderr).contains("--allow-unidentified-root"));
+
+        let database_path = temp
+            .path()
+            .join("data/archive-ledger/archives/arc_setup/archive.db");
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let count = |table: &str| {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count("archive_roots"), 1);
+        assert_eq!(count("devices"), 1);
+        assert_eq!(count("sites"), 1);
+        assert_eq!(count("locations"), 2);
+        assert_eq!(count("collections"), 2);
     }
 
     #[test]

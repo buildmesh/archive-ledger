@@ -22,9 +22,10 @@ use crate::registry::{
     RegistryPath, RiskAssignment, RiskDomainSnapshot, SiteSnapshot,
 };
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const STREAM_ID: &str = "stream_primary";
 const SCHEMA_V4: &str = include_str!("schema_v4.sql");
+const SCHEMA_V5_MIGRATION: &str = include_str!("schema_v5_migration.sql");
 
 pub type Result<T> = std::result::Result<T, ProjectionError>;
 
@@ -341,7 +342,8 @@ impl ProjectionDb {
         let path = path.as_ref().to_path_buf();
         fs::metadata(&path).map_err(|source| io_error("open database", &path, source))?;
         let database = Self { path, config };
-        let connection = database.open_connection()?;
+        let mut connection = database.open_connection()?;
+        database.migrate_if_needed(&mut connection)?;
         let archive_id = meta_required(&connection, "archive_id")
             .map_err(|source| sqlite_error(&database.path, source))?;
         database.validate_identity(&connection, &archive_id)?;
@@ -369,7 +371,7 @@ impl ProjectionDb {
         fs::create_dir_all(parent)
             .map_err(|source| io_error("create database directory", parent, source))?;
         let database = Self { path, config };
-        let connection = database.open_connection()?;
+        let mut connection = database.open_connection()?;
         let initialized: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'archive_meta')",
@@ -384,11 +386,16 @@ impl ProjectionDb {
             transaction
                 .execute_batch(SCHEMA_V4)
                 .map_err(|source| sqlite_error(&database.path, source))?;
+            transaction
+                .execute_batch(SCHEMA_V5_MIGRATION)
+                .map_err(|source| sqlite_error(&database.path, source))?;
             initialize_meta(&transaction, archive_id)
                 .map_err(|source| sqlite_error(&database.path, source))?;
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(&database.path, source))?;
+        } else {
+            database.migrate_if_needed(&mut connection)?;
         }
         database.validate_identity(&connection, archive_id)?;
         Ok(database)
@@ -1209,6 +1216,36 @@ impl ProjectionDb {
         Ok(connection)
     }
 
+    fn migrate_if_needed(&self, connection: &mut Connection) -> Result<()> {
+        let schema_version = meta_required(connection, "schema_version")
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if schema_version == SCHEMA_VERSION.to_string() {
+            return Ok(());
+        }
+        if schema_version != "4" {
+            return Err(ProjectionError::UnsupportedSchema {
+                actual: schema_version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute_batch(SCHEMA_V5_MIGRATION)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute(
+                "UPDATE archive_meta SET value = ?1 WHERE key = 'schema_version'",
+                [SCHEMA_VERSION.to_string()],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        Ok(())
+    }
+
     fn validate_identity(&self, connection: &Connection, archive_id: &str) -> Result<()> {
         let schema_version = meta_required(connection, "schema_version")
             .map_err(|source| sqlite_error(&self.path, source))?;
@@ -1784,6 +1821,8 @@ struct DeviceCheckedInPayload {
 struct DeviceMountObservedPayload {
     mount_id: String,
     device_id: String,
+    #[serde(default)]
+    archive_root_id: Option<String>,
     mount_root_uri: String,
     status: String,
     fingerprint_status: String,
@@ -2259,13 +2298,16 @@ fn project_archive_root_snapshot(
     transaction.execute(
         "INSERT INTO archive_roots(archive_root_id, device_id, display_name,
           root_path_on_device_bytes, root_path_encoding, root_path_display,
-          status, created_event_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          status, created_event_id, filesystem_fingerprint, fingerprint_kind, identity_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(archive_root_id) DO UPDATE SET device_id = excluded.device_id,
           display_name = excluded.display_name,
           root_path_on_device_bytes = excluded.root_path_on_device_bytes,
           root_path_encoding = excluded.root_path_encoding,
-          root_path_display = excluded.root_path_display, status = excluded.status",
+          root_path_display = excluded.root_path_display, status = excluded.status,
+          filesystem_fingerprint = excluded.filesystem_fingerprint,
+          fingerprint_kind = excluded.fingerprint_kind,
+          identity_state = excluded.identity_state",
         params![
             value.archive_root_id,
             value.device_id,
@@ -2275,6 +2317,9 @@ fn project_archive_root_snapshot(
             value.root_path_on_device.display,
             value.status,
             record.envelope.event_id,
+            value.filesystem_fingerprint,
+            value.fingerprint_kind,
+            value.identity_state,
         ],
     )?;
     Ok(())
@@ -2961,11 +3006,25 @@ fn project_device_mount_observed(
     if !device_exists {
         return Err(invalid_payload(record, "device mount names no device"));
     }
+    if let Some(archive_root_id) = &value.archive_root_id {
+        let root_matches: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_roots
+             WHERE archive_root_id = ?1 AND device_id = ?2)",
+            params![archive_root_id, value.device_id],
+            |row| row.get(0),
+        )?;
+        if !root_matches {
+            return Err(invalid_payload(
+                record,
+                "device mount root does not belong to the device",
+            ));
+        }
+    }
     transaction.execute(
         "INSERT INTO device_mounts(
             mount_id, device_id, host_id, mount_root_uri, status,
-            fingerprint_status, observed_time_utc_ms, observed_event_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            fingerprint_status, observed_time_utc_ms, observed_event_id, archive_root_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             value.mount_id,
             value.device_id,
@@ -2975,22 +3034,42 @@ fn project_device_mount_observed(
             value.fingerprint_status,
             sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
             record.envelope.event_id,
+            value.archive_root_id,
         ],
     )?;
-    transaction.execute(
-        "UPDATE devices SET
-            identity_state = CASE
-                WHEN ?2 = 'mismatch' THEN 'conflict' ELSE identity_state END,
-            last_fingerprint_match_time_utc_ms = CASE
-                WHEN ?2 = 'match' THEN ?3 ELSE last_fingerprint_match_time_utc_ms END,
-            last_fingerprint_status = ?2
-         WHERE device_id = ?1",
-        params![
-            value.device_id,
-            value.fingerprint_status,
-            sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
-        ],
-    )?;
+    if let Some(archive_root_id) = value.archive_root_id {
+        transaction.execute(
+            "UPDATE archive_roots SET
+                identity_state = CASE
+                    WHEN ?2 = 'mismatch' THEN 'conflict' ELSE identity_state END,
+                last_seen_event_id = ?3,
+                last_seen_time_utc_ms = ?4
+             WHERE archive_root_id = ?1",
+            params![
+                archive_root_id,
+                value.fingerprint_status,
+                record.envelope.event_id,
+                sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            ],
+        )?;
+    } else {
+        // Version-4 mount observations predate Archive Root identity evidence and
+        // retain their historical Device-fingerprint behavior during replay.
+        transaction.execute(
+            "UPDATE devices SET
+                identity_state = CASE
+                    WHEN ?2 = 'mismatch' THEN 'conflict' ELSE identity_state END,
+                last_fingerprint_match_time_utc_ms = CASE
+                    WHEN ?2 = 'match' THEN ?3 ELSE last_fingerprint_match_time_utc_ms END,
+                last_fingerprint_status = ?2
+             WHERE device_id = ?1",
+            params![
+                value.device_id,
+                value.fingerprint_status,
+                sql_integer(record.envelope.time_utc_ms, "time_utc_ms", record)?,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -4086,7 +4165,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_contains_every_specified_table_tier() {
+    fn schema_v5_contains_every_specified_table_tier() {
         assert_eq!(parent_directory(Path::new("archive.db")), Path::new("."));
         let temp = TempDir::new().unwrap();
         let database = database(&temp, ProjectionConfig::default());
@@ -4140,7 +4219,84 @@ mod tests {
         .map(str::to_owned)
         .collect();
         assert_eq!(actual, expected);
-        assert_eq!(database.status().unwrap().schema_version, 4);
+        assert_eq!(database.status().unwrap().schema_version, 5);
+    }
+
+    #[test]
+    fn opening_a_v4_projection_migrates_transactionally_to_v5() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("archive.db");
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute_batch(SCHEMA_V4).unwrap();
+        initialize_meta(&transaction, "arc_migrate").unwrap();
+        transaction
+            .execute(
+                "UPDATE archive_meta SET value = '4' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let database = ProjectionDb::open_existing(&path, ProjectionConfig::default()).unwrap();
+        assert_eq!(database.status().unwrap().schema_version, 5);
+        let connection = Connection::open(&path).unwrap();
+        let root_columns = connection
+            .prepare("PRAGMA table_info(archive_roots)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
+        assert!(root_columns.contains("filesystem_fingerprint"));
+        assert!(root_columns.contains("fingerprint_kind"));
+        assert!(root_columns.contains("identity_state"));
+    }
+
+    #[test]
+    fn failed_v5_migration_leaves_the_v4_projection_usable() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("archive.db");
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute_batch(SCHEMA_V4).unwrap();
+        initialize_meta(&transaction, "arc_migrate_failure").unwrap();
+        transaction
+            .execute(
+                "UPDATE archive_meta SET value = '4' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "CREATE INDEX archive_roots_confirmed_fingerprint ON sites(site_id)",
+                [],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let error = ProjectionDb::open_existing(&path, ProjectionConfig::default()).unwrap_err();
+        assert_eq!(error.code(), "projection_sqlite");
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(meta_required(&connection, "schema_version").unwrap(), "4");
+        let has_identity_column: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('archive_roots') WHERE name = 'identity_state'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_identity_column);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use archive_ledger::{
     PolicyFindingFilter, PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig,
     ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError,
     RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, ScanConfig, ScanError,
-    ScanStatus, SiteSnapshot,
+    ScanStatus, SiteSnapshot, StorageDiscoveryError,
 };
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
@@ -224,7 +224,7 @@ enum Command {
     /// Manage collections through canonical full-snapshot events.
     Collection {
         #[command(subcommand)]
-        command: RegistryEntityCommand,
+        command: CollectionCommand,
     },
     /// Manage devices through canonical full-snapshot events.
     Device {
@@ -602,7 +602,58 @@ enum RegistryEntityCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum CollectionCommand {
+    /// Create a Collection and its initial filesystem Location from cwd or --path.
+    Init(CollectionInitArgs),
+    /// List active Collections.
+    List {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one Collection by stable ID.
+    Show { id: String },
+    /// Add a Collection with friendly flags, or provide a complete JSON snapshot.
+    Add(Box<RegistryAddArgs>),
+    /// Replace user-controlled fields with a complete JSON snapshot.
+    Update { snapshot: String },
+    /// Retire a Collection with a complete JSON snapshot whose status is retired.
+    Retire {
+        snapshot: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Debug, Args)]
+struct CollectionInitArgs {
+    /// Directory containing the Collection; defaults to the current directory.
+    #[arg(default_value = ".")]
+    path: PathBuf,
+    /// Human-readable Collection name; prompted for on a terminal when omitted.
+    #[arg(long)]
+    name: Option<String>,
+    /// Existing Device ID/name, or a name for a new Device.
+    #[arg(long)]
+    device: Option<String>,
+    /// Existing Site ID/name, or a name for a new Site.
+    #[arg(long)]
+    site: Option<String>,
+    /// Override the default `<Collection> on <Device>` Location name.
+    #[arg(long)]
+    location_name: Option<String>,
+    /// Override the mounted filesystem's display name.
+    #[arg(long)]
+    root_name: Option<String>,
+    /// Permit registration when no stable filesystem or partition UUID is available.
+    #[arg(long)]
+    allow_unidentified_root: bool,
+    /// Never prompt; requires every unresolved value as a flag.
+    #[arg(long)]
+    non_interactive: bool,
+}
+
+#[derive(Debug, Args, Clone)]
 struct RegistryAddArgs {
     #[arg(long)]
     snapshot: Option<String>,
@@ -735,6 +786,7 @@ enum AppError {
     Metadata(MetadataError),
     Scan(ScanError),
     Annex(AnnexImportError),
+    Storage(StorageDiscoveryError),
     Io(std::io::Error),
     Json(serde_json::Error),
     Clock,
@@ -753,6 +805,7 @@ impl AppError {
             Self::Metadata(error) => error.code(),
             Self::Scan(error) => error.code(),
             Self::Annex(error) => error.code(),
+            Self::Storage(error) => error.code(),
             Self::Io(_) => "io_error",
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
@@ -773,6 +826,7 @@ impl std::fmt::Display for AppError {
             Self::Metadata(error) => error.fmt(formatter),
             Self::Scan(error) => error.fmt(formatter),
             Self::Annex(error) => error.fmt(formatter),
+            Self::Storage(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
@@ -832,6 +886,12 @@ impl From<ScanError> for AppError {
 impl From<AnnexImportError> for AppError {
     fn from(error: AnnexImportError) -> Self {
         Self::Annex(error)
+    }
+}
+
+impl From<StorageDiscoveryError> for AppError {
+    fn from(error: StorageDiscoveryError) -> Self {
+        Self::Storage(error)
     }
 }
 
@@ -1058,9 +1118,7 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         Command::AnnexRemote { command } => execute_annex_remote(cli, &database, command),
         Command::Job { command } => execute_job(cli, &database, command),
         Command::Site { command } => execute_registry(cli, &database, RegistryKind::Site, command),
-        Command::Collection { command } => {
-            execute_registry(cli, &database, RegistryKind::Collection, command)
-        }
+        Command::Collection { command } => execute_collection(cli, &database, command),
         Command::Device { command } => {
             execute_registry(cli, &database, RegistryKind::Device, command)
         }
@@ -3259,6 +3317,9 @@ fn execute_init(
                 display_name: mounted_path.display().to_string(),
                 root_path_on_device: RegistryPath::utf8("/"),
                 status: "active".to_owned(),
+                filesystem_fingerprint: None,
+                fingerprint_kind: None,
+                identity_state: "unavailable".to_owned(),
             },
         ))?;
         registry.record(RegistryChange::Location(
@@ -3362,6 +3423,563 @@ fn prompt_default(label: &str, default: &str) -> Result<String, AppError> {
     })
 }
 
+fn prompt_confirmation(label: &str) -> Result<bool, AppError> {
+    print!("{label} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn execute_collection(
+    cli: &Cli,
+    database: &ProjectionDb,
+    command: &CollectionCommand,
+) -> Result<u8, AppError> {
+    match command {
+        CollectionCommand::Init(args) => execute_collection_init(cli, database, args),
+        CollectionCommand::List { all } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Collection,
+            &RegistryEntityCommand::List { all: *all },
+        ),
+        CollectionCommand::Show { id } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Collection,
+            &RegistryEntityCommand::Show { id: id.clone() },
+        ),
+        CollectionCommand::Add(args) => execute_registry(
+            cli,
+            database,
+            RegistryKind::Collection,
+            &RegistryEntityCommand::Add(args.clone()),
+        ),
+        CollectionCommand::Update { snapshot } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Collection,
+            &RegistryEntityCommand::Update {
+                snapshot: snapshot.clone(),
+            },
+        ),
+        CollectionCommand::Retire { snapshot, yes } => execute_registry(
+            cli,
+            database,
+            RegistryKind::Collection,
+            &RegistryEntityCommand::Retire {
+                snapshot: snapshot.clone(),
+                yes: *yes,
+            },
+        ),
+    }
+}
+
+fn execute_collection_init(
+    cli: &Cli,
+    database: &ProjectionDb,
+    args: &CollectionInitArgs,
+) -> Result<u8, AppError> {
+    let interactive = !args.non_interactive && std::io::stdin().is_terminal();
+    let collection_name = match args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        Some(name) => name.to_owned(),
+        None if interactive => prompt_default("Collection name", "")?,
+        None => {
+            return Err(AppError::Input(
+                "collection init requires --name when input is non-interactive".to_owned(),
+            ))
+        }
+    };
+    let collection_name = collection_name.trim().to_owned();
+    if collection_name.is_empty() {
+        return Err(AppError::Input(
+            "Collection name must be non-empty".to_owned(),
+        ));
+    }
+    for (flag, value) in [
+        ("--location-name", args.location_name.as_deref()),
+        ("--root-name", args.root_name.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(AppError::Input(format!("{flag} must be non-empty")));
+        }
+    }
+
+    let mounted = archive_ledger::discover_mounted_filesystem(&args.path)?;
+    if mounted.identity_state == "unavailable"
+        && !args.allow_unidentified_root
+        && (!interactive
+            || !prompt_confirmation(
+                "No stable filesystem or partition UUID is available. Register this root with unconfirmed identity?",
+            )?)
+    {
+        return Err(AppError::Input(
+            "stable filesystem identity is unavailable; inspect the mount and rerun with --allow-unidentified-root to confirm".to_owned(),
+        ));
+    }
+
+    let state = database.registry_state(false)?;
+    if state
+        .collections
+        .iter()
+        .any(|collection| collection.display_name == collection_name)
+    {
+        return Err(AppError::Input(format!(
+            "an active Collection named {collection_name:?} already exists"
+        )));
+    }
+
+    let matching_roots = match (
+        mounted.fingerprint_kind.as_deref(),
+        mounted.filesystem_fingerprint.as_deref(),
+    ) {
+        (Some(kind), Some(fingerprint)) => state
+            .archive_roots
+            .iter()
+            .filter(|root| {
+                root.fingerprint_kind.as_deref() == Some(kind)
+                    && root.filesystem_fingerprint.as_deref() == Some(fingerprint)
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    if matching_roots.len() > 1
+        || matching_roots
+            .iter()
+            .any(|root| root.identity_state == "conflict")
+    {
+        return Err(AppError::Input(
+            "the discovered filesystem identity is conflicting; resolve the Archive Root identity before initializing a Collection".to_owned(),
+        ));
+    }
+    let existing_root = matching_roots
+        .into_iter()
+        .find(|root| root.identity_state == "confirmed")
+        .cloned();
+
+    let mut changes = Vec::new();
+    let (device, root, site) = if let Some(root) = existing_root {
+        let device = state
+            .devices
+            .iter()
+            .find(|device| device.device_id == root.device_id)
+            .cloned()
+            .ok_or_else(|| AppError::Input("known Archive Root has no active Device".to_owned()))?;
+        if let Some(selector) = args.device.as_deref() {
+            let selected = select_device(&state.devices, selector)?.ok_or_else(|| {
+                AppError::Input(format!(
+                    "discovered Archive Root already belongs to {}; --device does not match",
+                    device.display_name
+                ))
+            })?;
+            if selected.device_id != device.device_id {
+                return Err(AppError::Input(format!(
+                    "discovered Archive Root already belongs to {}; --device does not match",
+                    device.display_name
+                )));
+            }
+        }
+        let site = device
+            .current_site_id
+            .as_deref()
+            .and_then(|site_id| state.sites.iter().find(|site| site.site_id == site_id))
+            .cloned()
+            .ok_or_else(|| {
+                AppError::Input(format!(
+                    "known Device {} has no active Site; set it with archive device move before initializing the Collection",
+                    device.display_name
+                ))
+            })?;
+        if let Some(selector) = args.site.as_deref() {
+            let selected = select_site(&state.sites, selector)?.ok_or_else(|| {
+                AppError::Input(format!(
+                    "known Device {} is at {}; --site does not match",
+                    device.display_name, site.display_name
+                ))
+            })?;
+            if selected.site_id != site.site_id {
+                return Err(AppError::Input(format!(
+                    "known Device {} is at {}; use archive device move to change its Site",
+                    device.display_name, site.display_name
+                )));
+            }
+        }
+        (device, root, site)
+    } else {
+        let device_selector = required_or_prompt(
+            args.device.as_deref(),
+            interactive,
+            "Device name",
+            "Primary storage",
+            "--device",
+        )?;
+        let existing_device = select_device(&state.devices, &device_selector)?;
+        let device_was_known = existing_device.is_some();
+        let site = if let Some(device) = existing_device.as_ref() {
+            if let Some(site_id) = device.current_site_id.as_deref() {
+                let site = state
+                    .sites
+                    .iter()
+                    .find(|site| site.site_id == site_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::Input(format!(
+                            "Device {} refers to an inactive or missing Site",
+                            device.display_name
+                        ))
+                    })?;
+                if let Some(selector) = args.site.as_deref() {
+                    let selected = select_site(&state.sites, selector)?.ok_or_else(|| {
+                        AppError::Input(format!(
+                            "Device {} is at {}; --site does not match",
+                            device.display_name, site.display_name
+                        ))
+                    })?;
+                    if selected.site_id != site.site_id {
+                        return Err(AppError::Input(format!(
+                            "Device {} is at {}; use archive device move to change its Site",
+                            device.display_name, site.display_name
+                        )));
+                    }
+                }
+                site
+            } else {
+                return Err(AppError::Input(format!(
+                    "Device {} has no Site; set it with archive device move before initializing the Collection",
+                    device.display_name
+                )));
+            }
+        } else {
+            let site_selector = required_or_prompt(
+                args.site.as_deref(),
+                interactive,
+                "Site name",
+                "Home",
+                "--site",
+            )?;
+            match select_site(&state.sites, &site_selector)? {
+                Some(site) => site,
+                None => {
+                    let site = SiteSnapshot {
+                        site_id: generated_id("site"),
+                        display_name: site_selector,
+                        site_kind: "site".to_owned(),
+                        description: None,
+                        status: "active".to_owned(),
+                    };
+                    changes.push(RegistryChange::Site(RegistryAction::Register, site.clone()));
+                    site
+                }
+            }
+        };
+        let device = if let Some(device) = existing_device {
+            device
+        } else {
+            let device = DeviceSnapshot {
+                device_id: generated_id("device"),
+                display_name: device_selector,
+                device_kind: "disk".to_owned(),
+                serial_hint: None,
+                hardware_fingerprint: None,
+                fingerprint_kind: None,
+                identity_state: "unavailable".to_owned(),
+                owner: None,
+                status: "active".to_owned(),
+                current_site_id: Some(site.site_id.clone()),
+                expected_availability: "intermittent".to_owned(),
+            };
+            changes.push(RegistryChange::Device(
+                RegistryAction::Register,
+                device.clone(),
+            ));
+            device
+        };
+        let reusable_unidentified_roots =
+            if device_was_known && mounted.identity_state == "unavailable" {
+                state
+                    .archive_roots
+                    .iter()
+                    .filter(|root| {
+                        root.device_id == device.device_id
+                            && root.identity_state == "unavailable"
+                            && root.root_path_on_device == RegistryPath::utf8("/")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+        if reusable_unidentified_roots.len() > 1 {
+            return Err(AppError::Input(format!(
+                "Device {} has multiple unidentified roots; supply stable filesystem evidence before initializing the Collection",
+                device.display_name
+            )));
+        }
+        let root = if let Some(root) = reusable_unidentified_roots.into_iter().next() {
+            root
+        } else {
+            let root = ArchiveRootSnapshot {
+                archive_root_id: generated_id("root"),
+                device_id: device.device_id.clone(),
+                display_name: args
+                    .root_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{} filesystem", device.display_name)),
+                root_path_on_device: RegistryPath::utf8("/"),
+                status: "active".to_owned(),
+                filesystem_fingerprint: mounted.filesystem_fingerprint.clone(),
+                fingerprint_kind: mounted.fingerprint_kind.clone(),
+                identity_state: mounted.identity_state.clone(),
+            };
+            changes.push(RegistryChange::ArchiveRoot(
+                RegistryAction::Register,
+                root.clone(),
+            ));
+            root
+        };
+        (device, root, site)
+    };
+
+    let relative_path = RegistryPath::from_path(&mounted.relative_path);
+    let existing_location = state
+        .locations
+        .iter()
+        .find(|location| {
+            location.archive_root_id.as_deref() == Some(root.archive_root_id.as_str())
+                && location.relative_path.as_ref() == Some(&relative_path)
+        })
+        .cloned();
+    let location = if let Some(location) = existing_location {
+        location
+    } else {
+        let location = LocationSnapshot {
+            location_id: generated_id("location"),
+            display_name: args
+                .location_name
+                .clone()
+                .unwrap_or_else(|| format!("{collection_name} on {}", device.display_name)),
+            kind: "filesystem".to_owned(),
+            archive_root_id: Some(root.archive_root_id.clone()),
+            relative_path: Some(relative_path),
+            device_id: Some(device.device_id.clone()),
+            site_id: None,
+            encryption_state: Some("unknown".to_owned()),
+            trust_level: Some("trusted".to_owned()),
+            expected_availability: device.expected_availability.clone(),
+            is_writable: true,
+            status: "active".to_owned(),
+        };
+        changes.push(RegistryChange::Location(
+            RegistryAction::Register,
+            location.clone(),
+        ));
+        location
+    };
+
+    let policy = state
+        .policies
+        .iter()
+        .find(|policy| policy.policy_id == "policy_starter")
+        .cloned()
+        .unwrap_or_else(|| PolicySnapshot {
+            policy_id: if state
+                .policies
+                .iter()
+                .any(|policy| policy.policy_id == "policy_starter")
+            {
+                generated_id("policy")
+            } else {
+                "policy_starter".to_owned()
+            },
+            display_name: "Two copies at two sites".to_owned(),
+            policy_version: 1,
+            requirements: PolicyRequirements {
+                min_qualifying_copies: 2,
+                min_devices: 2,
+                min_sites: 2,
+                require_offsite_copy: true,
+                require_offline_copy: false,
+                require_encrypted_offsite: false,
+                max_verification_age_days: 365,
+                max_observation_age_days: 365,
+                max_device_checkin_age_days: 365,
+            },
+            enabled: true,
+            status: "active".to_owned(),
+        });
+    if !state
+        .policies
+        .iter()
+        .any(|existing| existing.policy_id == policy.policy_id)
+    {
+        changes.push(RegistryChange::Policy(
+            RegistryAction::Register,
+            policy.clone(),
+        ));
+    }
+    let collection = CollectionSnapshot {
+        collection_id: generated_id("collection"),
+        display_name: collection_name,
+        description: Some(format!("Files under {}", mounted.path.display())),
+        home_site_id: Some(site.site_id.clone()),
+        policy_id: Some(policy.policy_id.clone()),
+        status: "active".to_owned(),
+    };
+    changes.push(RegistryChange::Collection(
+        RegistryAction::Register,
+        collection.clone(),
+    ));
+    changes.push(RegistryChange::DeviceMount(DeviceMount {
+        mount_id: generated_id("mount"),
+        device_id: device.device_id.clone(),
+        archive_root_id: Some(root.archive_root_id.clone()),
+        mount_root_uri: mounted.mount_root.display().to_string(),
+        status: "mounted".to_owned(),
+        fingerprint_status: if root.identity_state == "confirmed" {
+            "match"
+        } else {
+            "unavailable"
+        }
+        .to_owned(),
+    }));
+
+    let events = EventStore::open_or_create(
+        cli.events_path(),
+        EventStoreConfig {
+            actor_id: cli.actor.clone(),
+            host_id: cli.host.clone(),
+            ..EventStoreConfig::default()
+        },
+    )?;
+    let registry = Registry::new(&events, database);
+    let mut event_ids = Vec::with_capacity(changes.len());
+    for change in changes {
+        event_ids.push(registry.record(change)?.event_id);
+    }
+    let output = json!({
+        "version": 1,
+        "collection": collection,
+        "location": location,
+        "device": device,
+        "site": site,
+        "archive_root": root,
+        "mounted": mounted,
+        "events": event_ids,
+    });
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "Created Collection {} with Location {} on Device {} at Site {}.",
+            collection.display_name, location.display_name, device.display_name, site.display_name
+        );
+        println!(
+            "Mounted root: {}; Location path within root: {}.",
+            mounted.mount_root.display(),
+            if mounted.relative_path.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                mounted.relative_path.display().to_string()
+            }
+        );
+        if root.identity_state == "confirmed" {
+            println!(
+                "Root identity: {} {}.",
+                root.fingerprint_kind.as_deref().unwrap_or("unknown"),
+                root.filesystem_fingerprint.as_deref().unwrap_or("unknown")
+            );
+        } else {
+            println!("Root identity: unavailable (not evidence of independent storage).");
+        }
+        println!(
+            "Next: archive location add . --collection {}",
+            collection.collection_id
+        );
+    }
+    Ok(EXIT_OK)
+}
+
+fn generated_id(prefix: &str) -> String {
+    format!(
+        "{prefix}_{}",
+        ulid::Ulid::new().to_string().to_ascii_lowercase()
+    )
+}
+
+fn required_or_prompt(
+    value: Option<&str>,
+    interactive: bool,
+    label: &str,
+    default: &str,
+    flag: &str,
+) -> Result<String, AppError> {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(value.to_owned());
+    }
+    if interactive {
+        return prompt_default(label, default);
+    }
+    Err(AppError::Input(format!(
+        "collection init requires {flag} when the filesystem is not already known and input is non-interactive"
+    )))
+}
+
+fn select_device(
+    devices: &[DeviceSnapshot],
+    selector: &str,
+) -> Result<Option<DeviceSnapshot>, AppError> {
+    select_registry_entity(
+        devices,
+        selector,
+        |device| &device.device_id,
+        |device| &device.display_name,
+        "Device",
+    )
+}
+
+fn select_site(sites: &[SiteSnapshot], selector: &str) -> Result<Option<SiteSnapshot>, AppError> {
+    select_registry_entity(
+        sites,
+        selector,
+        |site| &site.site_id,
+        |site| &site.display_name,
+        "Site",
+    )
+}
+
+fn select_registry_entity<T: Clone>(
+    values: &[T],
+    selector: &str,
+    id: impl Fn(&T) -> &String,
+    name: impl Fn(&T) -> &String,
+    kind: &str,
+) -> Result<Option<T>, AppError> {
+    if let Some(exact) = values.iter().find(|value| id(value) == selector) {
+        return Ok(Some(exact.clone()));
+    }
+    let matches = values
+        .iter()
+        .filter(|value| name(value) == selector)
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(value.clone())),
+        _ => Err(AppError::Input(format!(
+            "{kind} name {selector:?} is ambiguous; use its stable ID"
+        ))),
+    }
+}
+
 fn execute_registry(
     cli: &Cli,
     database: &ProjectionDb,
@@ -3375,34 +3993,30 @@ fn execute_registry(
                     "discover is available only under device".to_owned(),
                 ));
             }
-            let canonical = std::fs::canonicalize(path).map_err(|error| {
-                AppError::Input(format!("cannot inspect {}: {error}", path.display()))
-            })?;
-            let metadata = std::fs::metadata(&canonical)?;
-            #[cfg(unix)]
-            let device_number = {
-                use std::os::unix::fs::MetadataExt;
-                Some(metadata.dev())
-            };
-            #[cfg(not(unix))]
-            let device_number: Option<u64> = None;
-            let output = json!({
-                "version": 1,
-                "path": canonical,
-                "filesystem_device_number": device_number,
-                "stable_fingerprint": null,
-                "fingerprint_status": "unavailable",
-                "note": "the filesystem device number is host-local and is not a durable device fingerprint",
-            });
+            let discovered = archive_ledger::discover_mounted_filesystem(path)?;
+            let output = json!({"version": 1, "mounted_filesystem": discovered});
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Mounted path: {}", canonical.display());
-                if let Some(number) = device_number {
-                    println!("  host-local filesystem device number: {number}");
+                println!("Path: {}", discovered.path.display());
+                println!("  mounted root: {}", discovered.mount_root.display());
+                println!(
+                    "  relative path: {}",
+                    if discovered.relative_path.as_os_str().is_empty() {
+                        ".".to_owned()
+                    } else {
+                        discovered.relative_path.display().to_string()
+                    }
+                );
+                if let (Some(kind), Some(fingerprint)) = (
+                    discovered.fingerprint_kind.as_deref(),
+                    discovered.filesystem_fingerprint.as_deref(),
+                ) {
+                    println!("  stable root identity: {kind} {fingerprint}");
+                } else {
+                    println!("  stable root identity: unavailable");
+                    println!("  this mount cannot prove independent storage");
                 }
-                println!("  stable fingerprint: unavailable");
-                println!("Use a filesystem UUID or hardware identifier with device add when one is available.");
             }
         }
         RegistryEntityCommand::List { all } => {
@@ -3509,6 +4123,7 @@ fn execute_registry(
                 RegistryChange::DeviceMount(DeviceMount {
                     mount_id: mount_id.clone(),
                     device_id: device_id.clone(),
+                    archive_root_id: None,
                     mount_root_uri: mount_root_uri.clone(),
                     status: status.clone(),
                     fingerprint_status: fingerprint_status.clone(),
@@ -3622,6 +4237,14 @@ fn build_registry_add(
                 display_name: name,
                 root_path_on_device: RegistryPath::utf8(required("--path", args.path.as_deref())?),
                 status: "active".to_owned(),
+                filesystem_fingerprint: args.fingerprint.clone(),
+                fingerprint_kind: args.fingerprint_kind.clone(),
+                identity_state: if args.fingerprint.is_some() && args.fingerprint_kind.is_some() {
+                    "confirmed"
+                } else {
+                    "unavailable"
+                }
+                .to_owned(),
             },
         ),
         RegistryKind::Location => {
