@@ -143,6 +143,16 @@ and 1,000 items; measurement may lower either bound. Writers build and validate
 one chunk in bounded memory, serialize it once, append and synchronize it, then
 advance local progress.
 
+Item schema 2 encodes `defaults` as an object keyed by item `kind`; each value is
+an object of fields common to that kind in this batch. The writer omits an
+explicit item field only when its JSON value exactly equals the corresponding
+kind default. During projection, defaults are materialized first and explicit
+item fields override them, so failures and other exceptions remain self-
+describing. `kind` itself cannot be defaulted. Defaults for one kind never enter
+another kind, unknown schemas fail closed, and schema-1 items remain explicit
+and rebuildable. This is semantic deduplication inside readable JSONL, not
+compression or an external dictionary.
+
 Chunk item indexes are zero-based and consecutive across the batch. The ordered
 item digest is BLAKE3 over the ASCII domain
 `archive-ledger-batch-items-v1\0`, followed for each chunk in order by its

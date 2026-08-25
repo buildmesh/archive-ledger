@@ -542,24 +542,49 @@ mod unix {
         assert_eq!(status["clients"].as_array().unwrap().len(), 2);
         assert_eq!(status["remotes"][0]["name"], "origin");
 
+        let content = temp.path().join("sync-content");
+        fs::create_dir(&content).unwrap();
         success(archive(&temp).args([
-            "site",
-            "add",
-            "--id",
-            "site_home",
+            "collection",
+            "init",
+            content.to_str().unwrap(),
             "--name",
+            "Files",
+            "--device",
+            "Desktop",
+            "--site",
             "Home",
-            "--kind",
-            "home",
+            "--allow-unidentified-root",
+            "--non-interactive",
         ]));
+        fs::write(content.join("one.txt"), b"one\n").unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        success(archive(&temp).args(["sync", "central"]));
         success(archive(&temp).arg("--archive").arg(&replica).args(["sync"]));
-        let sites = json(&success(
-            archive(&temp)
-                .arg("--archive")
-                .arg(&replica)
-                .args(["--json", "site", "list"]),
-        ));
-        assert_eq!(sites["items"][0]["display_name"], "Home");
+        let replica_database = rusqlite::Connection::open(replica.join("archive.db")).unwrap();
+        assert_eq!(
+            replica_database
+                .query_row("SELECT COUNT(*) FROM file_refs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            replica_database
+                .query_row(
+                    "SELECT COUNT(*) FROM verification_results WHERE result = 'ok'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

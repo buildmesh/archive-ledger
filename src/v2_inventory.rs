@@ -225,13 +225,26 @@ pub fn record_placements(
         .expect("non-empty pending placements have a first item");
     let append = store.append_batch(
         "copy_place",
-        1,
+        2,
         json!({
             "collection_id": first.collection_id,
             "location_id": first.location_id,
             "job_id": first.job_id,
         }),
-        json!({}),
+        json!({
+            "content_observed": {
+                "collection_id": first.collection_id,
+                "location_id": first.location_id,
+                "job_id": first.job_id,
+                "job_type": first.job_type,
+                "observed_time_utc_ms": observed_time,
+                "device_fingerprint_status": first.device_fingerprint_status,
+                "representation": "ordinary_file",
+                "item_type": "copy_claim",
+                "outcome_kind": "content_observed",
+                "duration_ms": 0,
+            }
+        }),
         items,
     )?;
     let apply = projection.apply(store)?;
@@ -1069,17 +1082,34 @@ pub fn add_files(
         "scan_id": config.scan_id,
         "job_id": config.job_id,
     });
+    let defaults = json!({
+        "content_observed": {
+            "collection_id": config.collection_id,
+            "location_id": config.location_id,
+            "job_id": config.job_id,
+            "scan_id": config.scan_id,
+            "job_type": job_type,
+            "observed_time_utc_ms": observed_time_utc_ms,
+            "device_fingerprint_status": config.device_fingerprint_status,
+            "representation": "ordinary_file",
+            "item_type": "copy_claim",
+            "outcome_kind": "content_observed",
+            "sha256_hex": null,
+            "external_identity_id": null,
+            "extension_hint": null,
+        }
+    });
     let append = if let Some(remote) = coordination_remote {
         store.append_coordinated_jsonl_batch(
             &remote,
             operation_kind,
-            1,
+            2,
             context,
-            json!({}),
+            defaults,
             &spool_path,
         )?
     } else {
-        store.append_jsonl_batch(operation_kind, 1, context, json!({}), &spool_path)?
+        store.append_jsonl_batch(operation_kind, 2, context, defaults, &spool_path)?
     };
     let apply = projection.apply(store)?;
     fs::remove_dir_all(&job_root)

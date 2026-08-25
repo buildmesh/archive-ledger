@@ -1255,6 +1255,9 @@ fn project_batch_start(
 ) -> Result<()> {
     let payload = object(&record.record.envelope.payload, "batch_start payload")?;
     let context = required(payload, "context")?;
+    let item_schema_version = number(payload, "item_schema_version")?;
+    let defaults = required(payload, "defaults")?;
+    validate_projected_item_defaults(item_schema_version, defaults)?;
     project_coordination_context(transaction, context, record, path)?;
     transaction.execute(
         "INSERT INTO batch_runs(batch_id, origin_id, operation_kind, item_schema_version, causal_frontier_hash, context_json, defaults_json, start_seq, last_chunk_seq, complete_seq, item_count, item_digest, state, negative_publication_state)
@@ -1263,13 +1266,10 @@ fn project_batch_start(
             record.record.envelope.batch_id,
             record.record.envelope.origin_id,
             string(payload, "operation_kind")?,
-            sql_i64(
-                number(payload, "item_schema_version")?,
-                "item schema version",
-            )?,
+            sql_i64(item_schema_version, "item schema version")?,
             string(payload, "causal_frontier_hash")?,
             serde_json::to_string(context)?,
-            serde_json::to_string(required(payload, "defaults")?)?,
+            serde_json::to_string(defaults)?,
             sql_i64(
                 record.record.envelope.origin_seq,
                 "batch start sequence",
@@ -1290,21 +1290,31 @@ fn project_batch_chunk(
     let items = required(payload, "items")?.as_array().ok_or_else(|| {
         V2ProjectionError::Invalid("batch chunk items must be an array".to_owned())
     })?;
-    let current: i64 = transaction
+    let (current, item_schema_version, defaults_json): (i64, i64, String) = transaction
         .query_row(
-            "SELECT item_count FROM batch_runs WHERE batch_id = ?1 AND state = 'running'",
+            "SELECT item_count, item_schema_version, defaults_json
+             FROM batch_runs WHERE batch_id = ?1 AND state = 'running'",
             [&record.record.envelope.batch_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|source| sqlite_error(path, source))?;
+    let item_schema_version = sql_u64(item_schema_version, "batch item schema version")?;
+    let defaults: Value = serde_json::from_str(&defaults_json)?;
+    validate_projected_item_defaults(item_schema_version, &defaults)?;
     if sql_u64(current, "batch item count")? != first {
         return Err(V2ProjectionError::Invalid(format!(
             "batch {} chunk range is not consecutive",
             record.record.envelope.batch_id
         )));
     }
-    for (offset, item) in items.iter().enumerate() {
-        let item = object(item, "batch item")?;
+    for (offset, raw_item) in items.iter().enumerate() {
+        let materialized;
+        let item = if item_schema_version == 1 {
+            object(raw_item, "batch item")?
+        } else {
+            materialized = materialize_batch_item(raw_item, &defaults)?;
+            &materialized
+        };
         let offset = u64::try_from(offset)
             .map_err(|_| V2ProjectionError::Invalid("batch item index overflow".to_owned()))?;
         let item_index = first
@@ -2969,6 +2979,46 @@ fn object<'a>(value: &'a Value, description: &str) -> Result<&'a serde_json::Map
         .ok_or_else(|| V2ProjectionError::Invalid(format!("{description} must be an object")))
 }
 
+fn validate_projected_item_defaults(item_schema_version: u64, defaults: &Value) -> Result<()> {
+    let defaults = object(defaults, "batch defaults")?;
+    match item_schema_version {
+        1 => Ok(()),
+        2 => {
+            for (kind, values) in defaults {
+                let values = object(values, &format!("defaults for item kind {kind:?}"))?;
+                if values.contains_key("kind") {
+                    return Err(V2ProjectionError::Invalid(format!(
+                        "defaults for item kind {kind:?} cannot default kind"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        version => Err(V2ProjectionError::Invalid(format!(
+            "unsupported batch item schema version {version}"
+        ))),
+    }
+}
+
+fn materialize_batch_item(
+    item: &Value,
+    defaults: &Value,
+) -> Result<serde_json::Map<String, Value>> {
+    let item = object(item, "batch item")?;
+    let kind = string(item, "kind")?;
+    let mut materialized = defaults
+        .as_object()
+        .and_then(|defaults| defaults.get(kind))
+        .map(|values| object(values, &format!("defaults for item kind {kind:?}")))
+        .transpose()?
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in item {
+        materialized.insert(key.clone(), value.clone());
+    }
+    Ok(materialized)
+}
+
 fn required<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a Value> {
     object
         .get(key)
@@ -3049,6 +3099,34 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn schema_two_materializes_defaults_and_preserves_exceptions() {
+        let defaults = json!({
+            "content_observed": {
+                "collection_id": "collection_files",
+                "representation": "ordinary_file",
+                "sha256_hex": null,
+            }
+        });
+        let item = json!({
+            "kind": "content_observed",
+            "representation": "annex_locked_symlink",
+            "file_ref_id": "file_one",
+        });
+
+        validate_projected_item_defaults(2, &defaults).unwrap();
+        let materialized = materialize_batch_item(&item, &defaults).unwrap();
+        assert_eq!(
+            materialized.get("collection_id").and_then(Value::as_str),
+            Some("collection_files")
+        );
+        assert_eq!(
+            materialized.get("representation").and_then(Value::as_str),
+            Some("annex_locked_symlink")
+        );
+        assert_eq!(materialized.get("sha256_hex"), Some(&Value::Null));
     }
 
     #[test]

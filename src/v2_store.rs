@@ -2032,6 +2032,7 @@ impl V2OriginStore {
     where
         I: Iterator<Item = Result<Value>>,
     {
+        validate_item_defaults(item_schema_version, &defaults)?;
         let origin_id = self.active_origin_id()?;
         let genesis_path = self.root.join("genesis.json");
         let genesis: SignedGenesis = parse_json(&genesis_path, &read_file(&genesis_path)?)?;
@@ -2116,8 +2117,8 @@ impl V2OriginStore {
                 "operation_kind": operation_kind,
                 "item_schema_version": item_schema_version,
                 "causal_frontier_hash": verified.accepted_frontier_hash,
-                "context": context,
-                "defaults": defaults
+                "context": &context,
+                "defaults": &defaults
             }),
         };
         let start_line = canonical_json(&start)?;
@@ -2159,7 +2160,7 @@ impl V2OriginStore {
                     }
                 };
                 let Some(item) = next else { break };
-                let item = item?;
+                let item = compact_batch_item(item?, item_schema_version, &defaults)?;
                 if !item.is_object() {
                     return Err(V2StoreError::Invalid(format!(
                         "batch item {item_index} is not a JSON object"
@@ -2484,6 +2485,62 @@ impl V2OriginStore {
             frontier_count: 2,
         })
     }
+}
+
+fn validate_item_defaults(item_schema_version: u32, defaults: &Value) -> Result<()> {
+    match item_schema_version {
+        1 => Ok(()),
+        2 => {
+            let defaults = defaults.as_object().ok_or_else(|| {
+                V2StoreError::Invalid("schema-2 batch defaults must be an object".to_owned())
+            })?;
+            for (kind, values) in defaults {
+                let values = values.as_object().ok_or_else(|| {
+                    V2StoreError::Invalid(format!(
+                        "schema-2 defaults for item kind {kind:?} must be an object"
+                    ))
+                })?;
+                if values.contains_key("kind") {
+                    return Err(V2StoreError::Invalid(format!(
+                        "schema-2 defaults for item kind {kind:?} cannot default kind"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        version => Err(V2StoreError::Invalid(format!(
+            "unsupported batch item schema version {version}"
+        ))),
+    }
+}
+
+fn compact_batch_item(item: Value, item_schema_version: u32, defaults: &Value) -> Result<Value> {
+    if item_schema_version == 1 {
+        return Ok(item);
+    }
+    let Value::Object(mut item) = item else {
+        return Err(V2StoreError::Invalid(
+            "schema-2 batch item must be an object".to_owned(),
+        ));
+    };
+    let kind = item
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| V2StoreError::Invalid("schema-2 batch item is missing kind".to_owned()))?
+        .to_owned();
+    let Some(kind_defaults) = defaults
+        .as_object()
+        .and_then(|defaults| defaults.get(&kind))
+        .and_then(Value::as_object)
+    else {
+        return Ok(Value::Object(item));
+    };
+    for (key, default) in kind_defaults {
+        if item.get(key) == Some(default) {
+            item.remove(key);
+        }
+    }
+    Ok(Value::Object(item))
 }
 
 pub fn is_v2_event_tree(root: impl AsRef<Path>) -> bool {
@@ -5157,6 +5214,54 @@ mod tests {
                 .filter(|record| record.record.envelope.record_kind == V2RecordKind::BatchChunk)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn schema_two_serializes_shared_item_defaults_once() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("archive");
+        initialize_v2_archive(&root, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(root.join("canonical")).unwrap();
+        let appended = store
+            .append_batch(
+                "inventory_add",
+                2,
+                json!({}),
+                json!({
+                    "content_observed": {
+                        "collection_id": "collection_files",
+                        "representation": "ordinary_file",
+                        "sha256_hex": null,
+                    }
+                }),
+                vec![json!({
+                    "kind": "content_observed",
+                    "collection_id": "collection_files",
+                    "representation": "annex_locked_symlink",
+                    "sha256_hex": null,
+                    "file_ref_id": "file_one",
+                })],
+            )
+            .unwrap();
+
+        let verified = store.verify().unwrap();
+        let chunk = verified
+            .records
+            .iter()
+            .find(|record| {
+                record.record.envelope.batch_id == appended.batch_id
+                    && record.record.envelope.record_kind == V2RecordKind::BatchChunk
+            })
+            .unwrap();
+        let item = chunk.record.envelope.payload["items"][0]
+            .as_object()
+            .unwrap();
+        assert!(!item.contains_key("collection_id"));
+        assert!(!item.contains_key("sha256_hex"));
+        assert_eq!(
+            item.get("representation").and_then(Value::as_str),
+            Some("annex_locked_symlink")
         );
     }
 
