@@ -21,7 +21,7 @@ use archive_ledger::{
     V2OriginStore, V2ProjectionDb, V2ProjectionError, V2Registry, V2StoreError,
 };
 use base64::Engine as _;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use fs2::available_space;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1050,6 +1050,8 @@ enum DeviceCommand {
         device: String,
         new_name: String,
     },
+    /// Confirm, correct, or explicitly withdraw Device hardware identity.
+    Identity(DeviceIdentityArgs),
     /// Record that a Device is now stored at another Site.
     Move {
         #[arg(
@@ -1092,6 +1094,30 @@ enum DeviceCommand {
         #[arg(long)]
         fingerprint_status: String,
     },
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("identity_action")
+        .required(true)
+        .multiple(false)
+        .args(["fingerprint", "unavailable", "conflict"])
+))]
+struct DeviceIdentityArgs {
+    /// Device display name or stable Archive Ledger ID.
+    device: String,
+    /// Stable hardware fingerprint value currently verified by the user.
+    #[arg(long, requires = "fingerprint_kind")]
+    fingerprint: Option<String>,
+    /// Hardware evidence kind, such as serial, wwn, nvme_eui64, or hardware_uuid.
+    #[arg(long = "kind", requires = "fingerprint")]
+    fingerprint_kind: Option<String>,
+    /// Explicitly record that stable Device identity is unavailable.
+    #[arg(long)]
+    unavailable: bool,
+    /// Mark previously recorded Device identity as conflicting or mismatched.
+    #[arg(long)]
+    conflict: bool,
 }
 
 #[derive(Debug, Args)]
@@ -4313,7 +4339,10 @@ fn v2_collection_risk(
                  LEFT JOIN devices d ON d.device_id = l.device_id AND d.status = 'active'
                  WHERE (
                        l.device_id IS NULL OR
-                       (d.device_id IS NOT NULL AND d.last_checkin_time_utc_ms >= ?4)
+                       (d.device_id IS NOT NULL
+                        AND d.identity_state = 'confirmed'
+                        AND d.last_fingerprint_status = 'match'
+                        AND d.last_checkin_time_utc_ms >= ?4)
                    )
              ), coverage AS (
                  SELECT object_id,
@@ -4445,7 +4474,10 @@ fn v2_collection_risk_with_findings(
              LEFT JOIN devices d ON d.device_id = l.device_id AND d.status = 'active'
              WHERE (
                    l.device_id IS NULL OR
-                   (d.device_id IS NOT NULL AND d.last_checkin_time_utc_ms >= ?4)
+                   (d.device_id IS NOT NULL
+                    AND d.identity_state = 'confirmed'
+                    AND d.last_fingerprint_status = 'match'
+                    AND d.last_checkin_time_utc_ms >= ?4)
                )
          ), coverage AS (
              SELECT object_id,
@@ -7231,6 +7263,7 @@ fn execute_v2_registry_command(
                 )?;
                 EXIT_OK
             }
+            DeviceCommand::Identity(args) => execute_v2_device_identity(cli, database, args)?,
             DeviceCommand::Move {
                 device_positional,
                 device_option,
@@ -10252,6 +10285,135 @@ fn execute_v2_location_status(
     Ok(EXIT_OK)
 }
 
+fn execute_v2_device_identity(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    args: &DeviceIdentityArgs,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let mut device = select_device(&state.devices, &args.device)?
+        .ok_or_else(|| AppError::Input(format!("Device not found: {:?}", args.device)))?;
+    let previous = device.clone();
+    let fingerprint_status;
+    if let (Some(value), Some(kind)) = (&args.fingerprint, &args.fingerprint_kind) {
+        let value = value.trim();
+        let kind = kind.trim().to_ascii_lowercase();
+        if value.is_empty() || kind.is_empty() {
+            return Err(AppError::Input(
+                "Device fingerprint kind and value must be non-empty".to_owned(),
+            ));
+        }
+        if is_archive_root_fingerprint_kind(&kind) {
+            return Err(AppError::Input(format!(
+                "{kind:?} identifies a filesystem/Archive Root, not a Device; use stable hardware evidence such as serial, wwn, nvme_eui64, or hardware_uuid"
+            )));
+        }
+        if let Some(existing) = state.devices.iter().find(|candidate| {
+            candidate.device_id != device.device_id
+                && candidate.status == "active"
+                && candidate.identity_state == "confirmed"
+                && candidate.fingerprint_kind.as_deref() == Some(kind.as_str())
+                && candidate.hardware_fingerprint.as_deref() == Some(value)
+        }) {
+            return Err(AppError::Input(format!(
+                "that hardware identity already belongs to Device {:?} ({}); reuse that Device for this storage, or confirm a stronger distinct hardware identity",
+                existing.display_name, existing.device_id
+            )));
+        }
+        device.hardware_fingerprint = Some(value.to_owned());
+        device.fingerprint_kind = Some(kind);
+        device.identity_state = "confirmed".to_owned();
+        fingerprint_status = "match";
+    } else if args.unavailable {
+        device.hardware_fingerprint = None;
+        device.fingerprint_kind = None;
+        device.identity_state = "unavailable".to_owned();
+        fingerprint_status = "unavailable";
+    } else if args.conflict {
+        if device.hardware_fingerprint.is_none() || device.fingerprint_kind.is_none() {
+            return Err(AppError::Input(
+                "cannot mark a Device identity conflict before any hardware identity has been recorded; use --unavailable or confirm stable hardware evidence"
+                    .to_owned(),
+            ));
+        }
+        device.identity_state = "conflict".to_owned();
+        fingerprint_status = "mismatch";
+    } else {
+        return Err(AppError::Input(
+            "choose a Device identity action".to_owned(),
+        ));
+    }
+
+    let store = V2OriginStore::open(cli.events_path())?;
+    let registry = V2Registry::new(&store, database);
+    let identity_result = registry.record(
+        RegistryChange::Device(RegistryAction::Update, device.clone()),
+        &cli.host,
+    )?;
+    let checkin_result = registry.record(
+        RegistryChange::DeviceCheckIn(DeviceCheckIn {
+            device_id: device.device_id.clone(),
+            fingerprint_status: fingerprint_status.to_owned(),
+        }),
+        &cli.host,
+    )?;
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "device": device,
+                "previous_identity": {
+                    "state": previous.identity_state,
+                    "fingerprint_kind": previous.fingerprint_kind,
+                    "hardware_fingerprint": previous.hardware_fingerprint,
+                },
+                "fingerprint_status": fingerprint_status,
+                "identity_update": identity_result,
+                "check_in": checkin_result,
+                "archive_root_identity_unchanged": true,
+            }))?
+        );
+    } else {
+        println!("Device: {}", device.display_name);
+        println!("Identity: {}", device.identity_state);
+        if let (Some(kind), Some(value)) = (
+            device.fingerprint_kind.as_deref(),
+            device.hardware_fingerprint.as_deref(),
+        ) {
+            println!("Hardware evidence: {kind} {value}");
+        } else {
+            println!("Hardware evidence: unavailable");
+        }
+        match device.identity_state.as_str() {
+            "confirmed" => println!(
+                "Recorded a current match. Policy may now count this Device when its Copy evidence also qualifies."
+            ),
+            "conflict" => println!(
+                "This Device will not count as independent protection until its identity conflict is resolved."
+            ),
+            _ => println!(
+                "This Device will not count as independent protection while hardware identity is unavailable."
+            ),
+        }
+        println!("Archive Root filesystem/partition identity was not changed.");
+    }
+    Ok(EXIT_OK)
+}
+
+fn is_archive_root_fingerprint_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "filesystem_uuid"
+            | "filesystem_label"
+            | "partition_uuid"
+            | "partition_label"
+            | "mount_path"
+            | "path"
+    )
+}
+
 fn execute_v2_device_status(
     cli: &Cli,
     database: &V2ProjectionDb,
@@ -10282,6 +10444,11 @@ fn execute_v2_device_status(
         .iter()
         .filter(|item| item.device_id.as_deref() == Some(&device.device_id))
         .collect::<Vec<_>>();
+    let archive_roots = state
+        .archive_roots
+        .iter()
+        .filter(|root| root.device_id == device.device_id && root.status == "active")
+        .collect::<Vec<_>>();
     let location_metrics = locations
         .iter()
         .map(|location| {
@@ -10308,22 +10475,50 @@ fn execute_v2_device_status(
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"version": 2, "device": device, "site": site, "locations": locations.iter().map(|location| json!({"location": location, "metrics": location_metrics.get(&location.location_id)})).collect::<Vec<_>>(), "file_count": total_files, "space_used_bytes": total_bytes, "stale_presence_count": total_stale, "free_space_bytes": free_space_bytes, "capacity_status": capacity_status})
+                &json!({"version": 2, "device": device, "site": site, "archive_roots": archive_roots, "locations": locations.iter().map(|location| json!({"location": location, "metrics": location_metrics.get(&location.location_id)})).collect::<Vec<_>>(), "file_count": total_files, "space_used_bytes": total_bytes, "stale_presence_count": total_stale, "free_space_bytes": free_space_bytes, "capacity_status": capacity_status})
             )?
         );
     } else {
         println!("Device: {}", device.display_name);
-        println!(
-            "Identifier: {}",
-            device
-                .hardware_fingerprint
-                .as_deref()
-                .unwrap_or("unavailable")
-        );
+        match (
+            device.identity_state.as_str(),
+            device.fingerprint_kind.as_deref(),
+            device.hardware_fingerprint.as_deref(),
+        ) {
+            ("confirmed", Some(kind), Some(value)) => {
+                println!("Device identity: confirmed ({kind} {value})")
+            }
+            (state, Some(kind), Some(value)) => {
+                println!("Device identity: {state} ({kind} {value})")
+            }
+            (state, _, _) => println!("Device identity: {state}"),
+        }
         println!(
             "Site: {}",
             site.map_or("unknown", |item| item.display_name.as_str())
         );
+        println!("Archive Roots:");
+        if archive_roots.is_empty() {
+            println!("  None.");
+        }
+        for root in &archive_roots {
+            match (
+                root.fingerprint_kind.as_deref(),
+                root.filesystem_fingerprint.as_deref(),
+            ) {
+                (Some(kind), Some(value)) => println!(
+                    "  {} — {} ({kind} {value})",
+                    root.display_name, root.identity_state
+                ),
+                _ => println!("  {} — {}", root.display_name, root.identity_state),
+            }
+        }
+        if device.identity_state != "confirmed" {
+            println!(
+                "Next: archive device identity {} --kind KIND --fingerprint VALUE",
+                shell_quote(&device.display_name)
+            );
+        }
         println!("Files in Locations: {total_files}");
         println!("Space used: {}", format_bytes(total_bytes));
         println!("Stale presence: {total_stale}");
@@ -10365,7 +10560,10 @@ fn v2_device_capacity(
         })
         .collect::<Vec<_>>();
     if roots.is_empty() {
-        return Ok((None, "Device identity is not confirmed".to_owned()));
+        return Ok((
+            None,
+            "Archive Root filesystem identity is not confirmed".to_owned(),
+        ));
     }
     let connection = Connection::open(database.path())
         .map_err(|error| AppError::Input(format!("cannot read Device mounts: {error}")))?;
@@ -11167,6 +11365,9 @@ fn execute_device(
         DeviceCommand::Rename { device, new_name } => {
             execute_registry_rename(cli, database, RegistryKind::Device, device, new_name)
         }
+        DeviceCommand::Identity(_) => Err(AppError::Input(
+            "Device identity confirmation requires a version 2 Archive".to_owned(),
+        )),
         DeviceCommand::Move {
             device_positional,
             device_option,

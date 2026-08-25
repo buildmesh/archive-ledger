@@ -1101,6 +1101,11 @@ mod unix {
         ])));
         assert_eq!(device_status["file_count"], 2);
         assert_eq!(device_status["space_used_bytes"], 8);
+        assert_eq!(device_status["device"]["identity_state"], "unavailable");
+        let human_device_status = success(archive(&temp).args(["device", "status", "Test Device"]));
+        let human_device_status = String::from_utf8_lossy(&human_device_status.stdout);
+        assert!(human_device_status.contains("Device identity: unavailable"));
+        assert!(human_device_status.contains("archive device identity"));
         let site_status = json(&success(
             archive(&temp).args(["--json", "site", "status", "Home"]),
         ));
@@ -1118,9 +1123,123 @@ mod unix {
         );
         assert_eq!(
             risk["collections"][0]["findings"][0]["qualifying_copies"],
+            0
+        );
+        assert_eq!(risk["collections"][0]["findings"][0]["sites"], 0);
+
+        let root_before = json(&success(archive(&temp).args(["--json", "root", "list"])));
+        let confirmed = json(&success(archive(&temp).args([
+            "--json",
+            "device",
+            "identity",
+            "Test Device",
+            "--kind",
+            "serial",
+            "--fingerprint",
+            "TEST-DEVICE-001",
+        ])));
+        assert_eq!(confirmed["device"]["identity_state"], "confirmed");
+        assert_eq!(confirmed["fingerprint_status"], "match");
+        assert_eq!(confirmed["archive_root_identity_unchanged"], true);
+        let root_after = json(&success(archive(&temp).args(["--json", "root", "list"])));
+        assert_eq!(root_before["items"], root_after["items"]);
+        let confirmed_risk = archive(&temp)
+            .args(["--json", "report", "risk", "--collection", "Files"])
+            .output()
+            .unwrap();
+        assert_eq!(confirmed_risk.status.code(), Some(10));
+        let confirmed_risk = json(&confirmed_risk);
+        assert_eq!(
+            confirmed_risk["collections"][0]["findings"][0]["qualifying_copies"],
             1
         );
-        assert_eq!(risk["collections"][0]["findings"][0]["sites"], 1);
+
+        success(archive(&temp).args([
+            "device",
+            "add",
+            "--id",
+            "device_clone",
+            "--name",
+            "Possible clone",
+            "--kind",
+            "disk",
+        ]));
+        let before_collision = json(&success(
+            archive(&temp).args(["--json", "events", "verify"]),
+        ));
+        let collision = archive(&temp)
+            .args([
+                "device",
+                "identity",
+                "Possible clone",
+                "--kind",
+                "serial",
+                "--fingerprint",
+                "TEST-DEVICE-001",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(collision.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&collision.stderr).contains("already belongs"));
+        let after_collision = json(&success(
+            archive(&temp).args(["--json", "events", "verify"]),
+        ));
+        assert_eq!(before_collision["records"], after_collision["records"]);
+
+        let conflict = json(&success(archive(&temp).args([
+            "--json",
+            "device",
+            "identity",
+            "Test Device",
+            "--conflict",
+        ])));
+        assert_eq!(conflict["device"]["identity_state"], "conflict");
+        assert_eq!(conflict["fingerprint_status"], "mismatch");
+        let conflict_risk = json(
+            &archive(&temp)
+                .args(["--json", "report", "risk", "--collection", "Files"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            conflict_risk["collections"][0]["findings"][0]["qualifying_copies"],
+            0
+        );
+        let unavailable = json(&success(archive(&temp).args([
+            "--json",
+            "device",
+            "identity",
+            "Test Device",
+            "--unavailable",
+        ])));
+        assert_eq!(unavailable["device"]["identity_state"], "unavailable");
+        assert!(unavailable["device"]["hardware_fingerprint"].is_null());
+        assert_eq!(unavailable["fingerprint_status"], "unavailable");
+        success(archive(&temp).args([
+            "device",
+            "identity",
+            "Test Device",
+            "--kind",
+            "serial",
+            "--fingerprint",
+            "TEST-DEVICE-001",
+        ]));
+
+        let root_identity = archive(&temp)
+            .args([
+                "device",
+                "identity",
+                "Possible clone",
+                "--kind",
+                "filesystem_uuid",
+                "--fingerprint",
+                "root-uuid",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(root_identity.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&root_identity.stderr)
+            .contains("identifies a filesystem/Archive Root"));
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         database
             .execute("UPDATE copy_claims SET last_seen_time_utc_ms = 0", [])

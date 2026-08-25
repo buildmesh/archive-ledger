@@ -164,6 +164,24 @@ archive collection init /srv/archive/documents \
 An unidentified removable filesystem can only be reused from matching prior mount evidence. A
 mount path alone is never silently promoted to durable Device identity.
 
+Filesystem/partition UUID evidence identifies the Archive Root, not the physical Device. Confirm
+Device independence separately with stable hardware evidence that you have checked on the current
+machine or drive:
+
+```bash
+archive device status "Main computer"
+archive device identity "Main computer" \
+  --kind hardware_uuid --fingerprint '<hardware UUID>'
+# Typical external-drive evidence kinds include serial, wwn, and nvme_eui64.
+```
+
+Do not use a filesystem UUID, partition UUID, label, or mount path as the Device fingerprint. If
+the platform exposes no trustworthy hardware identity, keep that uncertainty explicit with
+`archive device identity <device> --unavailable`. If recorded evidence is cloned or no longer
+matches, use `--conflict`; the Device then stops qualifying as independent protection until a
+stronger identity is confirmed. Confirmation records a current manual identity check-in, while
+Archive Root identity remains unchanged.
+
 ## Add files and reconcile a Location
 
 Setup registers topology but does not enumerate ordinary content. Add present files from the
@@ -309,8 +327,9 @@ archive collection add . --collection "Documents"
 ```
 
 One Device may have several Locations, and several Devices together may contain every Object. If a
-removable filesystem is later mounted elsewhere, its UUID identifies the same Archive Root and
-Device.
+removable filesystem is later mounted elsewhere, its UUID identifies the same Archive Root, which
+remains associated with its registered Device; that UUID is never treated as Device hardware
+identity.
 
 Record a physical Site move without changing stable IDs:
 

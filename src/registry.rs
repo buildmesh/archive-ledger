@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -1132,16 +1132,60 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
                     "invalid expected_availability".to_owned(),
                 ));
             }
-            if value.identity_state == "confirmed"
-                && (value
-                    .hardware_fingerprint
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-                    || value.fingerprint_kind.as_deref().is_none_or(str::is_empty))
-            {
+            let fingerprint = value
+                .hardware_fingerprint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let fingerprint_kind = value
+                .fingerprint_kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if fingerprint.is_some() != fingerprint_kind.is_some() {
                 return Err(RegistryError::Invalid(
-                    "confirmed devices require fingerprint kind and value".to_owned(),
+                    "device fingerprint kind and value must be supplied together".to_owned(),
                 ));
+            }
+            match value.identity_state.as_str() {
+                "confirmed" | "conflict" if fingerprint.is_none() || fingerprint_kind.is_none() => {
+                    return Err(RegistryError::Invalid(format!(
+                        "{} devices require fingerprint kind and value",
+                        value.identity_state
+                    )));
+                }
+                "unavailable" if fingerprint.is_some() => {
+                    return Err(RegistryError::Invalid(
+                        "unavailable Device identity cannot retain a hardware fingerprint"
+                            .to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            if fingerprint_kind.is_some_and(is_archive_root_fingerprint_kind) {
+                return Err(RegistryError::Invalid(
+                    "filesystem, partition, and mount-path fingerprints identify Archive Roots, not Devices"
+                        .to_owned(),
+                ));
+            }
+            if value.identity_state == "confirmed" {
+                let duplicate: Option<(String, String)> = connection
+                    .query_row(
+                        "SELECT device_id, display_name FROM devices
+                         WHERE device_id != ?1 AND status = 'active'
+                           AND identity_state = 'confirmed'
+                           AND fingerprint_kind = ?2 AND hardware_fingerprint = ?3
+                         LIMIT 1",
+                        params![value.device_id, fingerprint_kind, fingerprint],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|source| sqlite_error(path, source))?;
+                if let Some((device_id, display_name)) = duplicate {
+                    return Err(RegistryError::Invalid(format!(
+                        "hardware identity already belongs to Device {display_name:?} ({device_id})"
+                    )));
+                }
             }
             if *action == RegistryAction::Update || *action == RegistryAction::Move {
                 let current_site: Option<String> = connection
@@ -1382,6 +1426,18 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
     }
     Ok(())
+}
+
+fn is_archive_root_fingerprint_kind(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "filesystem_uuid"
+            | "filesystem_label"
+            | "partition_uuid"
+            | "partition_label"
+            | "mount_path"
+            | "path"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1821,6 +1877,66 @@ mod tests {
                 "host_test",
             )
             .unwrap();
+        let root_identity_as_device = registry
+            .record(
+                RegistryChange::Device(
+                    RegistryAction::Update,
+                    DeviceSnapshot {
+                        device_id: "device_main".to_owned(),
+                        display_name: "Main Computer".to_owned(),
+                        device_kind: "computer".to_owned(),
+                        serial_hint: None,
+                        hardware_fingerprint: Some("filesystem-root-id".to_owned()),
+                        fingerprint_kind: Some("filesystem_uuid".to_owned()),
+                        identity_state: "confirmed".to_owned(),
+                        owner: None,
+                        status: "active".to_owned(),
+                        current_site_id: Some("site_home".to_owned()),
+                        expected_availability: "online".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap_err();
+        assert_eq!(root_identity_as_device.code(), "registry_invalid");
+        let confirmed_device = DeviceSnapshot {
+            device_id: "device_main".to_owned(),
+            display_name: "Main Computer".to_owned(),
+            device_kind: "computer".to_owned(),
+            serial_hint: None,
+            hardware_fingerprint: Some("hardware-1".to_owned()),
+            fingerprint_kind: Some("serial".to_owned()),
+            identity_state: "confirmed".to_owned(),
+            owner: None,
+            status: "active".to_owned(),
+            current_site_id: Some("site_home".to_owned()),
+            expected_availability: "online".to_owned(),
+        };
+        registry
+            .record(
+                RegistryChange::Device(RegistryAction::Update, confirmed_device.clone()),
+                "host_test",
+            )
+            .unwrap();
+        let mut inconsistent_device = confirmed_device.clone();
+        inconsistent_device.identity_state = "unavailable".to_owned();
+        let inconsistent = registry
+            .record(
+                RegistryChange::Device(RegistryAction::Update, inconsistent_device),
+                "host_test",
+            )
+            .unwrap_err();
+        assert_eq!(inconsistent.code(), "registry_invalid");
+        let mut duplicate_device = confirmed_device;
+        duplicate_device.device_id = "device_duplicate".to_owned();
+        duplicate_device.display_name = "Duplicate".to_owned();
+        let duplicate = registry
+            .record(
+                RegistryChange::Device(RegistryAction::Register, duplicate_device),
+                "host_test",
+            )
+            .unwrap_err();
+        assert_eq!(duplicate.code(), "registry_invalid");
         registry
             .record(
                 RegistryChange::ArchiveRoot(
