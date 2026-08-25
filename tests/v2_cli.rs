@@ -957,6 +957,70 @@ mod unix {
         assert_eq!(second["summary"]["new_paths"], 0);
         assert_eq!(second["summary"]["confirmed_good"], 2);
 
+        let first_page = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "find",
+            "--collection",
+            "Files",
+            "--limit",
+            "1",
+        ])));
+        assert_eq!(first_page["version"], 2);
+        assert_eq!(first_page["items"].as_array().unwrap().len(), 1);
+        let first_file_id = first_page["items"][0]["file_ref_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let continuation = first_page["next"].as_str().unwrap();
+        let second_page = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "find",
+            "--collection",
+            "Files",
+            "--limit",
+            "1",
+            "--continue",
+            continuation,
+        ])));
+        assert_eq!(second_page["items"].as_array().unwrap().len(), 1);
+        assert_ne!(second_page["items"][0]["file_ref_id"], first_file_id);
+        assert!(second_page["next"].is_null());
+        let prefix = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "find",
+            "--collection",
+            "Files",
+            "--prefix",
+            "nested",
+        ])));
+        assert_eq!(prefix["items"].as_array().unwrap().len(), 1);
+        assert_eq!(prefix["items"][0]["logical_path"]["text"], "nested/two.bin");
+        let shown = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "show",
+            &first_file_id,
+        ])));
+        assert_eq!(shown["version"], 2);
+        assert_eq!(shown["file_review"]["file"]["file_ref_id"], first_file_id);
+        assert_eq!(
+            shown["file_review"]["copies"].as_array().unwrap().len(),
+            2,
+            "duplicate-content paths expose the same two physical claims",
+        );
+        assert_eq!(shown["file_review"]["copies_truncated"], false);
+        let human = success(archive(&temp).args(["file", "show", &first_file_id]));
+        assert!(String::from_utf8_lossy(&human.stdout).contains("Copies:"));
+        let missing = archive(&temp)
+            .args(["--json", "file", "show", "file_missing"])
+            .output()
+            .unwrap();
+        assert_eq!(missing.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("not_found"));
+
         let archive_status = archive(&temp).args(["--json", "status"]).output().unwrap();
         assert_eq!(archive_status.status.code(), Some(10));
         let archive_status = json(&archive_status);
@@ -1073,6 +1137,23 @@ mod unix {
         ])));
         assert_eq!(scanned["status"], "complete");
         assert_eq!(scanned["summary"]["missing_paths"], 1);
+
+        let stale_page = archive(&temp)
+            .args([
+                "--json",
+                "file",
+                "find",
+                "--collection",
+                "Files",
+                "--limit",
+                "1",
+                "--continue",
+                continuation,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(stale_page.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&stale_page.stderr).contains("stale_continuation"));
 
         success(archive(&temp).args(["db", "rebuild"]));
         let rebuilt = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();

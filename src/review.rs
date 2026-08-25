@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::discovery::{EncodedPath, PathEncoding};
 use crate::projection::{ProjectionDb, ProjectionError};
+use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 
 const OUTPUT_VERSION: u32 = 1;
 const TOKEN_VERSION: u32 = 1;
@@ -22,6 +23,9 @@ pub type Result<T> = std::result::Result<T, ReviewError>;
 pub enum ReviewError {
     #[error(transparent)]
     Projection(#[from] ProjectionError),
+
+    #[error(transparent)]
+    V2Projection(#[from] V2ProjectionError),
 
     #[error("SQLite operation failed for {path}: {source}")]
     Sqlite {
@@ -50,6 +54,7 @@ impl ReviewError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Projection(error) => error.code(),
+            Self::V2Projection(error) => error.code(),
             Self::Sqlite { .. } => "review_sqlite",
             Self::InvalidLimit => "invalid_limit",
             Self::InvalidContinuation => "invalid_continuation",
@@ -192,6 +197,7 @@ pub struct FileReview {
     pub external_namespace: Option<String>,
     pub external_key: Option<String>,
     pub copies: Vec<CopyReview>,
+    pub copies_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -288,33 +294,40 @@ impl ProjectionDb {
             .map_err(|_| ReviewError::InvalidContinuation)?;
         let mut statement = connection
             .prepare(
-                "SELECT f.file_ref_id, f.collection_id, c.display_name,
+                "WITH object_copy_metrics AS (
+                    SELECT object_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NOT NULL
+                    GROUP BY object_id
+                 ), external_copy_metrics AS (
+                    SELECT external_identity_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NULL
+                      AND external_identity_id IS NOT NULL
+                    GROUP BY external_identity_id
+                 )
+                 SELECT f.file_ref_id, f.collection_id, c.display_name,
                         f.logical_path_encoding, f.logical_path_bytes,
                         f.logical_path_display, f.identity_state, f.object_id,
                         f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
-                        (SELECT COUNT(*) FROM copy_claims cc
-                         WHERE ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                             OR (f.object_id IS NULL AND f.external_identity_id IS NOT NULL
-                                 AND cc.external_identity_id = f.external_identity_id))
-                           AND cc.state != 'superseded'),
-                        (SELECT COUNT(*) FROM copy_claims cc
-                         WHERE ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                             OR (f.object_id IS NULL AND f.external_identity_id IS NOT NULL
-                                 AND cc.external_identity_id = f.external_identity_id))
-                           AND cc.state = 'present'),
-                        (SELECT MAX(cc.last_seen_time_utc_ms) FROM copy_claims cc
-                         WHERE ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                             OR (f.object_id IS NULL AND f.external_identity_id IS NOT NULL
-                                 AND cc.external_identity_id = f.external_identity_id))
-                           AND cc.state != 'superseded'),
-                        (SELECT MAX(cc.last_verified_time_utc_ms) FROM copy_claims cc
-                         WHERE ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                             OR (f.object_id IS NULL AND f.external_identity_id IS NOT NULL
-                                 AND cc.external_identity_id = f.external_identity_id))
-                           AND cc.state != 'superseded')
+                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
+                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
+                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
+                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
                  FROM file_refs f
                  JOIN collections c ON c.collection_id = f.collection_id
                  LEFT JOIN objects o ON o.object_id = f.object_id
+                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
+                 LEFT JOIN external_copy_metrics em
+                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
                  WHERE f.path_state = 'active'
                    AND (?1 IS NULL OR f.collection_id = ?1)
                    AND (?2 IS NULL OR (f.logical_path_encoding = ?2 AND f.logical_path_bytes = ?3))
@@ -380,29 +393,40 @@ impl ProjectionDb {
         let connection = open(self.path())?;
         let file = connection
             .query_row(
-                "SELECT f.file_ref_id, f.collection_id, c.display_name,
+                "WITH object_copy_metrics AS (
+                    SELECT object_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NOT NULL
+                    GROUP BY object_id
+                 ), external_copy_metrics AS (
+                    SELECT external_identity_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NULL
+                      AND external_identity_id IS NOT NULL
+                    GROUP BY external_identity_id
+                 )
+                 SELECT f.file_ref_id, f.collection_id, c.display_name,
                         f.logical_path_encoding, f.logical_path_bytes,
                         f.logical_path_display, f.identity_state, f.object_id,
                         f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
-                        (SELECT COUNT(*) FROM copy_claims cc
-                         WHERE cc.state != 'superseded' AND
-                           ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                            OR (f.object_id IS NULL AND cc.external_identity_id = f.external_identity_id))),
-                        (SELECT COUNT(*) FROM copy_claims cc
-                         WHERE cc.state = 'present' AND
-                           ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                            OR (f.object_id IS NULL AND cc.external_identity_id = f.external_identity_id))),
-                        (SELECT MAX(cc.last_seen_time_utc_ms) FROM copy_claims cc
-                         WHERE cc.state != 'superseded' AND
-                           ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                            OR (f.object_id IS NULL AND cc.external_identity_id = f.external_identity_id))),
-                        (SELECT MAX(cc.last_verified_time_utc_ms) FROM copy_claims cc
-                         WHERE cc.state != 'superseded' AND
-                           ((f.object_id IS NOT NULL AND cc.object_id = f.object_id)
-                            OR (f.object_id IS NULL AND cc.external_identity_id = f.external_identity_id)))
+                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
+                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
+                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
+                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
                  FROM file_refs f
                  JOIN collections c ON c.collection_id = f.collection_id
                  LEFT JOIN objects o ON o.object_id = f.object_id
+                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
+                 LEFT JOIN external_copy_metrics em
+                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
                  WHERE f.file_ref_id = ?1",
                 [file_ref_id],
                 file_summary_from_row,
@@ -452,17 +476,24 @@ impl ProjectionDb {
                    AND ((?1 IS NOT NULL AND cc.object_id = ?1)
                      OR (?1 IS NULL AND ?2 IS NOT NULL AND cc.external_identity_id = ?2))
                  ORDER BY l.display_name, cc.relative_path_encoding,
-                          cc.relative_path_bytes, cc.copy_claim_id",
+                          cc.relative_path_bytes, cc.copy_claim_id
+                 LIMIT ?3",
             )
             .map_err(|source| sqlite_error(self.path(), source))?;
-        let copies = statement
+        let mut copies = statement
             .query_map(
-                params![file.object_id, file.external_identity_id],
+                params![
+                    file.object_id,
+                    file.external_identity_id,
+                    i64::try_from(MAX_PAGE_SIZE + 1).unwrap_or(i64::MAX),
+                ],
                 copy_review_from_row,
             )
             .map_err(|source| sqlite_error(self.path(), source))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|source| sqlite_error(self.path(), source))?;
+        let copies_truncated = copies.len() > MAX_PAGE_SIZE;
+        copies.truncate(MAX_PAGE_SIZE);
         Ok(FileReview {
             version: OUTPUT_VERSION,
             applied_event_seq,
@@ -470,6 +501,7 @@ impl ProjectionDb {
             external_namespace,
             external_key,
             copies,
+            copies_truncated,
         })
     }
 
@@ -771,6 +803,250 @@ impl ProjectionDb {
     }
 }
 
+impl V2ProjectionDb {
+    pub fn find_files(&self, request: FilePageRequest) -> Result<FilePage> {
+        validate_limit(request.limit)?;
+        validate_filter(&request.filter)?;
+        let status = self.status()?;
+        let applied_event_seq = status.records;
+        let query_hash = file_query_hash_at(&request.filter, &status.applied_frontier_hash);
+        let cursor = request
+            .continuation
+            .as_deref()
+            .map(decode_file_token)
+            .transpose()?;
+        if cursor.as_ref().is_some_and(|cursor| {
+            cursor.applied_event_seq != applied_event_seq || cursor.query_hash != query_hash
+        }) {
+            return Err(ReviewError::StaleContinuation);
+        }
+
+        let connection = open(self.path())?;
+        let prefix_upper = request
+            .filter
+            .path_prefix
+            .as_ref()
+            .and_then(|path| exclusive_prefix_end(&path.bytes));
+        let cursor_bytes = cursor
+            .as_ref()
+            .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.path_bytes))
+            .transpose()
+            .map_err(|_| ReviewError::InvalidContinuation)?;
+        let mut statement = connection
+            .prepare(
+                "WITH object_copy_metrics AS (
+                    SELECT object_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NOT NULL
+                    GROUP BY object_id
+                 ), external_copy_metrics AS (
+                    SELECT external_identity_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NULL
+                      AND external_identity_id IS NOT NULL
+                    GROUP BY external_identity_id
+                 )
+                 SELECT f.file_ref_id, f.collection_id, c.display_name,
+                        f.logical_path_encoding, f.logical_path_bytes,
+                        f.logical_path_display, f.identity_state, f.object_id,
+                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
+                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
+                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
+                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
+                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
+                 FROM file_refs f
+                 JOIN collections c ON c.collection_id = f.collection_id
+                 LEFT JOIN objects o ON o.object_id = f.object_id
+                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
+                 LEFT JOIN external_copy_metrics em
+                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
+                 WHERE f.path_state = 'active'
+                   AND (?1 IS NULL OR f.collection_id = ?1)
+                   AND (?2 IS NULL OR (f.logical_path_encoding = ?2 AND f.logical_path_bytes = ?3))
+                   AND (?4 IS NULL OR (f.logical_path_encoding = ?4
+                        AND f.logical_path_bytes >= ?5
+                        AND (?6 IS NULL OR f.logical_path_bytes < ?6)))
+                   AND (?7 IS NULL OR f.identity_state = ?7)
+                   AND (?8 IS NULL OR f.object_id = ?8)
+                   AND (?9 IS NULL OR f.external_identity_id = ?9)
+                   AND (?10 IS NULL OR (f.collection_id, f.logical_path_encoding,
+                        f.logical_path_bytes, f.file_ref_id) > (?10, ?11, ?12, ?13))
+                 ORDER BY f.collection_id, f.logical_path_encoding,
+                          f.logical_path_bytes, f.file_ref_id
+                 LIMIT ?14",
+            )
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let exact = request.filter.exact_path.as_ref();
+        let prefix = request.filter.path_prefix.as_ref();
+        let rows = statement
+            .query_map(
+                params![
+                    request.filter.collection_id,
+                    exact.map(|path| path.encoding.as_str()),
+                    exact.map(|path| path.bytes.as_slice()),
+                    prefix.map(|path| path.encoding.as_str()),
+                    prefix.map(|path| path.bytes.as_slice()),
+                    prefix_upper,
+                    request.filter.identity_state,
+                    request.filter.object_id,
+                    request.filter.external_identity_id,
+                    cursor.as_ref().map(|cursor| cursor.collection_id.as_str()),
+                    cursor.as_ref().map(|cursor| cursor.path_encoding.as_str()),
+                    cursor_bytes,
+                    cursor.as_ref().map(|cursor| cursor.file_ref_id.as_str()),
+                    i64::try_from(request.limit + 1).unwrap_or(i64::MAX),
+                ],
+                file_summary_from_row,
+            )
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let mut items = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let has_more = items.len() > request.limit;
+        items.truncate(request.limit);
+        let next = if has_more {
+            items
+                .last()
+                .map(|item| encode_file_token(item, applied_event_seq, &query_hash))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(FilePage {
+            version: 2,
+            applied_event_seq,
+            items,
+            next,
+        })
+    }
+
+    pub fn review_file(&self, file_ref_id: &str) -> Result<FileReview> {
+        let status = self.status()?;
+        let applied_event_seq = status.records;
+        let connection = open(self.path())?;
+        let file = connection
+            .query_row(
+                "WITH object_copy_metrics AS (
+                    SELECT object_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NOT NULL
+                    GROUP BY object_id
+                 ), external_copy_metrics AS (
+                    SELECT external_identity_id,
+                           COUNT(*) AS current_copy_count,
+                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
+                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
+                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
+                    FROM copy_claims
+                    WHERE state != 'superseded' AND object_id IS NULL
+                      AND external_identity_id IS NOT NULL
+                    GROUP BY external_identity_id
+                 )
+                 SELECT f.file_ref_id, f.collection_id, c.display_name,
+                        f.logical_path_encoding, f.logical_path_bytes,
+                        f.logical_path_display, f.identity_state, f.object_id,
+                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
+                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
+                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
+                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
+                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
+                 FROM file_refs f
+                 JOIN collections c ON c.collection_id = f.collection_id
+                 LEFT JOIN objects o ON o.object_id = f.object_id
+                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
+                 LEFT JOIN external_copy_metrics em
+                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
+                 WHERE f.file_ref_id = ?1",
+                [file_ref_id],
+                file_summary_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(self.path(), source))?
+            .ok_or_else(|| ReviewError::NotFound {
+                kind: "file",
+                id: file_ref_id.to_owned(),
+            })?;
+        let (external_namespace, external_key) = file
+            .external_identity_id
+            .as_ref()
+            .map(|id| {
+                connection
+                    .query_row(
+                        "SELECT namespace, external_key FROM external_identities
+                         WHERE external_identity_id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+            })
+            .transpose()
+            .map_err(|source| sqlite_error(self.path(), source))?
+            .flatten()
+            .map_or((None, None), |(namespace, key)| {
+                (Some(namespace), Some(key))
+            });
+        let mut statement = connection
+            .prepare(
+                "SELECT cc.copy_claim_id, cc.state, cc.claim_basis,
+                        cc.relative_path_encoding, cc.relative_path_bytes,
+                        cc.relative_path_display, l.location_id, l.display_name,
+                        l.kind, l.status, l.archive_root_id, ar.display_name,
+                        l.device_id, d.display_name, d.identity_state,
+                        COALESCE(l.site_id, d.current_site_id), s.display_name,
+                        l.encryption_state, l.trust_level, l.expected_availability,
+                        cc.last_seen_time_utc_ms, cc.last_verified_time_utc_ms,
+                        cc.last_verification_result, cc.last_error_code, cc.last_error_detail
+                 FROM copy_claims cc
+                 JOIN locations l ON l.location_id = cc.location_id
+                 LEFT JOIN archive_roots ar ON ar.archive_root_id = l.archive_root_id
+                 LEFT JOIN devices d ON d.device_id = l.device_id
+                 LEFT JOIN sites s ON s.site_id = COALESCE(l.site_id, d.current_site_id)
+                 WHERE cc.state != 'superseded'
+                   AND ((?1 IS NOT NULL AND cc.object_id = ?1)
+                     OR (?1 IS NULL AND ?2 IS NOT NULL AND cc.external_identity_id = ?2))
+                 ORDER BY l.display_name, cc.relative_path_encoding,
+                          cc.relative_path_bytes, cc.copy_claim_id
+                 LIMIT ?3",
+            )
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let mut copies = statement
+            .query_map(
+                params![
+                    file.object_id,
+                    file.external_identity_id,
+                    i64::try_from(MAX_PAGE_SIZE + 1).unwrap_or(i64::MAX),
+                ],
+                copy_review_from_row,
+            )
+            .map_err(|source| sqlite_error(self.path(), source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let copies_truncated = copies.len() > MAX_PAGE_SIZE;
+        copies.truncate(MAX_PAGE_SIZE);
+        Ok(FileReview {
+            version: 2,
+            applied_event_seq,
+            file,
+            external_namespace,
+            external_key,
+            copies,
+            copies_truncated,
+        })
+    }
+}
+
 fn history_query(
     database: &ProjectionDb,
     column: &'static str,
@@ -894,6 +1170,10 @@ fn validate_filter(filter: &FileFilter) -> Result<()> {
 }
 
 fn file_query_hash(filter: &FileFilter) -> String {
+    file_query_hash_at(filter, "")
+}
+
+fn file_query_hash_at(filter: &FileFilter, projection_snapshot: &str) -> String {
     let path = |path: &Option<EncodedPath>| {
         path.as_ref().map(|path| {
             json!({
@@ -910,6 +1190,7 @@ fn file_query_hash(filter: &FileFilter) -> String {
             "identity_state": filter.identity_state,
             "object_id": filter.object_id,
             "external_identity_id": filter.external_identity_id,
+            "projection_snapshot": projection_snapshot,
         }))
         .expect("file query shape is serializable")
         .as_bytes(),

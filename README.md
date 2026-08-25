@@ -411,7 +411,7 @@ archive c ls
 archive l ls
 archive d ls
 archive s ls
-archive file find --collection <documents-collection-id> --limit 100
+archive file find --collection "Documents" --limit 100
 archive file show <file-id>
 ```
 
@@ -429,7 +429,10 @@ Unavailable or unconfirmed facts are shown explicitly rather than guessed.
 
 File and copy lists use stable continuations, so directories with thousands of entries and
 Collections with hundreds of thousands of Files remain reviewable without running the equivalent
-of `ls` or loading the full result in memory.
+of `ls` or loading the full result in memory. `file find` accepts a Collection name or stable ID
+and supports `--exact` and `--prefix` logical-path filters. `file show` reports the exact total
+Copy count and returns at most 1,000 detailed Copy rows; JSON sets `copies_truncated` when more
+rows exist.
 
 Risk reports automatically refresh missing or stale derived assessments from SQLite; they never
 scan storage or replay canonical history. Review the starter Policy and simulated loss results:
@@ -613,7 +616,7 @@ output remains the default. Setup commands have explicit non-interactive flags:
 ```bash
 archive --json status
 archive --json report stale-presence --locations
-archive --json file find --collection <documents-collection-id> --limit 100
+archive --json file find --collection "Documents" --limit 100
 
 archive collection init /srv/archive/documents \
   --name "Documents" --device "Main computer" --site "Home" \

@@ -1881,6 +1881,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         return execute_v2_status(cli);
     }
     if let Ok(database) = V2ProjectionDb::open_existing(cli.database_path()) {
+        if let Command::File { command } = &cli.command {
+            return execute_v2_file(&database, command, cli.json);
+        }
         if let Some(result) = execute_v2_registry_command(cli, &database)? {
             return Ok(result);
         }
@@ -13756,6 +13759,126 @@ fn execute_file(
                     println!("More history: rerun with --after-seq {next}");
                 }
             }
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn execute_v2_file(
+    database: &V2ProjectionDb,
+    command: &FileCommand,
+    as_json: bool,
+) -> Result<u8, AppError> {
+    match command {
+        FileCommand::Find(args) => {
+            let collection_id = args
+                .collection
+                .as_deref()
+                .map(|selector| {
+                    let state = database.registry_state(false)?;
+                    select_collection(&state.collections, selector)?.ok_or_else(|| {
+                        AppError::Input(format!("Collection not found: {selector:?}"))
+                    })
+                })
+                .transpose()?
+                .map(|collection| collection.collection_id);
+            let page = database.find_files(FilePageRequest {
+                filter: FileFilter {
+                    collection_id,
+                    exact_path: args.exact.clone().map(utf8_path),
+                    path_prefix: args.prefix.clone().map(utf8_path),
+                    identity_state: args.identity_state.clone(),
+                    ..FileFilter::default()
+                },
+                limit: args.limit,
+                continuation: args.continuation.clone(),
+            })?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&page)?);
+            } else if page.items.is_empty() {
+                println!("No Files matched.");
+            } else {
+                for file in &page.items {
+                    println!(
+                        "{}  [{}]  {} present / {} known copies  {}",
+                        file.logical_path.display,
+                        file.collection_name,
+                        file.present_copy_count,
+                        file.current_copy_count,
+                        file.identity_state
+                    );
+                    println!(
+                        "  file: {}  object: {}",
+                        file.file_ref_id,
+                        file.object_id.as_deref().unwrap_or("unresolved")
+                    );
+                }
+                if let Some(next) = page.next {
+                    println!("More results: rerun with --continue {next}");
+                }
+            }
+        }
+        FileCommand::Show { file_ref_id } => {
+            let review = database.review_file(file_ref_id)?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "version": 2,
+                        "file_review": review,
+                    }))?
+                );
+            } else {
+                println!(
+                    "{}  [{}]",
+                    review.file.logical_path.display, review.file.collection_name
+                );
+                println!("  File: {}", review.file.file_ref_id);
+                println!("  Identity: {}", review.file.identity_state);
+                println!(
+                    "  Object: {}",
+                    review.file.object_id.as_deref().unwrap_or("unresolved")
+                );
+                if let (Some(namespace), Some(key)) =
+                    (&review.external_namespace, &review.external_key)
+                {
+                    println!("  External identity: {namespace}:{key}");
+                }
+                if review.copies.is_empty() {
+                    println!("  Copies: none currently observed");
+                } else {
+                    println!("  Copies:");
+                    for copy in &review.copies {
+                        println!(
+                            "    {} — {} ({})",
+                            copy.location_name, copy.state, copy.copy_claim_id
+                        );
+                        println!(
+                            "      Device/Site: {} / {}",
+                            copy.device_name.as_deref().unwrap_or("service"),
+                            copy.site_name.as_deref().unwrap_or("unknown")
+                        );
+                        println!(
+                            "      Last seen: {}  verified: {} ({})",
+                            optional_time(copy.last_seen_time_utc_ms),
+                            optional_time(copy.last_verified_time_utc_ms),
+                            copy.last_verification_result.as_deref().unwrap_or("never")
+                        );
+                    }
+                    if review.copies_truncated {
+                        println!(
+                            "  Showing the first {} of {} current Copy claims.",
+                            review.copies.len(),
+                            review.file.current_copy_count
+                        );
+                    }
+                }
+            }
+        }
+        FileCommand::History { .. } => {
+            return Err(AppError::Input(
+                "file history is not yet available for version 2 Archives".to_owned(),
+            ));
         }
     }
     Ok(EXIT_OK)
