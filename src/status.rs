@@ -52,6 +52,8 @@ pub struct CollectionStatus {
     pub location_count: u64,
     pub violated_files: Option<u64>,
     pub uncertain_files: Option<u64>,
+    pub files_at_risk: Option<u64>,
+    pub locations: Vec<LocationStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -63,6 +65,7 @@ pub struct LocationStatus {
     pub device_name: Option<String>,
     pub site_id: Option<String>,
     pub site_name: Option<String>,
+    pub relative_path_display: Option<String>,
     pub logical_file_count: u64,
     pub present_count: u64,
     pub present_bytes: u64,
@@ -74,6 +77,10 @@ pub struct LocationStatus {
     pub unknown_bytes: u64,
     pub unresolved_present_count: u64,
     pub unresolved_missing_count: u64,
+    pub stale_presence_count: Option<u64>,
+    pub stale_presence_minimum_age_days: Option<u64>,
+    pub stale_presence_maximum_age_days: Option<u64>,
+    pub stale_presence_policy_complete: bool,
     pub last_complete_inventory_utc_ms: Option<u64>,
     pub last_verification_utc_ms: Option<u64>,
 }
@@ -143,6 +150,15 @@ struct LocationIdentity {
     device_name: Option<String>,
     site_id: Option<String>,
     site_name: Option<String>,
+    relative_path_display: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeviceMountStatus {
+    pub mount_root_uri: String,
+    pub archive_root_id: Option<String>,
+    pub fingerprint_status: String,
+    pub observed_time_utc_ms: u64,
 }
 
 struct StaleLocationRow {
@@ -233,6 +249,8 @@ impl ProjectionDb {
             location_count: unsigned(location_count),
             violated_files: risk.map(|risk| unsigned(risk.0)),
             uncertain_files: risk.map(|risk| unsigned(risk.1)),
+            files_at_risk: risk.map(|risk| unsigned(risk.0)),
+            locations: Vec::new(),
         })
     }
 
@@ -242,7 +260,8 @@ impl ProjectionDb {
         let identity: Option<LocationIdentity> = connection
             .query_row(
                 "SELECT l.display_name, l.device_id, d.display_name,
-                        COALESCE(l.site_id, d.current_site_id), s.display_name
+                        COALESCE(l.site_id, d.current_site_id), s.display_name,
+                        l.relative_path_display
                  FROM locations l
                  LEFT JOIN devices d ON d.device_id = l.device_id
                  LEFT JOIN sites s ON s.site_id = COALESCE(l.site_id, d.current_site_id)
@@ -255,6 +274,7 @@ impl ProjectionDb {
                         device_name: row.get(2)?,
                         site_id: row.get(3)?,
                         site_name: row.get(4)?,
+                        relative_path_display: row.get(5)?,
                     })
                 },
             )
@@ -314,6 +334,7 @@ impl ProjectionDb {
             device_name: identity.device_name,
             site_id: identity.site_id,
             site_name: identity.site_name,
+            relative_path_display: identity.relative_path_display,
             logical_file_count: unsigned(logical_file_count),
             present_count: unsigned(copy_counts[0]),
             present_bytes: unsigned(copy_counts[1]),
@@ -325,9 +346,111 @@ impl ProjectionDb {
             unknown_bytes: unsigned(copy_counts[7]),
             unresolved_present_count: unsigned(unresolved_present_count),
             unresolved_missing_count: unsigned(unresolved_missing_count),
+            stale_presence_count: None,
+            stale_presence_minimum_age_days: None,
+            stale_presence_maximum_age_days: None,
+            stale_presence_policy_complete: false,
             last_complete_inventory_utc_ms,
             last_verification_utc_ms,
         })
+    }
+
+    pub fn collection_location_ids(&self, collection_id: &str) -> Result<Vec<String>> {
+        let connection =
+            Connection::open(self.path()).map_err(|source| sql(self.path(), source))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT l.location_id
+                 FROM locations l
+                 WHERE l.status = 'active' AND (
+                   EXISTS (
+                     SELECT 1 FROM path_observations po
+                     JOIN file_refs f ON f.file_ref_id = po.file_ref_id
+                     WHERE po.location_id = l.location_id
+                       AND f.collection_id = ?1 AND f.path_state = 'active'
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM annex_imports ai
+                     WHERE ai.location_id = l.location_id
+                       AND ai.collection_id = ?1 AND ai.status = 'complete'
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM scan_runs sr
+                     WHERE sr.location_id = l.location_id
+                       AND sr.collection_id = ?1
+                       AND sr.status IN ('running', 'complete', 'partial')
+                   )
+                 )
+                 ORDER BY l.display_name, l.location_id",
+            )
+            .map_err(|source| sql(self.path(), source))?;
+        let location_ids = statement
+            .query_map([collection_id], |row| row.get(0))
+            .map_err(|source| sql(self.path(), source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sql(self.path(), source))?;
+        Ok(location_ids)
+    }
+
+    pub fn location_collection_ids(&self, location_id: &str) -> Result<Vec<String>> {
+        let connection =
+            Connection::open(self.path()).map_err(|source| sql(self.path(), source))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT c.collection_id
+                 FROM collections c
+                 WHERE c.status = 'active' AND (
+                   EXISTS (
+                     SELECT 1 FROM file_refs f
+                     JOIN path_observations po ON po.file_ref_id = f.file_ref_id
+                     WHERE f.collection_id = c.collection_id
+                       AND f.path_state = 'active' AND po.location_id = ?1
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM annex_imports ai
+                     WHERE ai.collection_id = c.collection_id
+                       AND ai.location_id = ?1 AND ai.status = 'complete'
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM scan_runs sr
+                     WHERE sr.collection_id = c.collection_id
+                       AND sr.location_id = ?1
+                       AND sr.status IN ('running', 'complete', 'partial')
+                   )
+                 )
+                 ORDER BY c.display_name, c.collection_id",
+            )
+            .map_err(|source| sql(self.path(), source))?;
+        let collection_ids = statement
+            .query_map([location_id], |row| row.get(0))
+            .map_err(|source| sql(self.path(), source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sql(self.path(), source))?;
+        Ok(collection_ids)
+    }
+
+    pub fn latest_device_mount(&self, device_id: &str) -> Result<Option<DeviceMountStatus>> {
+        let connection =
+            Connection::open(self.path()).map_err(|source| sql(self.path(), source))?;
+        connection
+            .query_row(
+                "SELECT mount_root_uri, archive_root_id, fingerprint_status,
+                        observed_time_utc_ms
+                 FROM device_mounts
+                 WHERE device_id = ?1 AND status = 'mounted'
+                 ORDER BY observed_time_utc_ms DESC, mount_id DESC LIMIT 1",
+                [device_id],
+                |row| {
+                    Ok(DeviceMountStatus {
+                        mount_root_uri: row.get(0)?,
+                        archive_root_id: row.get(1)?,
+                        fingerprint_status: row.get(2)?,
+                        observed_time_utc_ms: unsigned(row.get(3)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| sql(self.path(), source))
     }
 
     pub fn stale_presence_report(

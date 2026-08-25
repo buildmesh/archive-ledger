@@ -203,6 +203,24 @@ pub(crate) struct ScanKnownEntry {
     pub modified_time_utc_ms: Option<u64>,
     pub has_effective_missing_candidate: bool,
     pub observed_by_current_scan: bool,
+    pub representation: String,
+    pub external_identity_id: Option<String>,
+    pub external_key: Option<String>,
+    pub expected_hash_algo: Option<String>,
+    pub expected_hash_hex: Option<String>,
+    pub expected_size_bytes: Option<u64>,
+    pub resolved_object_id: Option<String>,
+    pub local_annex_repo_id: Option<String>,
+    pub local_annex_availability_state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanKnownCopy {
+    pub copy_claim_id: String,
+    pub state: String,
+    pub object_id: Option<String>,
+    pub external_identity_id: Option<String>,
+    pub has_effective_missing_candidate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -572,6 +590,25 @@ impl ProjectionDb {
             .map_err(|source| sqlite_error(&self.path, source))
     }
 
+    pub fn location_has_completed_annex_import(
+        &self,
+        collection_id: &str,
+        location_id: &str,
+    ) -> Result<bool> {
+        let connection = self.open_connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM annex_imports
+                    WHERE collection_id = ?1 AND location_id = ?2
+                      AND status = 'complete'
+                 )",
+                params![collection_id, location_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
     pub(crate) fn validate_scan_topology(
         &self,
         collection_id: &str,
@@ -692,26 +729,36 @@ impl ProjectionDb {
             .map_err(|source| sqlite_error(&self.path, source))
     }
 
-    pub(crate) fn scan_change_counts(&self, scan_id: &str) -> Result<(u64, u64)> {
+    pub(crate) fn scan_observation_counts(&self, scan_id: &str) -> Result<(u64, u64, u64)> {
         let connection = self.open_connection()?;
-        let (new_paths, changed_paths): (i64, i64) = connection
+        let (new_paths, changed_paths, integrity_verified_paths): (i64, i64, i64) = connection
             .query_row(
                 "SELECT
                     COALESCE(SUM(CASE WHEN p.first_seen_event_id = e.event_id THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN p.first_seen_event_id != e.event_id THEN 1 ELSE 0 END), 0)
+                    COALESCE(SUM(CASE WHEN p.first_seen_event_id != e.event_id THEN 1 ELSE 0 END), 0),
+                    (SELECT COUNT(DISTINCT verified.file_ref_id)
+                     FROM events verified
+                     WHERE verified.event_type = 'copy_verified'
+                       AND json_extract(verified.payload_json, '$.result') = 'ok'
+                       AND verified.job_id = (
+                         SELECT job_id FROM scan_runs WHERE scan_id = ?1
+                       ))
                  FROM events e
                  JOIN path_observations p
                    ON p.file_ref_id = e.file_ref_id AND p.location_id = e.location_id
                   AND p.last_seen_event_id = e.event_id
                  WHERE e.event_type = 'path_observed'
-                   AND json_extract(e.payload_json, '$.scan_id') = ?1",
+                   AND e.job_id = (
+                     SELECT job_id FROM scan_runs WHERE scan_id = ?1
+                   )",
                 [scan_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
         Ok((
             u64::try_from(new_paths).unwrap_or(0),
             u64::try_from(changed_paths).unwrap_or(0),
+            u64::try_from(integrity_verified_paths).unwrap_or(0),
         ))
     }
 
@@ -838,9 +885,11 @@ impl ProjectionDb {
                     params![scan_id, job_id, collection_id, location_id, exclusions_json],
                 )
                 .map_err(|source| sqlite_error(&self.path, source))?;
-            // Keep copy_claims as the outer loop. With a regular JOIN, SQLite
-            // may scan every location path against every copy before applying
-            // the path equality, which becomes quadratic on large locations.
+            // Keep copy_claims as the outer loop. Annex content copies live at
+            // their object-store paths, not at the collection's logical paths,
+            // so associate them through the shared external identity. Ordinary
+            // copies continue to use the exact path association. The correlated
+            // EXISTS also avoids a quadratic path-by-copy join on large locations.
             transaction
                 .execute(
                     "INSERT INTO job_items(
@@ -853,13 +902,23 @@ impl ProjectionDb {
                             c.relative_path_display, 'pending',
                             (SELECT started_time_utc_ms FROM scan_runs WHERE scan_id = ?1)
                      FROM copy_claims c
-                     CROSS JOIN path_observations p
-                       ON p.location_id = c.location_id
-                      AND p.observed_path_encoding = c.relative_path_encoding
-                      AND p.observed_path_bytes = c.relative_path_bytes
-                     JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-                     WHERE f.collection_id = ?3 AND f.path_state = 'active'
-                       AND c.location_id = ?4 AND c.state IN ('present', 'corrupt', 'unknown')
+                     WHERE c.location_id = ?4 AND c.state IN ('present', 'corrupt', 'unknown')
+                       AND (
+                           EXISTS (
+                               SELECT 1
+                               FROM path_observations p
+                               JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+                               WHERE p.location_id = c.location_id
+                                 AND p.observed_path_encoding = c.relative_path_encoding
+                                 AND p.observed_path_bytes = c.relative_path_bytes
+                                 AND f.collection_id = ?3 AND f.path_state = 'active'
+                           )
+                           OR (c.external_identity_id IS NOT NULL AND EXISTS (
+                               SELECT 1 FROM file_refs f
+                               WHERE f.external_identity_id = c.external_identity_id
+                                 AND f.collection_id = ?3 AND f.path_state = 'active'
+                           ))
+                       )
                        AND NOT EXISTS (
                            SELECT 1 FROM job_items seen
                            WHERE seen.job_id = ?2 AND seen.item_type = 'scan_seen'
@@ -1314,10 +1373,29 @@ impl ScanProjectionSession {
                                     AND m.candidate_event_seq > last_path_event.seq)
                                 OR (m.candidate_kind = 'copy' AND m.copy_claim_id = c.copy_claim_id
                                     AND m.candidate_event_seq > c.state_event_seq))
-                        )
+                        ),
+                        p.representation, f.external_identity_id, x.external_key,
+                        x.expected_hash_algo, x.expected_hash_hex, x.expected_size_bytes,
+                        COALESCE(f.object_id, x.object_id),
+                        (SELECT a.source_repo_id
+                         FROM external_availability a
+                         WHERE a.external_identity_id = f.external_identity_id
+                           AND a.location_id = p.location_id
+                           AND a.source_repo_id = a.source_remote_id
+                         ORDER BY a.observed_time_utc_ms DESC
+                         LIMIT 1),
+                        (SELECT a.state
+                         FROM external_availability a
+                         WHERE a.external_identity_id = f.external_identity_id
+                           AND a.location_id = p.location_id
+                           AND a.source_repo_id = a.source_remote_id
+                         ORDER BY a.observed_time_utc_ms DESC
+                         LIMIT 1)
                  FROM path_observations p
                  JOIN file_refs f ON f.file_ref_id = p.file_ref_id
                  JOIN events last_path_event ON last_path_event.event_id = p.last_seen_event_id
+                 LEFT JOIN external_identities x
+                   ON x.external_identity_id = f.external_identity_id
                  LEFT JOIN copy_claims c
                    ON c.location_id = p.location_id
                   AND c.relative_path_encoding = p.observed_path_encoding
@@ -1346,6 +1424,53 @@ impl ScanProjectionSession {
                             modified_time_utc_ms: optional_u64(row.get(5)?)?,
                             observed_by_current_scan: row.get(6)?,
                             has_effective_missing_candidate: row.get(7)?,
+                            representation: row.get(8)?,
+                            external_identity_id: row.get(9)?,
+                            external_key: row.get(10)?,
+                            expected_hash_algo: row.get(11)?,
+                            expected_hash_hex: row.get(12)?,
+                            expected_size_bytes: optional_u64(row.get(13)?)?,
+                            resolved_object_id: row.get(14)?,
+                            local_annex_repo_id: row.get(15)?,
+                            local_annex_availability_state: row.get(16)?,
+                        })
+                    },
+                )
+            })
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+
+    pub(crate) fn known_copy(
+        &self,
+        scan_id: &str,
+        location_id: &str,
+        path: &EncodedPath,
+    ) -> Result<Option<ScanKnownCopy>> {
+        self.connection
+            .prepare_cached(
+                "SELECT copy_claim_id, state, object_id, external_identity_id,
+                        EXISTS(
+                            SELECT 1 FROM scan_missing_candidates m
+                            WHERE m.scan_id = ?1 AND m.location_id = c.location_id
+                              AND m.candidate_kind = 'copy'
+                              AND m.copy_claim_id = c.copy_claim_id
+                              AND m.candidate_event_seq > c.state_event_seq
+                        )
+                 FROM copy_claims c
+                 WHERE location_id = ?2 AND relative_path_encoding = ?3
+                   AND relative_path_bytes = ?4 AND state != 'superseded'",
+            )
+            .and_then(|mut statement| {
+                statement.query_row(
+                    params![scan_id, location_id, path.encoding.as_str(), path.bytes],
+                    |row| {
+                        Ok(ScanKnownCopy {
+                            copy_claim_id: row.get(0)?,
+                            state: row.get(1)?,
+                            object_id: row.get(2)?,
+                            external_identity_id: row.get(3)?,
+                            has_effective_missing_candidate: row.get(4)?,
                         })
                     },
                 )
@@ -4189,235 +4314,6 @@ mod tests {
 
     fn summary_event(number: u64) -> EventRequest {
         EventRequest::new("job_started", json!({ "number": number }))
-    }
-
-    #[test]
-    fn archive_display_name_replays_legacy_initialization_and_rename() {
-        let temp = TempDir::new().unwrap();
-        let store = event_store(&temp, 100);
-        store
-            .append(EventRequest::new(
-                "archive_initialized",
-                json!({"archive_id": "arc_test"}),
-            ))
-            .unwrap();
-        let database = database(&temp, ProjectionConfig::default());
-        database.apply(&store).unwrap();
-        assert_eq!(database.status().unwrap().archive_display_name, "arc_test");
-
-        store
-            .append(EventRequest::new(
-                "archive_updated",
-                json!({"archive_id": "arc_test", "display_name": "Personal"}),
-            ))
-            .unwrap();
-        database.apply(&store).unwrap();
-        assert_eq!(database.status().unwrap().archive_display_name, "Personal");
-    }
-
-    #[test]
-    fn schema_v5_contains_every_specified_table_tier() {
-        assert_eq!(parent_directory(Path::new("archive.db")), Path::new("."));
-        let temp = TempDir::new().unwrap();
-        let database = database(&temp, ProjectionConfig::default());
-        let connection = database.open_connection().unwrap();
-        let mut statement = connection
-            .prepare(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-            )
-            .unwrap();
-        let actual: BTreeSet<String> = statement
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let expected: BTreeSet<String> = [
-            "archive_meta",
-            "events",
-            "objects",
-            "object_hashes",
-            "external_identities",
-            "external_availability",
-            "collections",
-            "file_refs",
-            "path_observations",
-            "devices",
-            "device_mounts",
-            "device_site_history",
-            "archive_roots",
-            "sites",
-            "locations",
-            "risk_domains",
-            "entity_risk_domains",
-            "copy_claims",
-            "scan_runs",
-            "scan_missing_candidates",
-            "verification_results",
-            "policies",
-            "checkpoints",
-            "metadata_destinations",
-            "checkpoint_replications",
-            "annex_imports",
-            "annex_remotes",
-            "operation_outcomes",
-            "jobs",
-            "job_items",
-            "policy_evaluations",
-            "policy_status",
-            "policy_rollup",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        assert_eq!(actual, expected);
-        assert_eq!(database.status().unwrap().schema_version, 5);
-    }
-
-    #[test]
-    fn opening_a_v4_projection_migrates_transactionally_to_v5() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("archive.db");
-        let mut connection = Connection::open(&path).unwrap();
-        let transaction = connection.transaction().unwrap();
-        transaction.execute_batch(SCHEMA_V4).unwrap();
-        initialize_meta(&transaction, "arc_migrate").unwrap();
-        transaction
-            .execute(
-                "UPDATE archive_meta SET value = '4' WHERE key = 'schema_version'",
-                [],
-            )
-            .unwrap();
-        transaction
-            .execute_batch(
-                "INSERT INTO sites(site_id, display_name, site_kind, status, last_event_id)
-                 VALUES ('site_migrate', 'Site', 'site', 'active', 'event_seed');
-                 INSERT INTO collections(collection_id, display_name, status, last_event_id)
-                 VALUES ('collection_migrate', 'Collection', 'active', 'event_seed');
-                 INSERT INTO devices(
-                   device_id, display_name, device_kind, identity_state, status,
-                   current_site_id, expected_availability, last_event_id
-                 ) VALUES (
-                   'device_migrate', 'Device', 'disk', 'unavailable', 'active',
-                   'site_migrate', 'intermittent', 'event_seed'
-                 );
-                 INSERT INTO archive_roots(
-                   archive_root_id, device_id, display_name, root_path_on_device_bytes,
-                   root_path_encoding, root_path_display, status, created_event_id
-                 ) VALUES (
-                   'root_migrate', 'device_migrate', 'Root', X'2f', 'utf8', '/',
-                   'active', 'event_seed'
-                 );
-                 INSERT INTO locations(
-                   location_id, display_name, kind, archive_root_id, relative_path_bytes,
-                   relative_path_encoding, relative_path_display, device_id,
-                   expected_availability, is_writable, status, created_event_id, last_event_id
-                 ) VALUES
-                   ('location_work', 'Worktree', 'filesystem', 'root_migrate', X'',
-                    'utf8', '', 'device_migrate', 'intermittent', 1, 'active',
-                    'event_seed', 'event_seed'),
-                   ('location_cas', 'CAS', 'filesystem', 'root_migrate', X'2e676974',
-                    'utf8', '.git', 'device_migrate', 'intermittent', 1, 'active',
-                    'event_seed', 'event_seed');
-                 INSERT INTO annex_imports(
-                   import_id, repo_path_bytes, repo_path_encoding, repo_path_display,
-                   collection_id, worktree_location_id, cas_location_id, device_id,
-                   archive_root_id, status, summary_json, started_event_id
-                 ) VALUES (
-                   'import_migrate', X'2f7265706f', 'utf8', '/repo',
-                   'collection_migrate', 'location_work', 'location_cas',
-                   'device_migrate', 'root_migrate', 'complete', '{}', 'event_seed'
-                 );",
-            )
-            .unwrap();
-        transaction.commit().unwrap();
-        drop(connection);
-
-        let database = ProjectionDb::open_existing(&path, ProjectionConfig::default()).unwrap();
-        assert_eq!(database.status().unwrap().schema_version, 5);
-        let connection = Connection::open(&path).unwrap();
-        let root_columns = connection
-            .prepare("PRAGMA table_info(archive_roots)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<rusqlite::Result<BTreeSet<_>>>()
-            .unwrap();
-        assert!(root_columns.contains("filesystem_fingerprint"));
-        assert!(root_columns.contains("fingerprint_kind"));
-        assert!(root_columns.contains("identity_state"));
-        let annex_columns = connection
-            .prepare("PRAGMA table_info(annex_imports)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<rusqlite::Result<BTreeSet<_>>>()
-            .unwrap();
-        assert!(annex_columns.contains("location_id"));
-        assert!(annex_columns.contains("legacy_worktree_location_id"));
-        assert!(annex_columns.contains("legacy_cas_location_id"));
-        assert!(!annex_columns.contains("worktree_location_id"));
-        let migrated_import: (String, Option<String>, Option<String>) = connection
-            .query_row(
-                "SELECT location_id, legacy_worktree_location_id,
-                        legacy_cas_location_id
-                 FROM annex_imports WHERE import_id = 'import_migrate'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            migrated_import,
-            (
-                "location_work".to_owned(),
-                Some("location_work".to_owned()),
-                Some("location_cas".to_owned())
-            )
-        );
-    }
-
-    #[test]
-    fn failed_v5_migration_leaves_the_v4_projection_usable() {
-        let temp = TempDir::new().unwrap();
-        let path = temp.path().join("archive.db");
-        let mut connection = Connection::open(&path).unwrap();
-        let transaction = connection.transaction().unwrap();
-        transaction.execute_batch(SCHEMA_V4).unwrap();
-        initialize_meta(&transaction, "arc_migrate_failure").unwrap();
-        transaction
-            .execute(
-                "UPDATE archive_meta SET value = '4' WHERE key = 'schema_version'",
-                [],
-            )
-            .unwrap();
-        transaction
-            .execute(
-                "CREATE INDEX archive_roots_confirmed_fingerprint ON sites(site_id)",
-                [],
-            )
-            .unwrap();
-        transaction.commit().unwrap();
-        drop(connection);
-
-        let error = ProjectionDb::open_existing(&path, ProjectionConfig::default()).unwrap_err();
-        assert_eq!(error.code(), "projection_sqlite");
-        let connection = Connection::open(&path).unwrap();
-        assert_eq!(meta_required(&connection, "schema_version").unwrap(), "4");
-        let has_identity_column: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM pragma_table_info('archive_roots') WHERE name = 'identity_state'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!has_identity_column);
-        assert_eq!(
-            connection
-                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-                .unwrap(),
-            "ok"
-        );
     }
 
     #[test]

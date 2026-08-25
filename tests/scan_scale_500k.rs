@@ -10,7 +10,7 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 #[test]
-#[ignore = "explicit 500k complete-scan and missing-activation scale gate"]
+#[ignore = "superseded v1 scan gate; replace after v2 scan batches project"]
 fn complete_scan_and_atomic_missing_activation_scale_gate() {
     let file_count: usize = std::env::var("ARCHIVE_LEDGER_SCAN_SCALE_FILES")
         .ok()
@@ -149,6 +149,10 @@ fn complete_scan_and_atomic_missing_activation_scale_gate() {
         directory_size(store.root()),
         fs::metadata(database.path()).unwrap().len(),
     );
+    if std::env::var_os("ARCHIVE_LEDGER_SCALE_KEEP").is_some() {
+        let kept = temp.keep();
+        eprintln!("scan_scale_artifacts={}", kept.display());
+    }
 }
 
 fn scanner<'a>(

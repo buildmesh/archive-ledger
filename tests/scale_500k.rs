@@ -11,7 +11,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 #[test]
-#[ignore = "explicit 500k-file scale gate"]
+#[ignore = "superseded v1 500k gate; replace with the v2 batch/projection scale gate"]
 fn discovery_projection_checkpoint_and_rebuild_scale_gate() {
     let file_count: usize = std::env::var("ARCHIVE_LEDGER_SCALE_FILES")
         .ok()
@@ -161,10 +161,14 @@ fn discovery_projection_checkpoint_and_rebuild_scale_gate() {
         fs::metadata(&database_path).unwrap().len(),
         fs::metadata(&rebuild_path).unwrap().len(),
     );
+    if std::env::var_os("ARCHIVE_LEDGER_SCALE_KEEP").is_some() {
+        let kept = temp.keep();
+        eprintln!("scale_artifacts={}", kept.display());
+    }
 }
 
 #[test]
-#[ignore = "explicit 500k stale-presence SQLite rollup scale gate"]
+#[ignore = "superseded v1 stale-presence gate; replace after v2 risk projection"]
 fn stale_presence_rollup_scale_gate() {
     let file_count: usize = std::env::var("ARCHIVE_LEDGER_STALE_SCALE_FILES")
         .ok()

@@ -7,8 +7,18 @@ Archive Ledger is a local-first command-line catalog for answering three practic
 - Which files could be permanently lost if a disk, site, account, or shared dependency fails?
 
 It inventories ordinary directories and git-annex repositories, verifies bytes, evaluates backup
-policy and disaster risks, and protects its own catalog history. It does not copy, move, delete,
-repair, or drop archive content.
+policy and disaster risks, protects its own catalog history, and can make verified copies between
+registered Locations. It does not move, delete, repair, or drop archive content.
+
+> Development status: new Archives use the signed version 2 event tree and a
+> rebuildable schema-6 SQLite projection. Setup, inventory, git-annex import,
+> Location scanning and verification, staging, verified copy, resumable jobs,
+> status, risk reporting, enrollment, verified Git synchronization, and portable
+> snapshot clone and layered catalog `fsck` use the v2 path. Topology-aware
+> metadata protection reporting and destructive content operations remain under
+> development. Keep
+> an independent backup of each Archive's canonical event tree and do not rely on
+> this pre-production build as the only catalog for irreplaceable data.
 
 ## Concepts and relationships
 
@@ -102,21 +112,22 @@ Create one named catalog. This does not inspect the current directory or tie the
 particular files:
 
 ```bash
-archive init --name "Personal archive"
+archive init "Personal archive"
 ```
 
 The first Archive becomes the default. Additional Archives can be selected explicitly:
 
 ```bash
-archive init --name "Work archive"
+archive init "Work archive"
 archive use "Personal archive"
 archive --archive "Work archive" status
 ```
 
 Catalogs live under the XDG data directory, normally
-`~/.local/share/archive-ledger/archives/<archive-id>/`. Init prints the exact SQLite and canonical
-event paths. Existing custom catalogs remain accessible with global `--database` and `--events`
-options, but central named Archives are the normal workflow.
+`~/.local/share/archive-ledger/archives/<archive-id>/`. Normal output confirms the Archive and
+suggests the next setup step; `archive init --json` includes its identity, accepted frontier,
+canonical Git commit, and Archive root. Pre-v2 development catalogs are intentionally unsupported
+and should be recreated. `--name` remains available as an alternative for scripts.
 
 For an ordinary directory, create a Collection from its logical root:
 
@@ -160,16 +171,17 @@ Collection root:
 
 ```bash
 cd /srv/archive/documents
-archive location add . --collection "Documents"
+archive collection add . --collection "Documents"
 ```
 
-`location add` is positive-only. It streams traversal, computes BLAKE3 for new or changed regular
-files, records successful reads as verification, and never marks an unvisited file missing. It can
-safely target a subtree:
+`collection add` infers the current Location and is positive-only. It streams traversal, computes
+BLAKE3 for new or changed regular files, records successful reads as verification and presence at
+that Location, and never marks an unvisited file missing. Git metadata named `.git` is always
+excluded. It can safely target a subtree:
 
 ```bash
 cd /srv/archive/documents/2026
-archive location add .
+archive collection add .
 ```
 
 After the first inventory, Location and Collection can usually be inferred from the current path.
@@ -186,6 +198,105 @@ Only a successfully completed scan can mark prior paths missing. Traversal error
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.
 Partial runs retain positives but cannot publish missing facts or fresh complete-coverage evidence.
 
+The human scan summary separates what was learned: files first added to this Location, files that
+were already known there, missing files, and files whose content was actually hashed and
+integrity-verified during this scan. A known path whose catalog observation needed refreshing is
+not described as a changed file. The versioned JSON retains the legacy `changed_paths` field for
+compatibility; it means an existing path observation was updated, not necessarily that its bytes
+changed. `integrity_verified_paths` is the explicit byte-verification count.
+
+## Check an unfamiliar directory before deleting its original
+
+Use staging when files arrive from another computer or removable disk and you do not know which
+contents are already cataloged:
+
+```bash
+archive stage /media/incoming --collection "Photos"
+```
+
+Staging computes BLAKE3 for stable regular files and compares content identity across every
+Collection. It reports content already in the selected Collection, content found only in other
+Collections, and content entirely new to the Archive. Names do not determine a match. Ordinary
+symlinks and special files are ignored and reported. For cataloged content it also reports
+policy-satisfied, at-risk, and unknown counts. Policy evidence is read from the current SQLite
+cache; staging never refreshes that cache itself.
+
+`archive stage` changes no ledger data. It appends no events and creates no File, Object, Location,
+Copy, presence, verification, or Policy facts. Reusable checksums normally go in
+`.archive-ledger-stage/manifest.sqlite3` beneath the staged directory; that reserved directory is
+excluded from its own audit. If the source is unwritable, the command creates a private temporary
+manifest and prints its path for use with `--manifest PATH`.
+
+Review an import without writing anything:
+
+```bash
+cd /srv/archive/photos
+archive stage import /media/incoming --dry-run
+```
+
+Then explicitly import only content that is still unknown across the whole Archive:
+
+```bash
+archive stage import /media/incoming --yes
+```
+
+Location and Collection are inferred from `cwd` when unambiguous. The command creates one new
+subtree named after the staged source; use `--into NEW-DIRECTORY` to select another single new
+directory name. Existing destinations are never overwritten.
+
+Import does not repeat a preliminary checksum scan. It hashes bytes while copying them into a
+private destination-side tree, compares them with the saved checksum, and reads every completed
+destination back for verification. The whole tree becomes visible only after every candidate
+succeeds, then the normal positive-only add engine records verified presence. Source files are
+never modified or deleted. Rerunning `archive stage` reuses unchanged checksums and refreshes the
+comparison against current ledger state. Import prints a durable job ID. If it is interrupted
+while preparing files or after the tree becomes visible but before ledger recording completes,
+resume it with `archive job resume JOB_ID`; existing destination bytes are re-read and must match
+the reviewed checksums.
+
+“Already cataloged” is not by itself a deletion-safety claim. A known Object may still have too
+few qualifying copies or all copies at one Site. After importing new content and making the needed
+verified Location-to-Location copies, review `archive report risk`; retain the staged source until
+every relevant Collection satisfies its Policy. Then rerun `archive stage` and retain the source
+unless it says `Source removal readiness: READY`. Readiness requires a complete audit, no
+archive-unknown content, and a satisfied current Policy for every active Collection that owns each
+staged Object; the staged source itself never counts as protection.
+
+## Make a verified copy at another Location
+
+Run copy from within the registered source Location. A path selects a logical File or directory
+prefix from the SQLite catalog; it does not enumerate the source directory. Omitting paths selects
+the Collection subtree corresponding to `cwd`:
+
+```bash
+cd /srv/archive/photos/2026/trip
+archive copy --to "Photos on SD01" . --dry-run
+archive copy --to "Photos on SD01" . --yes
+```
+
+`archive location copy` is an equivalent, more explicit entry point. Use `--from` and
+`--collection` when they cannot be inferred, and use `--non-interactive --yes` for unattended
+execution.
+
+Copy planning deduplicates identical Objects and skips Objects already recorded present at the
+destination. Before writing, Archive Ledger checks both mounted Device identities, every selected
+source, destination collisions and containment, and available space. Each source stream is checked
+against the reviewed BLAKE3 while it is copied through a same-directory temporary file; the final
+destination is published without replacement and read back for verification. Existing files are
+never overwritten, and source files are never changed or deleted. If post-publication verification
+fails, the unrecorded suspect destination is left in place for inspection rather than deleted.
+
+Long copies have a durable job ID. If a run is interrupted, mount the same registered Devices and
+resume it; completed Objects are reconciled from canonical facts and are not recopied:
+
+```bash
+archive job resume <job-id>
+```
+
+Copy creates additional verified presence, not proof that preservation Policy is satisfied. Review
+`archive report risk` after copying, especially for distinct-Device, distinct-Site, freshness, and
+shared-risk requirements.
+
 ## Add another Device or partial Location
 
 Suppose an external disk is mounted at `/media/sd01` and contains another ordinary copy or subset:
@@ -194,7 +305,7 @@ Suppose an external disk is mounted at `/media/sd01` and contains another ordina
 cd /media/sd01/documents
 archive location init --collection "Documents" \
   --device "SD01" --site "Home" --non-interactive
-archive location add . --collection "Documents"
+archive collection add . --collection "Documents"
 ```
 
 One Device may have several Locations, and several Devices together may contain every Object. If a
@@ -239,11 +350,35 @@ archive location import-annex --collection "Photos" \
   --device "SD01" --site "Home" --non-interactive
 ```
 
-The importer reads the Git index, annex keys, object bytes, location logs, and `git-annex` branch.
-It does not invoke mutating git-annex commands and verifies that HEAD and worktree status stay
-unchanged. Every tracked annex path becomes a File reference. A dangling link remains an unresolved
-external identity and is absent from that Location; readable content becomes a BLAKE3 Object and
-verified present copy.
+Use `location import-annex`, not `location init`, for an annex repository.
+`location init` is topology-only setup for ordinary directories and intentionally
+does not enumerate files; it refuses an unimported annex worktree before creating
+an empty Location. If an older Archive Ledger version already registered that
+exact path, `location import-annex` reuses the Location and fills in its annex
+inventory rather than creating a duplicate.
+
+The importer is a one-time migration/bootstrap step. It reads the Git index, annex keys, and local
+object bytes without invoking mutating git-annex commands, and it verifies that HEAD and worktree
+status stay unchanged. Every annex-managed path becomes a File
+reference. A dangling annex link remains an unresolved external identity and is absent from that
+Location; readable content becomes a BLAKE3 Object and verified present copy. Other symlinks,
+including Git-tracked organizational links, are counted and explicitly reported as ignored. They
+create no File, Object, path-observation, or Copy facts.
+
+After a successful import, use the normal inventory commands:
+
+```bash
+archive collection add .
+archive location scan
+```
+
+These commands recognize the imported annex paths from SQLite and inspect the filesystem directly;
+they do not run Git or git-annex. Locked content is read only through a validated symlink target
+inside that Location's `.git/annex/objects` directory. Dangling links and annex pointer files remain
+known but absent, and `.git` itself is never traversed as ordinary Collection content. A complete
+`location scan` can therefore detect content that has appeared or disappeared after migration,
+while `collection add` remains positive-only. An annex repository that has not been imported still
+fails closed and directs the user to `--import-annex`.
 
 For example, photos, documents, and emails repositories normally become three Collections. The
 main photos repository and every partial photos remote are Locations of Photos. Multiple disks that
@@ -268,27 +403,55 @@ Fast summaries come from indexed SQLite and do not enumerate storage:
 
 ```bash
 archive status
-archive collection status "Documents"
-archive location status "Documents on Main computer"
-archive collection list
-archive location list
+archive c status "Documents"
+archive l status "Documents on Main computer"
+archive d status "Main computer"
+archive s status "Home"
+archive c ls
+archive l ls
+archive d ls
+archive s ls
 archive file find --collection <documents-collection-id> --limit 100
 archive file show <file-id>
-archive copy list --location <main-location-id> --limit 100
 ```
+
+`c`, `l`, `d`, and `s` are shortcuts for `collection`, `location`, `device`, and `site`;
+`ls` is a shortcut for `list`. The human list commands print one active display name per line.
+Use `show` or `--json` when IDs and registry details are needed.
+
+`archive status` gives an Archive-wide action view: every Collection's File count and current
+Policy at-risk and uncertain counts. Collection status expands that view into the Locations known
+to contain its inventory. Location status shows its Device, Site, path relative to the Device
+root, File count, present-byte space, and stale-presence count and age threshold. Device status
+rolls those figures up across its Locations and, when the Device is currently mounted and its
+filesystem identity still matches, reports live free space. Site status rolls them up by Device.
+Unavailable or unconfirmed facts are shown explicitly rather than guessed.
 
 File and copy lists use stable continuations, so directories with thousands of entries and
 Collections with hundreds of thousands of Files remain reviewable without running the equivalent
 of `ls` or loading the full result in memory.
 
-Evaluate and review Policy and simulated loss results:
+Risk reports automatically refresh missing or stale derived assessments from SQLite; they never
+scan storage or replay canonical history. Review the starter Policy and simulated loss results:
 
 ```bash
-archive policy evaluate
+archive policy list
+archive policy show "Two copies at two sites"
 archive report risk
 archive report integrity
 archive report policy
 ```
+
+The starter Policy requires two qualifying copies on two Devices at two Sites, including one
+offsite copy, with verification, presence, and Device check-in evidence no more than 365 days old.
+Update only the settings that should change, for example:
+
+```bash
+archive policy update "Two copies at two sites" \
+  --copies 3 --verification-days 180
+```
+
+`archive policy evaluate` remains available to precompute the same SQLite cache explicitly.
 
 Early reports commonly have findings until independent Devices and Sites are inventoried and
 verified. Use risk domains for shared failures that topology cannot reveal, such as several disks
@@ -311,16 +474,11 @@ stale resolved presence.
 ## Verify bytes and resume work
 
 Adding or scanning content records the hashing read as baseline verification. Routine verification
-re-reads current copy claims:
+currently re-reads the selected Location:
 
 ```bash
 archive verify <main-location-id> \
   --path /srv/archive/documents \
-  --fingerprint-status match
-
-archive verify <main-location-id> \
-  --path /srv/archive/documents \
-  --copy <copy-claim-id> \
   --fingerprint-status match
 ```
 
@@ -342,45 +500,101 @@ duplicate durable facts. Operations are batched and do not require all paths in 
 ## Protect and recover the catalog
 
 SQLite is the normal interactive materialized view, but it is replaceable. Canonical events are the
-durable rebuild source, so protecting only `archive.db` is insufficient. Exact paths are printed by
-`archive init --json`.
+durable rebuild source, so protecting only `archive.db` is insufficient. `archive init --json`
+prints the Archive root; its SQLite view is `archive.db`, its Git-backed event tree is `canonical/`,
+and its private client key stays under `local/`.
 
-Record the registered Location physically containing the catalog, then configure a Git remote whose
-registered storage and Site are independent:
+Configure a Git remote for the Archive's canonical history, then synchronize. The remote may be a
+local bare repository, an SSH Git URL, or another locator supported by Git. Do not embed passwords
+or tokens in it; use normal Git/SSH credential configuration.
 
 ```bash
-archive catalog-location <catalog-location-id>
-
-archive metadata-destination add \
-  --name "Offsite catalog history" \
-  --location <offsite-metadata-location-id> \
-  --remote backup \
-  --locator ssh://backup.example/archive-ledger.git
-
-git -C <canonical-event-path> remote add \
-  backup ssh://backup.example/archive-ledger.git
-
-archive checkpoint --replicate
-archive report metadata
+archive sync remote add central ssh://backup.example/personal-archive.git
+archive sync
+archive sync status
 ```
 
-“Protected through N” appears only after Archive Ledger observes the checkpoint at independent
-topology. A Git repository on the same disk may receive events but is not counted as proven
-independent protection. Keep credentials in Git, SSH, or credential-manager configuration—not in
-locators or canonical events.
+`archive sync [remote]` fetches and verifies both histories before changing accepted state. A
+fast-forward remains a fast-forward; compatible offline additions from different enrolled
+installations become one Git merge commit whose tree is the verified union of immutable origin
+journals. Event JSONL is never text-merged, neither side is dropped by arrival order, and SQLite is
+updated only by applying the newly accepted origin ranges. Remote publication uses compare-and-swap
+and retries a race instead of force-pushing over it.
+
+The coordination remote is transport and a rendezvous for short signed leases; it is not by itself
+proof of independent disaster protection. Multi-client topology, Policy, registry, revocation,
+Archive rename, and complete-scan negative publication use a conservative Archive-wide lease.
+Positive observations can still be recorded offline. Keep an independently protected copy of the
+canonical event tree, and keep each installation's private key under `local/` private.
+
+On an Archive copied to a new installation, create a public signed request:
+
+```bash
+archive sync enroll --name "Laptop" --output laptop.enrollment.json
+```
+
+Transfer only that request to an already enrolled installation and approve it:
+
+```bash
+archive sync approve laptop.enrollment.json
+archive sync
+archive sync status
+```
+
+Create a portable SQLite snapshot when a full event replay would be slow. The new directory is an
+out-of-band cache artifact; it is deliberately not committed to canonical Git history. Transfer it
+through any suitable file-transfer mechanism alongside access to the Git remote.
+
+```bash
+archive snapshot create /media/transfer/personal-snapshot
+archive snapshot inspect /media/transfer/personal-snapshot
+```
+
+On the new installation, clone canonical history and optionally seed SQLite from that snapshot:
+
+```bash
+archive sync clone ssh://backup.example/personal-archive.git \
+  --snapshot /media/transfer/personal-snapshot
+```
+
+Clone verifies the snapshot signature, database checksum, Archive and genesis IDs, historical Git
+commit, frontier, schema, and projector version before use. It applies only the newer event ranges
+in the cloned Git history. If the snapshot is absent or rejected, clone safely rebuilds SQLite from
+canonical events instead. It never stores the SQLite database in the canonical Git repository.
+
+After cloning, run `archive sync enroll --name <this-computer>`, approve that public request on an
+already enrolled installation, and synchronize both installations before the new one writes. The
+request never contains the private key. To stop a lost installation from making future writes, use
+`archive sync revoke <client-id> --yes`; previously accepted history remains intact.
 
 Verify history, update SQLite, rebuild a disposable projection, and rehearse recovery:
 
 ```bash
 archive events verify
+archive fsck
+archive fsck --full
 archive db apply
 archive db rebuild --target /tmp/archive-rebuilt.db
 
-git clone --branch archive-ledger \
-  ssh://backup.example/archive-ledger.git restored-events
 archive restore check restored-events \
   --rebuild-database restored-archive.db
 ```
+
+Routine `archive fsck` is read-only. It runs strict Git object verification,
+verifies every signed origin journal and accepted frontier, runs SQLite
+`quick_check` and `foreign_key_check`, and checks Archive identity, record count,
+and origin cursors. It does not bring a stale projection current; a finding tells
+you to run `archive db apply` explicitly. `--full` additionally creates a unique
+disposable clone and database at the live projection's captured frontier, checks
+the rebuild's SQLite integrity and foreign keys, compares every classified
+event-derived table, then removes only that tool-owned rebuild. A behind
+projection can therefore pass logical comparison through its applied frontier
+while separately telling you to run `archive db apply`. Use `--keep-rebuild` to
+retain the diagnostic database or `--rebuild-dir <directory>` to select a volume
+with enough free space.
+
+Exit status 0 means all performed checks passed, 10 means health or currency
+findings were found, and 2 means a requested check could not be completed.
 
 `restore check` verifies the chain and builds a new database; it does not overwrite the current
 catalog.
@@ -393,7 +607,8 @@ catalog.
   or partial-coverage concerns.
 
 Exit `10` is an actionable finding, not a crash. Global `--json` provides versioned structured
-results. Setup commands have explicit non-interactive flags:
+results. An agent environment can set `ARCHIVE_LEDGER_OUTPUT=json` once instead; human-readable
+output remains the default. Setup commands have explicit non-interactive flags:
 
 ```bash
 archive --json status
@@ -410,18 +625,35 @@ fail closed if SQLite advances between pages.
 
 ## Safety and current scope
 
-- `location add`, `location scan`, and git-annex import do not modify archive content.
-- Generic traversal does not follow symlinks as ordinary files or cross filesystems.
+- `stage`, `collection add`, `location scan`, and git-annex import do not modify existing archive
+  content. `stage import` is an explicit mutation that creates only new verified destination files
+  and refuses overwrite.
+- `copy` is an explicit mutation that creates only verified files at a registered destination
+  Location. It refuses overwrite and never changes or deletes its source.
+- Generic traversal excludes every `.git` path, does not follow symlinks as ordinary files, and
+  does not cross filesystems.
+- A git-annex repository requires one successful import. Later add and scan operations use the
+  imported catalog facts and direct filesystem reads without depending on Git or git-annex.
+- Imported annex symlinks are read only when both lexical and canonical checks keep the target
+  inside the registered Location's `.git/annex/objects`; escape attempts fail closed.
+- Every other symlink is ignored and reported. Archive Ledger does not follow it, count it as a
+  File, treat its target as another Copy, or manage the organization it represents.
 - Device identity mismatch blocks scanning; unidentified roots remain visibly uncertain.
 - Positive-only add and every partial scan are incapable of publishing missing facts.
 - Complete missing activation is atomic and follows only confirmed complete coverage.
 - Registry changes and renames append canonical events; history is not rewritten.
-- Current commands do not copy, move, delete, drop, repair, or quarantine content.
+- No command deletes, drops, repairs, quarantines, or rewrites existing archive content.
 
-Background scanning of connected Devices and content mutation such as `archive copy` are planned,
-not current behavior. Continue using established tools such as git-annex for copy/drop operations,
-then import or scan the resulting state.
+Background scanning of connected Devices and destructive Location-to-Location operations remain
+future work. Verified copy is available as both `archive copy` and the equivalent
+`archive location copy`; it copies unique Objects rather than materializing ignored organizational
+symlinks. Archive Ledger no longer needs git-annex for an imported Location's scanning or copying.
+It does not yet drop content, so use an established external workflow for any removal and scan the
+resulting state afterward.
 
-The implementation has explicit 500,000-File and 500,000-Object scale gates. Discovery, hashing,
-projection, and large result lists are bounded or paged. SQLite intentionally trades some storage
-for low-latency indexed review; canonical history remains the recovery source.
+The current v2 acceptance gate inventories 100,000 real files in one resumable logical operation,
+publishes 111 bounded physical records in one Git commit, rebuilds the projection, and checks
+interactive status latency. Earlier streaming-foundation tests cover 500,000 paths. Discovery,
+hashing, projection, and large result lists are bounded or paged. SQLite intentionally trades some
+storage for low-latency indexed review; canonical history remains the recovery source. Reproducible
+measurements live under `docs/benchmarks/`.

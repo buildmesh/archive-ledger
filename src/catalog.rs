@@ -31,7 +31,7 @@ pub enum CatalogError {
     Unknown(String),
     #[error("archive selector {0:?} is ambiguous; use the stable Archive ID")]
     Ambiguous(String),
-    #[error("no Archive is configured; run `archive init --name <name>`")]
+    #[error("no Archive is configured; run `archive init <name>`")]
     NoneConfigured,
     #[error(
         "multiple Archives are configured and none is the default; run `archive use <archive>`"

@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{self, Metadata, ReadDir};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -226,6 +227,11 @@ impl FileDiscovery {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
+        if self.root.components().chain(relative.components()).any(
+            |component| matches!(component, Component::Normal(name) if name == OsStr::new(".git")),
+        ) {
+            return true;
+        }
         self.exclusions
             .iter()
             .any(|excluded| relative == excluded || relative.starts_with(excluded))

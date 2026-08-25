@@ -12,6 +12,8 @@ use thiserror::Error;
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
 use crate::policy::PolicyRequirements;
 use crate::projection::{ProjectionDb, ProjectionError};
+use crate::v2_projection::{V2ApplyStats, V2ProjectionDb, V2ProjectionError};
+use crate::v2_store::{V2AppendResult, V2OriginStore, V2StoreError};
 
 pub type Result<T> = std::result::Result<T, RegistryError>;
 
@@ -21,6 +23,10 @@ pub enum RegistryError {
     EventStore(#[from] EventStoreError),
     #[error(transparent)]
     Projection(#[from] ProjectionError),
+    #[error(transparent)]
+    V2Store(#[from] V2StoreError),
+    #[error(transparent)]
+    V2Projection(#[from] V2ProjectionError),
     #[error("SQLite operation failed for {path}: {source}")]
     Sqlite {
         path: PathBuf,
@@ -40,6 +46,8 @@ impl RegistryError {
         match self {
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
+            Self::V2Store(error) => error.code(),
+            Self::V2Projection(error) => error.code(),
             Self::Sqlite { .. } => "registry_sqlite",
             Self::Invalid(_) => "registry_invalid",
             Self::AlreadyExists { .. } => "already_exists",
@@ -80,6 +88,16 @@ pub struct RegistryMutationResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct V2RegistryMutationResult {
+    pub version: u32,
+    pub batch_id: String,
+    pub accepted_frontier_hash: String,
+    pub git_commit: String,
+    pub records_applied: u64,
+    pub applied_frontier_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegistryState {
     pub version: u32,
     pub applied_event_seq: u64,
@@ -96,6 +114,58 @@ pub struct RegistryState {
 pub struct Registry<'a> {
     events: &'a EventStore,
     projection: &'a ProjectionDb,
+}
+
+pub struct V2Registry<'a> {
+    store: &'a V2OriginStore,
+    projection: &'a V2ProjectionDb,
+}
+
+impl<'a> V2Registry<'a> {
+    pub fn new(store: &'a V2OriginStore, projection: &'a V2ProjectionDb) -> Self {
+        Self { store, projection }
+    }
+
+    pub fn record(
+        &self,
+        change: RegistryChange,
+        host_id: &str,
+    ) -> Result<V2RegistryMutationResult> {
+        self.projection.apply(self.store)?;
+        validate_change(self.projection.path(), &change)?;
+        let (operation_kind, item) = v2_registry_item(change.clone(), host_id)?;
+        let append: V2AppendResult = if self.store.coordination_required()? {
+            let remote = self.store.coordination_remote()?;
+            self.store.sync_remote(&remote)?;
+            self.projection.apply(self.store)?;
+            validate_change(self.projection.path(), &change)?;
+            self.store.append_coordinated_batch(
+                &remote,
+                operation_kind,
+                1,
+                serde_json::json!({"host_id": host_id}),
+                serde_json::json!({}),
+                vec![item],
+            )?
+        } else {
+            self.store.append_batch(
+                operation_kind,
+                1,
+                serde_json::json!({"host_id": host_id}),
+                serde_json::json!({}),
+                vec![item],
+            )?
+        };
+        let applied: V2ApplyStats = self.projection.apply(self.store)?;
+        Ok(V2RegistryMutationResult {
+            version: 2,
+            batch_id: append.batch_id,
+            accepted_frontier_hash: append.accepted_frontier_hash,
+            git_commit: append.git_commit,
+            records_applied: applied.records_applied,
+            applied_frontier_hash: applied.applied_frontier_hash,
+        })
+    }
 }
 
 impl<'a> Registry<'a> {
@@ -309,6 +379,200 @@ impl ProjectionDb {
         )?;
         Ok(RegistryState {
             version: 1,
+            applied_event_seq,
+            sites,
+            policies,
+            collections,
+            devices,
+            archive_roots,
+            locations,
+            risk_domains,
+            risk_assignments,
+        })
+    }
+}
+
+impl V2ProjectionDb {
+    pub fn registry_state(&self, include_retired: bool) -> Result<RegistryState> {
+        let applied_event_seq = self.status()?.records;
+        let connection =
+            Connection::open(self.path()).map_err(|source| sqlite_error(self.path(), source))?;
+        let status = (!include_retired).then_some("active");
+        let sites = query_rows(
+            &connection,
+            "SELECT site_id, display_name, site_kind, description, status FROM sites
+             WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, site_id",
+            status,
+            |row| {
+                Ok(SiteSnapshot {
+                    site_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    site_kind: row.get(2)?,
+                    description: row.get(3)?,
+                    status: row.get(4)?,
+                })
+            },
+            self.path(),
+        )?;
+        let policies = query_rows(
+            &connection,
+            "SELECT policy_id, display_name, policy_version, requirements_json, enabled, status
+             FROM policies WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, policy_id",
+            status,
+            |row| {
+                let requirements: String = row.get(3)?;
+                let requirements = serde_json::from_str(&requirements).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(PolicySnapshot {
+                    policy_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    policy_version: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    requirements,
+                    enabled: row.get(4)?,
+                    status: row.get(5)?,
+                })
+            },
+            self.path(),
+        )?;
+        let collections = query_rows(
+            &connection,
+            "SELECT collection_id, display_name, description, home_site_id, policy_id, status
+             FROM collections WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, collection_id",
+            status,
+            |row| {
+                Ok(CollectionSnapshot {
+                    collection_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    description: row.get(2)?,
+                    home_site_id: row.get(3)?,
+                    policy_id: row.get(4)?,
+                    status: row.get(5)?,
+                })
+            },
+            self.path(),
+        )?;
+        let devices = query_rows(
+            &connection,
+            "SELECT device_id, display_name, device_kind, serial_hint, hardware_fingerprint,
+                    fingerprint_kind, identity_state, owner, status, current_site_id,
+                    expected_availability
+             FROM devices WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, device_id",
+            status,
+            |row| {
+                Ok(DeviceSnapshot {
+                    device_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    device_kind: row.get(2)?,
+                    serial_hint: row.get(3)?,
+                    hardware_fingerprint: row.get(4)?,
+                    fingerprint_kind: row.get(5)?,
+                    identity_state: row.get(6)?,
+                    owner: row.get(7)?,
+                    status: row.get(8)?,
+                    current_site_id: row.get(9)?,
+                    expected_availability: row.get(10)?,
+                })
+            },
+            self.path(),
+        )?;
+        let archive_roots = query_rows(
+            &connection,
+            "SELECT archive_root_id, device_id, display_name, root_path_encoding,
+                    root_path_on_device_bytes, root_path_display, status,
+                    filesystem_fingerprint, fingerprint_kind, identity_state
+             FROM archive_roots WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY display_name, archive_root_id",
+            status,
+            |row| {
+                Ok(ArchiveRootSnapshot {
+                    archive_root_id: row.get(0)?,
+                    device_id: row.get(1)?,
+                    display_name: row.get(2)?,
+                    root_path_on_device: registry_path_from_row(row, 3, 4, 5)?,
+                    status: row.get(6)?,
+                    filesystem_fingerprint: row.get(7)?,
+                    fingerprint_kind: row.get(8)?,
+                    identity_state: row.get(9)?,
+                })
+            },
+            self.path(),
+        )?;
+        let locations = query_rows(
+            &connection,
+            "SELECT location_id, display_name, kind, archive_root_id,
+                    relative_path_encoding, relative_path_bytes, relative_path_display,
+                    device_id, site_id, encryption_state, trust_level,
+                    expected_availability, is_writable, status
+             FROM locations WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY display_name, location_id",
+            status,
+            |row| {
+                let encoding: Option<String> = row.get(4)?;
+                Ok(LocationSnapshot {
+                    location_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    kind: row.get(2)?,
+                    archive_root_id: row.get(3)?,
+                    relative_path: encoding
+                        .map(|encoding| {
+                            registry_path_from_parts(encoding, row.get(5)?, row.get(6)?)
+                        })
+                        .transpose()?,
+                    device_id: row.get(7)?,
+                    site_id: row.get(8)?,
+                    encryption_state: row.get(9)?,
+                    trust_level: row.get(10)?,
+                    expected_availability: row.get(11)?,
+                    is_writable: row.get(12)?,
+                    status: row.get(13)?,
+                })
+            },
+            self.path(),
+        )?;
+        let risk_domains = query_rows(
+            &connection,
+            "SELECT risk_domain_id, display_name, risk_kind, description, status
+             FROM risk_domains WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY display_name, risk_domain_id",
+            status,
+            |row| {
+                Ok(RiskDomainSnapshot {
+                    risk_domain_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    risk_kind: row.get(2)?,
+                    description: row.get(3)?,
+                    status: row.get(4)?,
+                })
+            },
+            self.path(),
+        )?;
+        let risk_assignments = query_rows(
+            &connection,
+            "SELECT entity_type, entity_id, risk_domain_id FROM entity_risk_domains
+             WHERE ?1 IS NULL ORDER BY entity_type, entity_id, risk_domain_id",
+            None,
+            |row| {
+                Ok(RiskAssignment {
+                    entity_type: row.get(0)?,
+                    entity_id: row.get(1)?,
+                    risk_domain_id: row.get(2)?,
+                })
+            },
+            self.path(),
+        )?;
+        Ok(RegistryState {
+            version: 2,
             applied_event_seq,
             sites,
             policies,
@@ -590,7 +854,7 @@ fn registry_path_from_parts(
     }
 }
 
-fn registry_path_bytes(path: &RegistryPath) -> Result<Vec<u8>> {
+pub(crate) fn registry_path_bytes(path: &RegistryPath) -> Result<Vec<u8>> {
     match path.encoding.as_str() {
         "utf8" => path
             .text
@@ -707,6 +971,23 @@ fn event_parts(change: RegistryChange) -> Result<(&'static str, Value, EventRefe
     }
 }
 
+fn v2_registry_item(change: RegistryChange, host_id: &str) -> Result<(&'static str, Value)> {
+    let (kind, payload, _) = event_parts(change)?;
+    if !payload.is_object() {
+        return Err(RegistryError::Invalid(
+            "registry snapshot must serialize as an object".to_owned(),
+        ));
+    }
+    let mut item = serde_json::Map::from_iter([
+        ("kind".to_owned(), Value::String(kind.to_owned())),
+        ("snapshot".to_owned(), payload),
+    ]);
+    if kind == "device_mount_observed" {
+        item.insert("host_id".to_owned(), Value::String(host_id.to_owned()));
+    }
+    Ok((kind, Value::Object(item)))
+}
+
 fn serialize_payload(value: impl Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|error| RegistryError::Invalid(format!("cannot serialize snapshot: {error}")))
@@ -740,7 +1021,7 @@ fn lifecycle_event(kind: &str, action: RegistryAction) -> &'static str {
     }
 }
 
-fn validate_change(path: &Path, change: &RegistryChange) -> Result<()> {
+pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()> {
     let connection = Connection::open(path).map_err(|source| sqlite_error(path, source))?;
     match change {
         RegistryChange::Site(action, value) => {
@@ -1270,7 +1551,10 @@ fn sqlite_error(path: &Path, source: rusqlite::Error) -> RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EventStoreConfig, ProjectionConfig};
+    use crate::{
+        initialize_v2_archive, EventStoreConfig, PolicyRequirements, ProjectionConfig,
+        V2OriginStore, V2ProjectionDb,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -1445,6 +1729,168 @@ mod tests {
                 )
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn v2_registry_projects_topology_and_rebuilds_without_v1_events() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("archive");
+        initialize_v2_archive(&archive, "arc_registry", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let database_path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &database_path).unwrap();
+        let database = V2ProjectionDb::open_existing(&database_path).unwrap();
+        let registry = V2Registry::new(&store, &database);
+
+        registry
+            .record(
+                RegistryChange::Site(
+                    RegistryAction::Register,
+                    SiteSnapshot {
+                        site_id: "site_home".to_owned(),
+                        display_name: "Home".to_owned(),
+                        site_kind: "home".to_owned(),
+                        description: None,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::Policy(
+                    RegistryAction::Register,
+                    PolicySnapshot {
+                        policy_id: "policy_default".to_owned(),
+                        display_name: "Default".to_owned(),
+                        policy_version: 1,
+                        requirements: PolicyRequirements {
+                            min_qualifying_copies: 2,
+                            min_devices: 2,
+                            min_sites: 2,
+                            require_offsite_copy: true,
+                            require_offline_copy: false,
+                            require_encrypted_offsite: false,
+                            max_verification_age_days: 365,
+                            max_observation_age_days: 365,
+                            max_device_checkin_age_days: 365,
+                        },
+                        enabled: true,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::Collection(
+                    RegistryAction::Register,
+                    CollectionSnapshot {
+                        collection_id: "collection_photos".to_owned(),
+                        display_name: "Photos".to_owned(),
+                        description: None,
+                        home_site_id: Some("site_home".to_owned()),
+                        policy_id: Some("policy_default".to_owned()),
+                        status: "active".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::Device(
+                    RegistryAction::Register,
+                    DeviceSnapshot {
+                        device_id: "device_main".to_owned(),
+                        display_name: "Main Computer".to_owned(),
+                        device_kind: "computer".to_owned(),
+                        serial_hint: None,
+                        hardware_fingerprint: None,
+                        fingerprint_kind: None,
+                        identity_state: "unavailable".to_owned(),
+                        owner: None,
+                        status: "active".to_owned(),
+                        current_site_id: Some("site_home".to_owned()),
+                        expected_availability: "online".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::ArchiveRoot(
+                    RegistryAction::Register,
+                    ArchiveRootSnapshot {
+                        archive_root_id: "root_main".to_owned(),
+                        device_id: "device_main".to_owned(),
+                        display_name: "Main filesystem".to_owned(),
+                        root_path_on_device: RegistryPath::utf8("/"),
+                        status: "active".to_owned(),
+                        filesystem_fingerprint: None,
+                        fingerprint_kind: None,
+                        identity_state: "unavailable".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::Location(
+                    RegistryAction::Register,
+                    LocationSnapshot {
+                        location_id: "location_photos".to_owned(),
+                        display_name: "Photos on Main Computer".to_owned(),
+                        kind: "filesystem".to_owned(),
+                        archive_root_id: Some("root_main".to_owned()),
+                        relative_path: Some(RegistryPath::utf8("srv/photos")),
+                        device_id: Some("device_main".to_owned()),
+                        site_id: None,
+                        encryption_state: Some("unknown".to_owned()),
+                        trust_level: Some("trusted".to_owned()),
+                        expected_availability: "online".to_owned(),
+                        is_writable: true,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "host_test",
+            )
+            .unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM collections", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM locations", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        let rebuilt_path = archive.join("rebuilt.db");
+        V2ProjectionDb::rebuild(&store, &rebuilt_path).unwrap();
+        let rebuilt = Connection::open(rebuilt_path).unwrap();
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT display_name FROM locations WHERE location_id = 'location_photos'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Photos on Main Computer"
         );
     }
 }

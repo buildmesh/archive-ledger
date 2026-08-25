@@ -2,10 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, File, Metadata};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -16,6 +20,8 @@ use thiserror::Error;
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
 use crate::projection::{ProjectionDb, ProjectionError};
+use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
+use crate::v2_store::{V2OriginStore, V2StoreError};
 
 const MAX_POINTER_BYTES: u64 = 32 * 1024;
 
@@ -28,6 +34,12 @@ pub enum AnnexImportError {
 
     #[error(transparent)]
     Projection(#[from] ProjectionError),
+
+    #[error(transparent)]
+    V2Store(#[from] V2StoreError),
+
+    #[error(transparent)]
+    V2Projection(#[from] V2ProjectionError),
 
     #[error("{operation} failed for {path}: {source}")]
     Io {
@@ -64,6 +76,8 @@ impl AnnexImportError {
         match self {
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
+            Self::V2Store(error) => error.code(),
+            Self::V2Projection(error) => error.code(),
             Self::Io { .. } => "annex_import_io",
             Self::Git { .. } => "annex_git_failed",
             Self::InvalidGitOutput { .. } => "annex_invalid_git_output",
@@ -148,9 +162,18 @@ pub struct AnnexSummary {
     pub mismatched: u64,
     pub read_errors: u64,
     pub ignored_non_annex: u64,
+    /// Git-tracked symlinks that are not validated git-annex CAS links.
+    #[serde(default)]
+    pub ignored_symlinks: u64,
     pub duplicate_paths: u64,
     pub availability_facts: u64,
     pub source_changed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnnexLocalCheckpoint {
+    summary: AnnexSummary,
+    spool_len: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +188,85 @@ pub struct AnnexImporter<'a> {
     store: &'a EventStore,
     projection: &'a ProjectionDb,
     config: AnnexImportConfig,
+}
+
+pub struct V2AnnexImporter<'a> {
+    store: &'a V2OriginStore,
+    projection: &'a V2ProjectionDb,
+    config: AnnexImportConfig,
+}
+
+/// Detects a git-annex worktree from its local Git configuration without
+/// changing the repository. Paths inside the worktree are accepted.
+pub fn is_git_annex_repository(path: impl AsRef<Path>) -> Result<bool> {
+    let path = path.as_ref();
+    let canonical = fs::canonicalize(path)
+        .map_err(|source| io_error("canonicalize possible annex repository", path, source))?;
+    if !canonical.is_dir() {
+        return Err(AnnexImportError::InvalidConfig(format!(
+            "repository path is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    let mut has_worktree_marker = false;
+    for ancestor in canonical.ancestors() {
+        let marker = ancestor.join(".git");
+        match fs::symlink_metadata(&marker) {
+            Ok(_) => {
+                has_worktree_marker = true;
+                break;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(io_error("inspect Git worktree marker", &marker, source));
+            }
+        }
+    }
+    if !has_worktree_marker {
+        return Ok(false);
+    }
+    let worktree = git_command(&canonical)
+        .args([
+            "-c",
+            "safe.directory=*",
+            "rev-parse",
+            "--is-inside-work-tree",
+        ])
+        .output()
+        .map_err(|source| io_error("run git command", &canonical, source))?;
+    if !worktree.status.success() {
+        if worktree.status.code() == Some(128) {
+            return Ok(false);
+        }
+        return Err(AnnexImportError::Git {
+            operation: "detect Git worktree",
+            detail: String::from_utf8_lossy(&worktree.stderr).trim().to_owned(),
+        });
+    }
+    if String::from_utf8_lossy(&worktree.stdout).trim() != "true" {
+        return Ok(false);
+    }
+    let output = git_command(&canonical)
+        .args([
+            "-c",
+            "safe.directory=*",
+            "config",
+            "--local",
+            "--get",
+            "annex.uuid",
+        ])
+        .output()
+        .map_err(|source| io_error("run git command", &canonical, source))?;
+    if output.status.success() {
+        return Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    Err(AnnexImportError::Git {
+        operation: "detect annex repository",
+        detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 /// Confirms that a path is a readable git-annex repository without changing it.
@@ -189,6 +291,418 @@ pub fn validate_annex_repository(path: impl AsRef<Path>) -> Result<PathBuf> {
         ));
     }
     Ok(canonical)
+}
+
+impl<'a> V2AnnexImporter<'a> {
+    pub fn new(
+        store: &'a V2OriginStore,
+        projection: &'a V2ProjectionDb,
+        mut config: AnnexImportConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        config.repo_path = fs::canonicalize(&config.repo_path).map_err(|source| {
+            io_error("canonicalize annex repository", &config.repo_path, source)
+        })?;
+        let connection = rusqlite::Connection::open(projection.path()).map_err(|source| {
+            AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                path: projection.path().to_path_buf(),
+                source,
+            })
+        })?;
+        let valid: i64 = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collections WHERE collection_id = ?1 AND status = 'active')
+                   AND EXISTS(SELECT 1 FROM locations WHERE location_id = ?2 AND status = 'active')
+                   AND EXISTS(SELECT 1 FROM locations WHERE location_id = ?3 AND status = 'active')
+                   AND EXISTS(SELECT 1 FROM devices WHERE device_id = ?4 AND status = 'active')
+                   AND EXISTS(SELECT 1 FROM archive_roots WHERE archive_root_id = ?5 AND status = 'active')",
+                rusqlite::params![
+                    config.collection_id,
+                    config.worktree_location_id,
+                    config.cas_location_id,
+                    config.device_id,
+                    config.archive_root_id,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| {
+                AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                    path: projection.path().to_path_buf(),
+                    source,
+                })
+            })?;
+        if valid != 1 {
+            return Err(AnnexImportError::InvalidConfig(
+                "annex import topology is not active in this Archive".to_owned(),
+            ));
+        }
+        Ok(Self {
+            store,
+            projection,
+            config,
+        })
+    }
+
+    pub fn run(&self) -> Result<AnnexImportResult> {
+        self.run_at_most(None)
+    }
+
+    pub fn run_at_most(&self, limit: Option<usize>) -> Result<AnnexImportResult> {
+        self.projection.apply(self.store)?;
+        let initial = SourceSnapshot::capture(&self.config.repo_path)?;
+        let annex_uuid = git_text(
+            &self.config.repo_path,
+            "read annex UUID",
+            &["config", "--local", "--get", "annex.uuid"],
+        )?;
+        if annex_uuid.is_empty() {
+            return Err(AnnexImportError::InvalidConfig(
+                "repository has no annex.uuid".to_owned(),
+            ));
+        }
+        let job_root = self
+            .projection
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("local/jobs")
+            .join(&self.config.job_id);
+        let spool_path = job_root.join("annex-items.jsonl");
+        let summary_path = job_root.join("annex-summary.json");
+        let config_path = job_root.join("annex-config.json");
+        let config_value = json!({
+            "repo_path": path_json(&encode_absolute_path(&self.config.repo_path)),
+            "import_id": self.config.import_id,
+            "job_id": self.config.job_id,
+            "collection_id": self.config.collection_id,
+            "worktree_location_id": self.config.worktree_location_id,
+            "cas_location_id": self.config.cas_location_id,
+            "device_id": self.config.device_id,
+            "archive_root_id": self.config.archive_root_id,
+            "batch_entries": self.config.batch_entries,
+            "annex_uuid": annex_uuid,
+            "git_head_commit": initial.head,
+            "source_fingerprint": initial.fingerprint(),
+        });
+        fs::create_dir_all(&job_root)
+            .map_err(|source| io_error("create annex import job directory", &job_root, source))?;
+        let new_job = !config_path.exists();
+        if new_job {
+            fs::write(
+                &config_path,
+                serde_json::to_vec(&config_value)
+                    .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?,
+            )
+            .map_err(|source| {
+                io_error("write annex import job configuration", &config_path, source)
+            })?;
+        } else {
+            let existing: Value =
+                serde_json::from_slice(&fs::read(&config_path).map_err(|source| {
+                    io_error("read annex import job configuration", &config_path, source)
+                })?)
+                .map_err(|error| {
+                    AnnexImportError::InvalidConfig(format!(
+                        "annex job configuration is invalid: {error}"
+                    ))
+                })?;
+            if existing != config_value {
+                return Err(AnnexImportError::InvalidConfig(format!(
+                    "job {} belongs to a different repository snapshot or import",
+                    self.config.job_id
+                )));
+            }
+        }
+        let connection = rusqlite::Connection::open(self.projection.path()).map_err(|source| {
+            AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                path: self.projection.path().to_path_buf(),
+                source,
+            })
+        })?;
+        let now = annex_now_utc_ms()?;
+        let params_text = serde_json::to_string(&config_value)
+            .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
+        connection
+            .execute(
+                "INSERT INTO jobs(job_id, job_type, status, created_time_utc_ms, started_time_utc_ms, params_json, input_version)
+                 VALUES (?1, 'annex_import', 'running', ?2, ?2, ?3, ?4)
+                 ON CONFLICT(job_id) DO NOTHING",
+                rusqlite::params![
+                    self.config.job_id,
+                    i64::try_from(now).unwrap_or(i64::MAX),
+                    params_text,
+                    self.config.import_id,
+                ],
+            )
+            .map_err(|source| AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                path: self.projection.path().to_path_buf(),
+                source,
+            }))?;
+        let actual: (String, String, String, String, Option<String>) = connection
+            .query_row(
+                "SELECT job_type, status, input_version, params_json, progress_json FROM jobs WHERE job_id = ?1",
+                [&self.config.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(|source| AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                path: self.projection.path().to_path_buf(),
+                source,
+            }))?;
+        if actual.0 != "annex_import"
+            || actual.2 != self.config.import_id
+            || actual.3 != params_text
+        {
+            return Err(AnnexImportError::InvalidConfig(format!(
+                "job {} belongs to different immutable inputs",
+                self.config.job_id
+            )));
+        }
+        if matches!(actual.1.as_str(), "complete" | "partial") {
+            let summary = actual
+                .4
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    AnnexImportError::InvalidConfig(format!(
+                        "completed annex job summary is invalid: {error}"
+                    ))
+                })?
+                .unwrap_or_default();
+            if job_root.is_dir() {
+                fs::remove_dir_all(&job_root).map_err(|source| {
+                    io_error("remove completed annex import job files", &job_root, source)
+                })?;
+            }
+            return Ok(AnnexImportResult {
+                status: AnnexImportStatus::Complete,
+                annex_uuid,
+                git_head_commit: initial.head,
+                summary,
+            });
+        }
+
+        let checkpoint: Option<AnnexLocalCheckpoint> = if summary_path.exists() {
+            Some(
+                serde_json::from_slice(&fs::read(&summary_path).map_err(|source| {
+                    io_error("read annex import job summary", &summary_path, source)
+                })?)
+                .map_err(|error| {
+                    AnnexImportError::InvalidConfig(format!(
+                        "annex job summary is invalid: {error}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        let fresh_progress = checkpoint.is_none();
+        let checkpoint_len = checkpoint.as_ref().map_or(0, |value| value.spool_len);
+        let spool_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&spool_path)
+            .map_err(|source| io_error("open annex import spool", &spool_path, source))?;
+        spool_file
+            .set_len(checkpoint_len)
+            .map_err(|source| io_error("truncate annex import spool", &spool_path, source))?;
+        let mut spool = BufWriter::new(spool_file);
+        spool
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|source| io_error("seek annex import spool", &spool_path, source))?;
+        if fresh_progress {
+            write_v2_item(
+                &mut spool,
+                &json!({
+                    "kind": "job_started",
+                    "job_id": self.config.job_id,
+                    "job_type": "annex_import",
+                    "input_version": self.config.import_id,
+                    "params": config_value,
+                    "item_type": "job",
+                    "item_key": self.config.job_id,
+                    "outcome_kind": "started",
+                    "operation_key": stable_id("op", &[self.config.job_id.as_bytes(), self.config.import_id.as_bytes(), b"job", b"started"]),
+                }),
+                &spool_path,
+            )?;
+            write_v2_item(
+                &mut spool,
+                &json!({
+                "kind": "annex_import_started",
+                "import_id": self.config.import_id,
+                "job_id": self.config.job_id,
+                "repo_path": path_json(&encode_absolute_path(&self.config.repo_path)),
+                "collection_id": self.config.collection_id,
+                "worktree_location_id": self.config.worktree_location_id,
+                "cas_location_id": self.config.cas_location_id,
+                "device_id": self.config.device_id,
+                "archive_root_id": self.config.archive_root_id,
+                "annex_uuid": annex_uuid,
+                "git_head_commit": initial.head,
+                "source_fingerprint": initial.fingerprint(),
+                }),
+                &spool_path,
+            )?;
+        }
+        let mut summary = checkpoint.map_or_else(AnnexSummary::default, |value| value.summary);
+        if fresh_progress {
+            save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+        }
+        let mut index = IndexStream::open(&self.config.repo_path)?;
+        let mut cat_file = CatFile::open(&self.config.repo_path)?;
+        let mut skip_entries = summary.entries_seen;
+        let mut processed_this_run = 0_usize;
+        let mut interrupted = false;
+        while let Some(entry) = index.next_entry()? {
+            if entry.stage != 0 {
+                continue;
+            }
+            if skip_entries > 0 {
+                skip_entries -= 1;
+                continue;
+            }
+            if limit.is_some_and(|limit| processed_this_run >= limit) {
+                interrupted = true;
+                break;
+            }
+            processed_this_run = processed_this_run.saturating_add(1);
+            summary.entries_seen = summary.entries_seen.saturating_add(1);
+            let blob_size = cat_file.check(&entry.oid)?;
+            if entry.mode != "120000" && blob_size > MAX_POINTER_BYTES {
+                summary.ignored_non_annex = summary.ignored_non_annex.saturating_add(1);
+                if summary
+                    .entries_seen
+                    .is_multiple_of(self.config.batch_entries as u64)
+                {
+                    save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+                }
+                continue;
+            }
+            let blob = cat_file.read_blob(&entry.oid, blob_size)?;
+            let Some(key_text) = annex_key_from_blob(&entry.mode, &blob) else {
+                summary.ignored_non_annex = summary.ignored_non_annex.saturating_add(1);
+                if entry.mode == "120000" {
+                    summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
+                }
+                if summary
+                    .entries_seen
+                    .is_multiple_of(self.config.batch_entries as u64)
+                {
+                    save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+                }
+                continue;
+            };
+            let logical = encode_relative_path(&raw_path(&entry.path)?);
+            let key = AnnexKey::parse(&key_text);
+            let outcome = inspect_entry_v2(&self.config, &entry, &blob, &key)?;
+            summary.add(&outcome.category);
+            write_v2_item(
+                &mut spool,
+                &v2_annex_entry_item(&self.config, &annex_uuid, &logical, &key, &outcome),
+                &spool_path,
+            )?;
+            if summary
+                .entries_seen
+                .is_multiple_of(self.config.batch_entries as u64)
+            {
+                save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+            }
+        }
+        if interrupted {
+            while index.next_entry()?.is_some() {}
+        }
+        index.finish()?;
+        cat_file.finish()?;
+        let final_snapshot = SourceSnapshot::capture(&self.config.repo_path)?;
+        if initial != final_snapshot {
+            return Err(AnnexImportError::SourceChanged);
+        }
+        if interrupted {
+            save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+            connection
+                .execute(
+                    "UPDATE jobs SET progress_json = ?2 WHERE job_id = ?1",
+                    rusqlite::params![
+                        self.config.job_id,
+                        serde_json::to_string(&json!({
+                            "phase": "reading_index",
+                            "entries_seen": summary.entries_seen,
+                        }))
+                        .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?
+                    ],
+                )
+                .map_err(|source| {
+                    AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                        path: self.projection.path().to_path_buf(),
+                        source,
+                    })
+                })?;
+            return Ok(AnnexImportResult {
+                status: AnnexImportStatus::Interrupted,
+                annex_uuid,
+                git_head_commit: initial.head,
+                summary,
+            });
+        }
+        write_v2_item(
+            &mut spool,
+            &json!({
+                "kind": "annex_import_completed",
+                "import_id": self.config.import_id,
+                "annex_uuid": annex_uuid,
+                "git_head_commit": initial.head,
+                "status": "complete",
+                "summary": summary,
+            }),
+            &spool_path,
+        )?;
+        write_v2_item(
+            &mut spool,
+            &json!({
+                "kind": "job_finished",
+                "job_id": self.config.job_id,
+                "job_type": "annex_import",
+                "input_version": self.config.import_id,
+                "status": "complete",
+                "summary": summary,
+                "item_type": "job",
+                "item_key": self.config.job_id,
+                "outcome_kind": "complete",
+                "operation_key": stable_id("op", &[self.config.job_id.as_bytes(), self.config.import_id.as_bytes(), b"job", b"complete"]),
+            }),
+            &spool_path,
+        )?;
+        spool
+            .flush()
+            .and_then(|()| spool.get_ref().sync_all())
+            .map_err(|source| io_error("sync annex import spool", &spool_path, source))?;
+        drop(spool);
+        self.store.append_jsonl_batch(
+            "annex_import",
+            1,
+            json!({
+                "import_id": self.config.import_id,
+                "collection_id": self.config.collection_id,
+                "location_id": self.config.worktree_location_id,
+            }),
+            json!({}),
+            &spool_path,
+        )?;
+        self.projection.apply(self.store)?;
+        drop(connection);
+        fs::remove_dir_all(&job_root).map_err(|source| {
+            io_error("remove completed annex import job files", &job_root, source)
+        })?;
+        Ok(AnnexImportResult {
+            status: AnnexImportStatus::Complete,
+            annex_uuid,
+            git_head_commit: initial.head,
+            summary,
+        })
+    }
 }
 
 impl<'a> AnnexImporter<'a> {
@@ -280,6 +794,9 @@ impl<'a> AnnexImporter<'a> {
             let blob = cat_file.read_blob(&entry.oid, blob_size)?;
             let Some(key_text) = annex_key_from_blob(&entry.mode, &blob) else {
                 summary.ignored_non_annex += 1;
+                if entry.mode == "120000" {
+                    summary.ignored_symlinks += 1;
+                }
                 continue;
             };
             let path = raw_path(&entry.path)?;
@@ -413,7 +930,13 @@ impl<'a> AnnexImporter<'a> {
             };
             let copy_path = annex_object_relative(index_blob)
                 .and_then(|bytes| raw_path(bytes).ok())
-                .map(|path| encode_relative_path(&path));
+                .map(|path| {
+                    if self.config.cas_location_id == self.config.worktree_location_id {
+                        encode_relative_path(&Path::new(".git/annex/objects").join(path))
+                    } else {
+                        encode_relative_path(&path)
+                    }
+                });
             ("annex_locked_symlink", target_metadata, true, copy_path)
         } else if metadata.file_type().is_file() {
             if metadata.len() <= MAX_POINTER_BYTES {
@@ -878,6 +1401,287 @@ impl<'a> AnnexImporter<'a> {
 
 const MAX_LOCATION_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
+fn write_v2_item(writer: &mut BufWriter<File>, item: &Value, path: &Path) -> Result<()> {
+    serde_json::to_writer(&mut *writer, item)
+        .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|source| io_error("write annex import spool", path, source))
+}
+
+fn save_annex_checkpoint(
+    spool: &mut BufWriter<File>,
+    spool_path: &Path,
+    checkpoint_path: &Path,
+    summary: &AnnexSummary,
+) -> Result<()> {
+    spool
+        .flush()
+        .and_then(|()| spool.get_ref().sync_all())
+        .map_err(|source| io_error("sync annex import spool", spool_path, source))?;
+    let spool_len = spool
+        .stream_position()
+        .map_err(|source| io_error("measure annex import spool", spool_path, source))?;
+    let checkpoint = AnnexLocalCheckpoint {
+        summary: summary.clone(),
+        spool_len,
+    };
+    let temporary = checkpoint_path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|source| io_error("create annex import checkpoint", &temporary, source))?;
+    serde_json::to_writer(&mut file, &checkpoint)
+        .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
+    file.sync_all()
+        .map_err(|source| io_error("sync annex import checkpoint", &temporary, source))?;
+    fs::rename(&temporary, checkpoint_path)
+        .map_err(|source| io_error("publish annex import checkpoint", checkpoint_path, source))
+}
+
+fn v2_annex_entry_item(
+    config: &AnnexImportConfig,
+    annex_uuid: &str,
+    logical: &EncodedPath,
+    key: &AnnexKey,
+    outcome: &EntryOutcome,
+) -> Value {
+    let external_identity_id = stable_id("ext", &[b"git-annex", key.raw.as_bytes()]);
+    let file_ref_id = stable_id(
+        "file",
+        &[
+            config.collection_id.as_bytes(),
+            logical.encoding.as_str().as_bytes(),
+            &logical.bytes,
+        ],
+    );
+    let resolved = outcome.category == EntryCategory::Present;
+    let object_id = outcome
+        .content
+        .as_ref()
+        .filter(|_| resolved)
+        .map(|content| format!("blake3:{}", content.blake3_hex));
+    let copy_location_id =
+        (outcome.content.is_some() || outcome.category == EntryCategory::ReadError).then(|| {
+            if outcome.representation == "annex_locked_symlink" {
+                config.cas_location_id.clone()
+            } else {
+                config.worktree_location_id.clone()
+            }
+        });
+    let copy_path = copy_location_id
+        .as_ref()
+        .map(|_| outcome.copy_path.as_ref().unwrap_or(logical));
+    let copy_claim_id = copy_path
+        .zip(copy_location_id.as_ref())
+        .map(|(path, location)| {
+            stable_id(
+                "copy",
+                &[
+                    location.as_bytes(),
+                    path.encoding.as_str().as_bytes(),
+                    &path.bytes,
+                ],
+            )
+        });
+    let operation_key = stable_id(
+        "op",
+        &[
+            config.job_id.as_bytes(),
+            config.import_id.as_bytes(),
+            logical.encoding.as_str().as_bytes(),
+            &logical.bytes,
+            b"annex_entry_observed",
+        ],
+    );
+    json!({
+        "kind": "annex_entry_observed",
+        "import_id": config.import_id,
+        "job_id": config.job_id,
+        "collection_id": config.collection_id,
+        "worktree_location_id": config.worktree_location_id,
+        "cas_location_id": config.cas_location_id,
+        "source_repo_id": annex_uuid,
+        "external_identity_id": external_identity_id,
+        "external_key": key.raw,
+        "backend": key.backend,
+        "expected_hash_algo": key.expected_sha256.as_ref().map(|_| "sha256"),
+        "expected_hash_hex": key.expected_sha256,
+        "expected_size_bytes": key.expected_size,
+        "resolution_state": if resolved { "resolved" } else if key.state == KeyState::Unsupported { "unsupported" } else { "unresolved" },
+        "file_ref_id": file_ref_id,
+        "logical_path": path_json(logical),
+        "path_state": if outcome.path_present { "present" } else { "missing" },
+        "representation": outcome.representation,
+        "local_availability": if outcome.local_bytes_present { "present" } else { "missing" },
+        "object_id": object_id,
+        "blake3_hex": outcome.content.as_ref().filter(|_| resolved).map(|content| &content.blake3_hex),
+        "sha256_hex": outcome.content.as_ref().map(|content| &content.sha256_hex),
+        "observed_size_bytes": outcome.content.as_ref().map(|content| content.size).or(key.expected_size),
+        "modified_time_utc_ms": outcome.content.as_ref().and_then(|content| content.modified_time_utc_ms),
+        "duration_ms": outcome.content.as_ref().map(|content| content.duration_ms),
+        "copy_location_id": copy_location_id,
+        "copy_path": copy_path.map(path_json),
+        "copy_claim_id": copy_claim_id,
+        "copy_state": match outcome.category {
+            EntryCategory::Present | EntryCategory::SupportedUnresolved => "present",
+            EntryCategory::Mismatch => "corrupt",
+            EntryCategory::ReadError => "unknown",
+            EntryCategory::Absent | EntryCategory::Unsupported => "missing",
+        },
+        "verification_result": match outcome.category {
+            EntryCategory::Present => Some("ok"),
+            EntryCategory::Mismatch => Some("hash_mismatch"),
+            EntryCategory::ReadError => Some("read_error"),
+            _ => None,
+        },
+        "error_detail": outcome.error,
+        "job_type": "annex_import",
+        "item_type": "file_ref",
+        "item_key": file_ref_id,
+        "outcome_kind": "annex_entry_observed",
+        "operation_key": operation_key,
+    })
+}
+
+fn inspect_entry_v2(
+    config: &AnnexImportConfig,
+    entry: &IndexEntry,
+    index_blob: &[u8],
+    key: &AnnexKey,
+) -> Result<EntryOutcome> {
+    let worktree_path = config.repo_path.join(raw_path(&entry.path)?);
+    let metadata = match fs::symlink_metadata(&worktree_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if key.state == KeyState::Unsupported {
+                return Ok(EntryOutcome {
+                    category: EntryCategory::Unsupported,
+                    representation: "missing_worktree_entry",
+                    content: None,
+                    error: None,
+                    path_present: false,
+                    local_bytes_present: false,
+                    copy_path: None,
+                });
+            }
+            return Ok(EntryOutcome::absent("missing_worktree_entry", false));
+        }
+        Err(error) => return Ok(EntryOutcome::read_error(error.to_string())),
+    };
+    let (representation, content_metadata, path_present, copy_path) = if entry.mode == "120000" {
+        if !metadata.file_type().is_symlink() {
+            return Ok(EntryOutcome::read_error(
+                "worktree representation changed from annex symlink".to_owned(),
+            ));
+        }
+        let target = fs::read_link(&worktree_path)
+            .map_err(|source| io_error("read annex symlink", &worktree_path, source))?;
+        if path_bytes(&target)? != index_blob {
+            return Ok(EntryOutcome::read_error(
+                "worktree symlink target differs from the Git index".to_owned(),
+            ));
+        }
+        let target_metadata = match fs::metadata(&worktree_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Ok(EntryOutcome::read_error(error.to_string())),
+        };
+        let copy_path = annex_object_relative(index_blob)
+            .and_then(|bytes| raw_path(bytes).ok())
+            .map(|path| {
+                if config.cas_location_id == config.worktree_location_id {
+                    encode_relative_path(&Path::new(".git/annex/objects").join(path))
+                } else {
+                    encode_relative_path(&path)
+                }
+            });
+        ("annex_locked_symlink", target_metadata, true, copy_path)
+    } else if metadata.file_type().is_file() {
+        if metadata.len() <= MAX_POINTER_BYTES {
+            match fs::read(&worktree_path) {
+                Ok(bytes) if annex_key_from_blob("100644", &bytes).as_deref() == Some(&key.raw) => {
+                    ("annex_pointer_file", None, true, None)
+                }
+                Ok(_) => (
+                    "annex_unlocked_file",
+                    Some(metadata),
+                    true,
+                    Some(encoded_worktree_path(entry)?),
+                ),
+                Err(error) => return Ok(EntryOutcome::read_error(error.to_string())),
+            }
+        } else {
+            (
+                "annex_unlocked_file",
+                Some(metadata),
+                true,
+                Some(encoded_worktree_path(entry)?),
+            )
+        }
+    } else {
+        return Ok(EntryOutcome::read_error(
+            "worktree entry is neither the indexed symlink nor a regular file".to_owned(),
+        ));
+    };
+    if key.state == KeyState::Unsupported {
+        return Ok(EntryOutcome {
+            category: EntryCategory::Unsupported,
+            representation,
+            content: None,
+            error: None,
+            path_present,
+            local_bytes_present: content_metadata.is_some(),
+            copy_path,
+        });
+    }
+    let Some(content_metadata) = content_metadata else {
+        return Ok(EntryOutcome::absent(representation, path_present));
+    };
+    if key.expected_sha256.is_none() {
+        return Ok(EntryOutcome {
+            category: EntryCategory::SupportedUnresolved,
+            representation,
+            content: None,
+            error: None,
+            path_present,
+            local_bytes_present: true,
+            copy_path,
+        });
+    }
+    match hash_file(&worktree_path, &content_metadata) {
+        Ok(content) => {
+            let matches = key.expected_size.is_none_or(|size| size == content.size)
+                && key.expected_sha256.as_deref() == Some(&content.sha256_hex);
+            Ok(EntryOutcome {
+                category: if matches {
+                    EntryCategory::Present
+                } else {
+                    EntryCategory::Mismatch
+                },
+                representation,
+                content: Some(content),
+                error: None,
+                path_present,
+                local_bytes_present: true,
+                copy_path,
+            })
+        }
+        Err(error) => Ok(EntryOutcome {
+            category: EntryCategory::ReadError,
+            representation,
+            content: None,
+            error: Some(error.to_string()),
+            path_present,
+            local_bytes_present: true,
+            copy_path,
+        }),
+    }
+}
+
 fn parse_location_log(key: &str, blob: &[u8]) -> Result<BTreeMap<String, &'static str>> {
     let mut states = BTreeMap::new();
     for line in blob.split(|byte| *byte == b'\n') {
@@ -1101,6 +1905,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 
 fn annex_key_from_blob(mode: &str, blob: &[u8]) -> Option<String> {
     if mode == "120000" {
+        annex_object_relative(blob)?;
         let last = blob.rsplit(|byte| *byte == b'/').next()?;
         let previous = blob.rsplit(|byte| *byte == b'/').nth(1)?;
         if last != previous {
@@ -1116,7 +1921,7 @@ fn annex_key_from_blob(mode: &str, blob: &[u8]) -> Option<String> {
 }
 
 fn annex_object_relative(blob: &[u8]) -> Option<&[u8]> {
-    const MARKER: &[u8] = b"annex/objects/";
+    const MARKER: &[u8] = b".git/annex/objects/";
     blob.windows(MARKER.len())
         .position(|window| window == MARKER)
         .map(|offset| &blob[offset + MARKER.len()..])
@@ -1674,6 +2479,17 @@ fn stable_id(prefix: &str, pieces: &[&[u8]]) -> String {
     format!("{prefix}_{}", &hasher.finalize().to_hex()[..32])
 }
 
+fn annex_now_utc_ms() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            AnnexImportError::InvalidConfig(format!("system clock is before epoch: {error}"))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| AnnexImportError::InvalidConfig("system time exceeds u64".to_owned()))
+}
+
 fn path_json(path: &EncodedPath) -> Value {
     match path.encoding.as_str() {
         "utf8" => json!({
@@ -1832,6 +2648,12 @@ mod tests {
             annex_key_from_blob("100644", format!("/annex/objects/{key}\n").as_bytes()).as_deref(),
             Some(key)
         );
+        assert!(annex_key_from_blob("120000", format!("../src/{key}/{key}").as_bytes()).is_none());
+        assert!(annex_key_from_blob(
+            "120000",
+            format!("../not-git/annex/objects/{key}/{key}").as_bytes()
+        )
+        .is_none());
         assert!(annex_key_from_blob("100644", b"ordinary content").is_none());
     }
 
@@ -1939,13 +2761,14 @@ mod tests {
             .run()
             .unwrap();
         assert_eq!(result.status, AnnexImportStatus::Complete);
-        assert_eq!(result.summary.entries_seen, 10);
+        assert_eq!(result.summary.entries_seen, 13);
         assert_eq!(result.summary.present, 4);
         assert_eq!(result.summary.absent, 2);
         assert_eq!(result.summary.unsupported, 1);
         assert_eq!(result.summary.mismatched, 1);
         assert_eq!(result.summary.read_errors, 1);
-        assert_eq!(result.summary.ignored_non_annex, 1);
+        assert_eq!(result.summary.ignored_non_annex, 4);
+        assert_eq!(result.summary.ignored_symlinks, 3);
         assert_eq!(result.summary.duplicate_paths, 1);
         assert_eq!(result.summary.availability_facts, 9);
         assert_eq!(before, tree_fingerprint(&fixture.repo));
@@ -2174,6 +2997,16 @@ mod tests {
         )
         .unwrap();
         fs::write(repo.join("ordinary.txt"), b"ordinary file\n").unwrap();
+        fs::create_dir(repo.join("organized")).unwrap();
+        std::os::unix::fs::symlink("../present.txt", repo.join("organized/present-alias.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink("../missing-target", repo.join("organized/dangling-alias"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            format!("../src/{present_key}/{present_key}"),
+            repo.join("organized/repeated-name-alias"),
+        )
+        .unwrap();
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "fixture"]);
 
