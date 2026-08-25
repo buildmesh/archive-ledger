@@ -138,6 +138,56 @@ mod unix {
     }
 
     #[test]
+    fn archive_list_and_ls_show_all_registered_archives_without_opening_them() {
+        let temp = TempDir::new().unwrap();
+        let empty = json(&success(archive(&temp).args(["--json", "list"])));
+        assert_eq!(empty["version"], 1);
+        assert!(empty["default_archive_id"].is_null());
+        assert_eq!(empty["archives"], serde_json::json!([]));
+        let empty_human = success(archive(&temp).args(["list"]));
+        assert!(String::from_utf8_lossy(&empty_human.stdout).contains("No Archives configured"));
+
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        success(archive(&temp).args([
+            "init",
+            "Work",
+            "--archive-id",
+            "arc_work",
+            "--make-default",
+            "--non-interactive",
+        ]));
+
+        let listed = json(&success(archive(&temp).args(["--json", "list"])));
+        assert_eq!(listed["default_archive_id"], "arc_work");
+        assert_eq!(listed["archives"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["archives"][0]["display_name"], "Personal");
+        assert_eq!(listed["archives"][0]["default"], false);
+        assert!(listed["archives"][0]["root"].is_string());
+        assert_eq!(listed["archives"][1]["display_name"], "Work");
+        assert_eq!(listed["archives"][1]["archive_id"], "arc_work");
+        assert_eq!(listed["archives"][1]["default"], true);
+
+        let human = success(archive(&temp).args(["list"]));
+        let alias = success(archive(&temp).args(["ls"]));
+        assert_eq!(human.stdout, alias.stdout);
+        let human = String::from_utf8_lossy(&human.stdout);
+        assert!(human.contains("  Personal (arc_personal)"));
+        assert!(human.contains("* Work (arc_work) — default"));
+
+        // Listing is registry-only: a missing catalog database remains visible
+        // instead of making discovery fail while the user chooses or repairs it.
+        fs::remove_file(root(&temp).join("archive.db")).unwrap();
+        let still_listed = json(&success(archive(&temp).args(["--json", "list"])));
+        assert_eq!(still_listed["archives"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn fsck_is_read_only_and_full_mode_compares_a_disposable_rebuild() {
         let temp = TempDir::new().unwrap();
         success(archive(&temp).args([

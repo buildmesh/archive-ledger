@@ -188,6 +188,9 @@ enum Command {
         #[arg(long, hide = true)]
         fingerprint_kind: Option<String>,
     },
+    /// List every registered Archive and mark the default.
+    #[command(visible_alias = "ls")]
+    List,
     /// Select the default Archive for later commands.
     Use { archive: String },
     /// Rename the selected Archive without changing its stable ID.
@@ -1862,6 +1865,14 @@ fn main() -> ExitCode {
 }
 
 fn execute(cli: &mut Cli) -> Result<u8, AppError> {
+    if let Command::List = &cli.command {
+        if cli.archive.is_some() || cli.database.is_some() || cli.events.is_some() {
+            return Err(AppError::Input(
+                "archive list cannot be combined with --archive or --database/--events".to_owned(),
+            ));
+        }
+        return execute_archive_list(cli.json);
+    }
     if let Command::Use { archive } = &cli.command {
         let mut registry = CatalogRegistry::load()?;
         let selected = if selector_is_path(archive) {
@@ -2015,6 +2026,7 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             Command::Init { .. } => {
                 unreachable!("init returned before opening an existing database")
             }
+            Command::List => unreachable!("list returned before opening SQLite"),
             Command::Use { .. } => unreachable!("use returned before opening SQLite"),
             Command::Rename { new_name } => execute_archive_rename(cli, &database, new_name),
             Command::Status => execute_status(&database, cli.json),
@@ -2147,6 +2159,55 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             Command::Restore { .. } => unreachable!("restore returned before opening SQLite"),
         }
     }
+}
+
+fn execute_archive_list(json_output: bool) -> Result<u8, AppError> {
+    let registry = CatalogRegistry::load()?;
+    let default_id = registry.default_archive_id();
+    let mut archives = registry.archives().iter().collect::<Vec<_>>();
+    archives.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then(left.archive_id.cmp(&right.archive_id))
+    });
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "default_archive_id": default_id,
+                "archives": archives.iter().map(|archive| json!({
+                    "archive_id": archive.archive_id,
+                    "display_name": archive.display_name,
+                    "root": archive.root,
+                    "default": default_id == Some(archive.archive_id.as_str()),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+    } else if archives.is_empty() {
+        println!("No Archives configured.");
+        println!("Next: archive init <name>");
+    } else {
+        println!("Archives:");
+        for archive in archives {
+            println!(
+                "{} {} ({}){}",
+                if default_id == Some(archive.archive_id.as_str()) {
+                    "*"
+                } else {
+                    " "
+                },
+                archive.display_name,
+                archive.archive_id,
+                if default_id == Some(archive.archive_id.as_str()) {
+                    " — default"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(EXIT_OK)
 }
 
 fn execute_v2_clone(

@@ -120,9 +120,14 @@ The first Archive becomes the default. Additional Archives can be selected expli
 
 ```bash
 archive init "Work archive"
+archive list                 # `archive ls` is equivalent
 archive use "Personal archive"
 archive --archive "Work archive" status
 ```
+
+`archive list` reads only the per-user Archive registry, marks the default, and remains usable if
+one registered catalog is unavailable or needs repair. `archive list --json` also returns each
+Archive's stable ID and catalog root for scripts.
 
 Catalogs live under the XDG data directory, normally
 `~/.local/share/archive-ledger/archives/<archive-id>/`. Normal output confirms the Archive and

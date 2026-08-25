@@ -109,6 +109,10 @@ impl CatalogRegistry {
         &self.archives
     }
 
+    pub fn default_archive_id(&self) -> Option<&str> {
+        self.default_archive_id.as_deref()
+    }
+
     pub fn resolve(&self, selector: Option<&str>) -> Result<KnownArchive> {
         if let Some(selector) = selector {
             let matches: Vec<_> = self
