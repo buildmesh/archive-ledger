@@ -667,18 +667,19 @@ enum FileCommand {
     Find(FileFindArgs),
     /// Show one logical file and all current copy evidence.
     Show { file_ref_id: String },
-    /// Show canonical history mirrored in SQLite.
+    /// Stream authenticated canonical history for one logical File.
     History {
         file_ref_id: String,
-        #[arg(long, default_value_t = 0)]
-        after_seq: u64,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[arg(long = "continue")]
+        continuation: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum ObjectCommand {
+    /// Show one Object and a bounded page of its logical Files from SQLite.
     Show {
         object_id: String,
         #[arg(long, default_value_t = 100)]
@@ -686,12 +687,13 @@ enum ObjectCommand {
         #[arg(long = "continue")]
         continuation: Option<String>,
     },
+    /// Stream authenticated canonical history for one Object.
     History {
         object_id: String,
-        #[arg(long, default_value_t = 0)]
-        after_seq: u64,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[arg(long = "continue")]
+        continuation: Option<String>,
     },
 }
 
@@ -1882,7 +1884,10 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
     }
     if let Ok(database) = V2ProjectionDb::open_existing(cli.database_path()) {
         if let Command::File { command } = &cli.command {
-            return execute_v2_file(&database, command, cli.json);
+            return execute_v2_file(&database, cli.events_path(), command, cli.json);
+        }
+        if let Command::Object { command } = &cli.command {
+            return execute_v2_object(&database, cli.events_path(), command, cli.json);
         }
         if let Some(result) = execute_v2_registry_command(cli, &database)? {
             return Ok(result);
@@ -4886,10 +4891,10 @@ fn execute_object(
         }
         ObjectCommand::History {
             object_id,
-            after_seq,
             limit,
+            continuation: _,
         } => {
-            let history = database.object_history(object_id, *after_seq, *limit)?;
+            let history = database.object_history(object_id, 0, *limit)?;
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&history)?);
             } else {
@@ -13745,10 +13750,10 @@ fn execute_file(
         }
         FileCommand::History {
             file_ref_id,
-            after_seq,
             limit,
+            continuation: _,
         } => {
-            let page = database.file_history(file_ref_id, *after_seq, *limit)?;
+            let page = database.file_history(file_ref_id, 0, *limit)?;
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&page)?);
             } else {
@@ -13766,6 +13771,7 @@ fn execute_file(
 
 fn execute_v2_file(
     database: &V2ProjectionDb,
+    events_path: &Path,
     command: &FileCommand,
     as_json: bool,
 ) -> Result<u8, AppError> {
@@ -13875,13 +13881,94 @@ fn execute_v2_file(
                 }
             }
         }
-        FileCommand::History { .. } => {
-            return Err(AppError::Input(
-                "file history is not yet available for version 2 Archives".to_owned(),
-            ));
+        FileCommand::History {
+            file_ref_id,
+            limit,
+            continuation,
+        } => {
+            let store = V2OriginStore::open(events_path)?;
+            let history =
+                database.file_history(&store, file_ref_id, *limit, continuation.clone())?;
+            print_v2_history(&history, as_json)?;
         }
     }
     Ok(EXIT_OK)
+}
+
+fn execute_v2_object(
+    database: &V2ProjectionDb,
+    events_path: &Path,
+    command: &ObjectCommand,
+    as_json: bool,
+) -> Result<u8, AppError> {
+    match command {
+        ObjectCommand::Show {
+            object_id,
+            limit,
+            continuation,
+        } => {
+            let review = database.review_object(object_id, *limit, continuation.clone())?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&review)?);
+            } else {
+                println!("Object: {}", review.object_id);
+                println!(
+                    "Hash: {}:{}",
+                    review.canonical_hash_algo, review.canonical_hash_hex
+                );
+                println!("Size: {} bytes", review.size_bytes);
+                println!("Files on this page: {}", review.files.items.len());
+                for file in &review.files.items {
+                    println!(
+                        "  {}  [{}]  ({})",
+                        file.logical_path.display, file.collection_name, file.file_ref_id
+                    );
+                }
+                if let Some(next) = review.files.next {
+                    println!("More paths: rerun with --continue {next}");
+                }
+            }
+        }
+        ObjectCommand::History {
+            object_id,
+            limit,
+            continuation,
+        } => {
+            let store = V2OriginStore::open(events_path)?;
+            let history =
+                database.object_history(&store, object_id, *limit, continuation.clone())?;
+            print_v2_history(&history, as_json)?;
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn print_v2_history(
+    history: &archive_ledger::V2HistoryPage,
+    as_json: bool,
+) -> Result<(), AppError> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(history)?);
+        return Ok(());
+    }
+    if history.items.is_empty() {
+        println!("No matching history entries.");
+    } else {
+        for entry in &history.items {
+            println!(
+                "{}  {}  {}  {}:{}",
+                entry.time_utc_ms,
+                entry.item_kind,
+                entry.operation_kind,
+                entry.origin_id,
+                entry.origin_seq
+            );
+        }
+    }
+    if let Some(next) = &history.next {
+        println!("More history: rerun with --continue {next}");
+    }
+    Ok(())
 }
 
 fn execute_policy_update(

@@ -1358,6 +1358,18 @@ impl V2OriginStore {
     /// Fully verifies canonical history while retaining only coordination
     /// batch starts and the initialization approval needed by consumers.
     pub fn verify_compact(&self) -> Result<VerifiedV2Archive> {
+        self.visit_verified(|_| Ok(()))
+    }
+
+    /// Fully verifies canonical history and yields each authenticated record
+    /// without retaining decoded batch chunks in memory.
+    ///
+    /// This is reserved for explicit audit/history operations. Routine reads
+    /// should use the SQLite projection instead.
+    pub fn visit_verified<F>(&self, mut visitor: F) -> Result<VerifiedV2Archive>
+    where
+        F: FnMut(&VerifiedV2Record) -> Result<()>,
+    {
         let genesis_path = self.root.join("genesis.json");
         let genesis_bytes = read_file(&genesis_path)?;
         let genesis: SignedGenesis = parse_json(&genesis_path, &genesis_bytes)?;
@@ -1430,7 +1442,7 @@ impl V2OriginStore {
             &mut clients,
             true,
             &mut retained_starts,
-            &mut |_| Ok(()),
+            &mut visitor,
         )?;
         let (approval_origin, approval_seq) =
             initial_stats.archive_initialized_at.ok_or_else(|| {
@@ -1482,7 +1494,7 @@ impl V2OriginStore {
                     &mut clients,
                     true,
                     &mut retained_starts,
-                    &mut |_| Ok(()),
+                    &mut visitor,
                 )?;
                 record_count = record_count
                     .checked_add(stats.records)

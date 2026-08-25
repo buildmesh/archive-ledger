@@ -1,5 +1,10 @@
-//! Fast, SQLite-only catalog review queries.
+//! Bounded catalog review queries.
+//!
+//! Routine summaries use SQLite only. Explicit v2 history reads stream and
+//! authenticate canonical records because their payloads are not duplicated
+//! in the materialized view.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -11,7 +16,9 @@ use thiserror::Error;
 
 use crate::discovery::{EncodedPath, PathEncoding};
 use crate::projection::{ProjectionDb, ProjectionError};
+use crate::v2_event::V2RecordKind;
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
+use crate::v2_store::{V2OriginStore, V2StoreError, VerifiedV2Record};
 
 const OUTPUT_VERSION: u32 = 1;
 const TOKEN_VERSION: u32 = 1;
@@ -26,6 +33,9 @@ pub enum ReviewError {
 
     #[error(transparent)]
     V2Projection(#[from] V2ProjectionError),
+
+    #[error(transparent)]
+    V2Store(#[from] V2StoreError),
 
     #[error("SQLite operation failed for {path}: {source}")]
     Sqlite {
@@ -55,6 +65,7 @@ impl ReviewError {
         match self {
             Self::Projection(error) => error.code(),
             Self::V2Projection(error) => error.code(),
+            Self::V2Store(error) => error.code(),
             Self::Sqlite { .. } => "review_sqlite",
             Self::InvalidLimit => "invalid_limit",
             Self::InvalidContinuation => "invalid_continuation",
@@ -219,6 +230,27 @@ pub struct HistoryPage {
     pub next_seq: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct V2HistoryEntry {
+    pub origin_id: String,
+    pub origin_seq: u64,
+    pub record_id: String,
+    pub time_utc_ms: u64,
+    pub batch_id: String,
+    pub operation_kind: String,
+    pub item_index: u64,
+    pub item_kind: String,
+    pub item: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct V2HistoryPage {
+    pub version: u32,
+    pub accepted_frontier_hash: String,
+    pub items: Vec<V2HistoryEntry>,
+    pub next: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectHashReview {
     pub hash_algo: String,
@@ -262,6 +294,23 @@ struct CopyToken {
     path_encoding: String,
     path_bytes: String,
     copy_claim_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2HistoryToken {
+    version: u32,
+    accepted_frontier_hash: String,
+    subject_kind: String,
+    subject_id: String,
+    offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct V2BatchHistoryContext {
+    operation_kind: String,
+    item_schema_version: u64,
+    defaults: serde_json::Value,
 }
 
 impl ProjectionDb {
@@ -1045,6 +1094,362 @@ impl V2ProjectionDb {
             copies_truncated,
         })
     }
+
+    pub fn review_object(
+        &self,
+        object_id: &str,
+        limit: usize,
+        continuation: Option<String>,
+    ) -> Result<ObjectReview> {
+        validate_limit(limit)?;
+        let connection = open(self.path())?;
+        let object = connection
+            .query_row(
+                "SELECT canonical_hash_algo, canonical_hash_hex, size_bytes,
+                        media_type, extension_hint
+                 FROM objects WHERE object_id = ?1",
+                [object_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| sqlite_error(self.path(), source))?
+            .ok_or_else(|| ReviewError::NotFound {
+                kind: "object",
+                id: object_id.to_owned(),
+            })?;
+        let mut statement = connection
+            .prepare(
+                "SELECT hash_algo, hash_hex, source FROM object_hashes
+                 WHERE object_id = ?1 ORDER BY hash_algo, hash_hex",
+            )
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let hashes = statement
+            .query_map([object_id], |row| {
+                Ok(ObjectHashReview {
+                    hash_algo: row.get(0)?,
+                    hash_hex: row.get(1)?,
+                    source: row.get(2)?,
+                })
+            })
+            .map_err(|source| sqlite_error(self.path(), source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let files = self.find_files(FilePageRequest {
+            filter: FileFilter {
+                object_id: Some(object_id.to_owned()),
+                ..FileFilter::default()
+            },
+            limit,
+            continuation,
+        })?;
+        Ok(ObjectReview {
+            version: 2,
+            applied_event_seq: files.applied_event_seq,
+            object_id: object_id.to_owned(),
+            canonical_hash_algo: object.0,
+            canonical_hash_hex: object.1,
+            size_bytes: sql_u64(object.2)?,
+            media_type: object.3,
+            extension_hint: object.4,
+            hashes,
+            files,
+        })
+    }
+
+    pub fn file_history(
+        &self,
+        store: &V2OriginStore,
+        file_ref_id: &str,
+        limit: usize,
+        continuation: Option<String>,
+    ) -> Result<V2HistoryPage> {
+        self.require_v2_subject("file", "file_refs", "file_ref_id", file_ref_id)?;
+        v2_history(
+            store,
+            "file",
+            "file_ref_id",
+            file_ref_id,
+            limit,
+            continuation,
+        )
+    }
+
+    pub fn object_history(
+        &self,
+        store: &V2OriginStore,
+        object_id: &str,
+        limit: usize,
+        continuation: Option<String>,
+    ) -> Result<V2HistoryPage> {
+        self.require_v2_subject("object", "objects", "object_id", object_id)?;
+        v2_history(store, "object", "object_id", object_id, limit, continuation)
+    }
+
+    fn require_v2_subject(
+        &self,
+        kind: &'static str,
+        table: &'static str,
+        column: &'static str,
+        id: &str,
+    ) -> Result<()> {
+        let connection = open(self.path())?;
+        let known: bool = connection
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1)"),
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        if known {
+            Ok(())
+        } else {
+            Err(ReviewError::NotFound {
+                kind,
+                id: id.to_owned(),
+            })
+        }
+    }
+}
+
+fn v2_history(
+    store: &V2OriginStore,
+    subject_kind: &'static str,
+    subject_field: &'static str,
+    subject_id: &str,
+    limit: usize,
+    continuation: Option<String>,
+) -> Result<V2HistoryPage> {
+    validate_limit(limit)?;
+    let cursor = continuation
+        .as_deref()
+        .map(decode_v2_history_token)
+        .transpose()?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.subject_kind != subject_kind || cursor.subject_id != subject_id
+    }) {
+        return Err(ReviewError::InvalidContinuation);
+    }
+    let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
+    let end = offset
+        .checked_add(u64::try_from(limit).map_err(|_| ReviewError::InvalidLimit)?)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ReviewError::InvalidContinuation)?;
+    let mut batches = BTreeMap::<String, V2BatchHistoryContext>::new();
+    let mut matched = 0_u64;
+    let mut items = Vec::with_capacity(limit.saturating_add(1));
+    let verified = store.visit_verified(|record| {
+        collect_v2_history_record(
+            record,
+            subject_field,
+            subject_id,
+            offset,
+            end,
+            &mut matched,
+            &mut items,
+            &mut batches,
+        )
+    })?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.accepted_frontier_hash != verified.accepted_frontier_hash)
+    {
+        return Err(ReviewError::StaleContinuation);
+    }
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next = if has_more {
+        Some(encode_v2_history_token(&V2HistoryToken {
+            version: TOKEN_VERSION,
+            accepted_frontier_hash: verified.accepted_frontier_hash.clone(),
+            subject_kind: subject_kind.to_owned(),
+            subject_id: subject_id.to_owned(),
+            offset: offset
+                .checked_add(u64::try_from(items.len()).unwrap_or(u64::MAX))
+                .ok_or(ReviewError::InvalidContinuation)?,
+        })?)
+    } else {
+        None
+    };
+    Ok(V2HistoryPage {
+        version: 2,
+        accepted_frontier_hash: verified.accepted_frontier_hash,
+        items,
+        next,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_v2_history_record(
+    record: &VerifiedV2Record,
+    subject_field: &str,
+    subject_id: &str,
+    offset: u64,
+    end: u64,
+    matched: &mut u64,
+    entries: &mut Vec<V2HistoryEntry>,
+    batches: &mut BTreeMap<String, V2BatchHistoryContext>,
+) -> std::result::Result<(), V2StoreError> {
+    let envelope = &record.record.envelope;
+    match envelope.record_kind {
+        V2RecordKind::BatchStart => {
+            let payload = history_object(&envelope.payload, "batch_start payload")?;
+            let operation_kind = history_string(payload, "operation_kind")?.to_owned();
+            let item_schema_version = history_number(payload, "item_schema_version")?;
+            if !matches!(item_schema_version, 1 | 2) {
+                return Err(V2StoreError::Invalid(format!(
+                    "unsupported batch item schema version {item_schema_version}"
+                )));
+            }
+            let defaults = payload
+                .get("defaults")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    V2StoreError::Invalid("batch_start defaults must be an object".to_owned())
+                })?;
+            batches.insert(
+                envelope.batch_id.clone(),
+                V2BatchHistoryContext {
+                    operation_kind,
+                    item_schema_version,
+                    defaults,
+                },
+            );
+        }
+        V2RecordKind::BatchChunk => {
+            let batch = batches.get(&envelope.batch_id).ok_or_else(|| {
+                V2StoreError::Invalid(format!(
+                    "batch {} chunk has no preceding start",
+                    envelope.batch_id
+                ))
+            })?;
+            let payload = history_object(&envelope.payload, "batch_chunk payload")?;
+            let first = history_number(payload, "first_item_index")?;
+            let chunk_items = payload
+                .get("items")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    V2StoreError::Invalid("batch_chunk items must be an array".to_owned())
+                })?;
+            for (position, raw_item) in chunk_items.iter().enumerate() {
+                let item = materialize_v2_history_item(
+                    raw_item,
+                    batch.item_schema_version,
+                    &batch.defaults,
+                )?;
+                if item.get(subject_field).and_then(serde_json::Value::as_str) != Some(subject_id) {
+                    continue;
+                }
+                let item_position = u64::try_from(position)
+                    .map_err(|_| V2StoreError::Invalid("item index overflow".to_owned()))?;
+                let item_index = first
+                    .checked_add(item_position)
+                    .ok_or_else(|| V2StoreError::Invalid("item index overflow".to_owned()))?;
+                if *matched >= offset && *matched < end {
+                    let item_kind = history_string(&item, "kind")?.to_owned();
+                    entries.push(V2HistoryEntry {
+                        origin_id: envelope.origin_id.clone(),
+                        origin_seq: envelope.origin_seq,
+                        record_id: envelope.record_id.clone(),
+                        time_utc_ms: envelope.time_utc_ms,
+                        batch_id: envelope.batch_id.clone(),
+                        operation_kind: batch.operation_kind.clone(),
+                        item_index,
+                        item_kind,
+                        item: serde_json::Value::Object(item),
+                    });
+                }
+                *matched = matched
+                    .checked_add(1)
+                    .ok_or_else(|| V2StoreError::Invalid("history count overflow".to_owned()))?;
+            }
+        }
+        V2RecordKind::BatchComplete => {
+            batches.remove(&envelope.batch_id);
+        }
+    }
+    Ok(())
+}
+
+fn materialize_v2_history_item(
+    item: &serde_json::Value,
+    item_schema_version: u64,
+    defaults: &serde_json::Value,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, V2StoreError> {
+    let item = history_object(item, "batch item")?;
+    if item_schema_version == 1 {
+        return Ok(item.clone());
+    }
+    let kind = history_string(item, "kind")?;
+    let mut materialized = defaults
+        .as_object()
+        .and_then(|defaults| defaults.get(kind))
+        .map(|values| history_object(values, "item defaults"))
+        .transpose()?
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in item {
+        materialized.insert(key.clone(), value.clone());
+    }
+    Ok(materialized)
+}
+
+fn history_object<'a>(
+    value: &'a serde_json::Value,
+    description: &str,
+) -> std::result::Result<&'a serde_json::Map<String, serde_json::Value>, V2StoreError> {
+    value
+        .as_object()
+        .ok_or_else(|| V2StoreError::Invalid(format!("{description} must be an object")))
+}
+
+fn history_string<'a>(
+    value: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<&'a str, V2StoreError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| V2StoreError::Invalid(format!("history item is missing string {key}")))
+}
+
+fn history_number(
+    value: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<u64, V2StoreError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| V2StoreError::Invalid(format!("history item is missing integer {key}")))
+}
+
+fn encode_v2_history_token(token: &V2HistoryToken) -> Result<String> {
+    serde_json::to_vec(token)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|_| ReviewError::InvalidContinuation)
+}
+
+fn decode_v2_history_token(token: &str) -> Result<V2HistoryToken> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ReviewError::InvalidContinuation)?;
+    let token: V2HistoryToken =
+        serde_json::from_slice(&bytes).map_err(|_| ReviewError::InvalidContinuation)?;
+    if token.version != TOKEN_VERSION
+        || token.subject_kind.is_empty()
+        || token.subject_id.is_empty()
+    {
+        return Err(ReviewError::InvalidContinuation);
+    }
+    Ok(token)
 }
 
 fn history_query(
@@ -1354,6 +1759,8 @@ mod tests {
 
     use super::*;
     use crate::projection::ProjectionConfig;
+    use crate::v2_store::initialize_v2_archive;
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn seeded_database(temp: &TempDir) -> ProjectionDb {
@@ -1431,6 +1838,73 @@ mod tests {
             )
             .unwrap();
         database
+    }
+
+    fn seeded_v2_database(temp: &TempDir) -> (V2OriginStore, V2ProjectionDb, String) {
+        let archive = temp.path().join("v2-archive");
+        initialize_v2_archive(&archive, "arc_review_v2", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let database_path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &database_path).unwrap();
+        let hash = "a".repeat(64);
+        let object_id = format!("blake3:{hash}");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"
+                INSERT INTO collections(
+                  collection_id, display_name, description, home_site_id, policy_id,
+                  status, last_record_id
+                ) VALUES ('collection_1', 'Photos', NULL, NULL, NULL, 'active', 'seed');
+                INSERT INTO objects(
+                  object_id, canonical_hash_algo, canonical_hash_hex, size_bytes,
+                  media_type, extension_hint, first_seen_record_id, first_seen_time_utc_ms
+                ) VALUES ('{object_id}', 'blake3', '{hash}', 42,
+                          'image/jpeg', 'jpg', 'seed', 100);
+                INSERT INTO object_hashes(
+                  object_id, hash_algo, hash_hex, source, verified_record_id
+                ) VALUES ('{object_id}', 'sha256', 'bbbb', 'import', 'seed');
+                INSERT INTO file_refs(
+                  file_ref_id, collection_id, logical_path_bytes, logical_path_encoding,
+                  logical_path_display, object_id, external_identity_id, identity_state,
+                  path_state, created_time_utc_ms, modified_time_utc_ms,
+                  observed_size_bytes, first_seen_record_id, last_seen_record_id,
+                  removed_record_id
+                ) VALUES
+                  ('file_a', 'collection_1', X'612e6a7067', 'utf8', 'a.jpg',
+                   '{object_id}', NULL, 'resolved', 'active', 100, 100, 42,
+                   'seed', 'seed', NULL),
+                  ('file_b', 'collection_1', X'622e6a7067', 'utf8', 'b.jpg',
+                   '{object_id}', NULL, 'resolved', 'active', 100, 100, 42,
+                   'seed', 'seed', NULL);
+                "#
+            ))
+            .unwrap();
+        drop(connection);
+        for observation in ["first", "second"] {
+            store
+                .append_batch(
+                    "inventory",
+                    2,
+                    json!({}),
+                    json!({
+                        "content_observed": {
+                            "file_ref_id": "file_a",
+                            "object_id": object_id,
+                        }
+                    }),
+                    vec![json!({
+                        "kind": "content_observed",
+                        "observation": observation,
+                    })],
+                )
+                .unwrap();
+        }
+        (
+            store,
+            V2ProjectionDb::open_existing(database_path).unwrap(),
+            object_id,
+        )
     }
 
     #[test]
@@ -1580,6 +2054,54 @@ mod tests {
         assert!(object.files.next.is_some());
         let object_history = database.object_history("object_1", 0, 10).unwrap();
         assert_eq!(object_history.items.len(), 2);
+    }
+
+    #[test]
+    fn v2_object_review_and_canonical_history_are_bounded_and_frontier_bound() {
+        let temp = TempDir::new().unwrap();
+        let (store, database, object_id) = seeded_v2_database(&temp);
+
+        let object = database.review_object(&object_id, 1, None).unwrap();
+        assert_eq!(object.version, 2);
+        assert_eq!(object.size_bytes, 42);
+        assert_eq!(object.files.items.len(), 1);
+        assert!(object.files.next.is_some());
+
+        let first = database.file_history(&store, "file_a", 1, None).unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].item_kind, "content_observed");
+        assert_eq!(first.items[0].item["file_ref_id"], "file_a");
+        assert_eq!(first.items[0].item["object_id"], object_id);
+        let continuation = first.next.clone().unwrap();
+        let second = database
+            .file_history(&store, "file_a", 1, first.next)
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].item["observation"], "second");
+        assert!(second.next.is_none());
+
+        let object_history = database
+            .object_history(&store, &object_id, 10, None)
+            .unwrap();
+        assert_eq!(object_history.items.len(), 2);
+        assert!(matches!(
+            database.file_history(&store, "missing", 10, None),
+            Err(ReviewError::NotFound { kind: "file", .. })
+        ));
+
+        store
+            .append_batch(
+                "unrelated",
+                1,
+                json!({}),
+                json!({}),
+                vec![json!({"kind": "job_finished", "job_id": "job_1"})],
+            )
+            .unwrap();
+        assert!(matches!(
+            database.file_history(&store, "file_a", 1, Some(continuation)),
+            Err(ReviewError::StaleContinuation)
+        ));
     }
 
     #[test]

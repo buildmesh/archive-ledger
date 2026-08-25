@@ -68,7 +68,7 @@ pub use registry::{
 pub use review::{
     utf8_path, CopyFilter, CopyPage, CopyPageRequest, CopyReview, FileFilter, FilePage,
     FilePageRequest, FileReview, FileSummary, HistoryEntry, HistoryPage, LosslessPath,
-    ObjectHashReview, ObjectReview, ReviewError,
+    ObjectHashReview, ObjectReview, ReviewError, V2HistoryEntry, V2HistoryPage,
 };
 pub use safe_copy::{
     copy_verified_no_replace, place_directory_no_replace, verify_existing_file, SafeCopyError,

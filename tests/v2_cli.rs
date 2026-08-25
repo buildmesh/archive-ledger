@@ -1012,8 +1012,51 @@ mod unix {
             "duplicate-content paths expose the same two physical claims",
         );
         assert_eq!(shown["file_review"]["copies_truncated"], false);
+        let object_id = shown["file_review"]["file"]["object_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let object =
+            json(&success(archive(&temp).args([
+                "--json", "object", "show", &object_id, "--limit", "1",
+            ])));
+        assert_eq!(object["version"], 2);
+        assert_eq!(object["object_id"], object_id);
+        assert_eq!(object["files"]["items"].as_array().unwrap().len(), 1);
+        assert!(object["files"]["next"].is_string());
+
+        let history = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "history",
+            &first_file_id,
+            "--limit",
+            "1",
+        ])));
+        assert_eq!(history["version"], 2);
+        assert_eq!(history["items"].as_array().unwrap().len(), 1);
+        assert_eq!(history["items"][0]["item"]["file_ref_id"], first_file_id);
+        let history_continuation = history["next"].as_str().unwrap();
+        let next_history = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "history",
+            &first_file_id,
+            "--limit",
+            "1",
+            "--continue",
+            history_continuation,
+        ])));
+        assert_eq!(next_history["items"].as_array().unwrap().len(), 1);
+        let object_history = json(&success(
+            archive(&temp).args(["--json", "object", "history", &object_id]),
+        ));
+        assert!(object_history["items"].as_array().unwrap().len() >= 2);
         let human = success(archive(&temp).args(["file", "show", &first_file_id]));
         assert!(String::from_utf8_lossy(&human.stdout).contains("Copies:"));
+        let human_history =
+            success(archive(&temp).args(["file", "history", &first_file_id, "--limit", "1"]));
+        assert!(String::from_utf8_lossy(&human_history.stdout).contains("content_observed"));
         let missing = archive(&temp)
             .args(["--json", "file", "show", "file_missing"])
             .output()

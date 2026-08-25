@@ -413,6 +413,9 @@ archive d ls
 archive s ls
 archive file find --collection "Documents" --limit 100
 archive file show <file-id>
+archive file history <file-id> --limit 100
+archive object show <object-id> --limit 100
+archive object history <object-id> --limit 100
 ```
 
 `c`, `l`, `d`, and `s` are shortcuts for `collection`, `location`, `device`, and `site`;
@@ -432,7 +435,13 @@ Collections with hundreds of thousands of Files remain reviewable without runnin
 of `ls` or loading the full result in memory. `file find` accepts a Collection name or stable ID
 and supports `--exact` and `--prefix` logical-path filters. `file show` reports the exact total
 Copy count and returns at most 1,000 detailed Copy rows; JSON sets `copies_truncated` when more
-rows exist.
+rows exist. `object show` similarly returns a bounded, continuable page of the logical Files that
+refer to one content Object, so heavily deduplicated content cannot produce an unbounded response.
+
+`file history` and `object history` are explicit audit operations. They authenticate and stream
+canonical event records in bounded memory because full event payloads are deliberately not
+duplicated in SQLite. Use the printed `--continue` token for another page; the command rejects a
+token if canonical history has advanced, so a page sequence cannot silently mix snapshots.
 
 Risk reports automatically refresh missing or stale derived assessments from SQLite; they never
 scan storage or replay canonical history. Review the starter Policy and simulated loss results:
