@@ -230,6 +230,11 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+    /// Configure or run bounded stale-presence refresh work.
+    Background {
+        #[command(subcommand)]
+        command: BackgroundCommand,
+    },
     /// Manage sites through canonical full-snapshot events.
     #[command(visible_alias = "s")]
     Site {
@@ -507,6 +512,26 @@ enum JobCommand {
     Resume {
         job_id: String,
         #[arg(long, hide = true)]
+        max_items: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BackgroundCommand {
+    /// Enable one-shot background work for an external scheduler.
+    Enable {
+        #[arg(long, default_value_t = 100)]
+        max_items: usize,
+    },
+    /// Disable background work without changing Archive facts.
+    Disable,
+    /// Pause scheduled runs while preserving configuration.
+    Pause,
+    /// Show local background configuration and pending stale work.
+    Status,
+    /// Run or resume one bounded stale-presence refresh pass.
+    Run {
+        #[arg(long)]
         max_items: Option<usize>,
     },
 }
@@ -1674,6 +1699,61 @@ struct LocalJob {
     input_version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackgroundConfig {
+    version: u32,
+    enabled: bool,
+    paused: bool,
+    max_items: usize,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            enabled: false,
+            paused: false,
+            max_items: 100,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BackgroundTarget {
+    copy_claim_id: String,
+    collection_id: String,
+    location_id: String,
+    file_ref_id: String,
+    object_id: String,
+    blake3_hex: String,
+    size_bytes: u64,
+    logical_path: RegistryPath,
+    copy_path: RegistryPath,
+    location_root: PathBuf,
+    device_fingerprint_status: String,
+}
+
+#[derive(Debug)]
+struct BackgroundVerificationFailure<'a> {
+    result: &'a str,
+    observed_hash_hex: Option<&'a str>,
+    observed_size: Option<u64>,
+    duration_ms: u64,
+    detail: &'a str,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BackgroundRunSummary {
+    selected: u64,
+    verified_ok: u64,
+    hash_mismatches: u64,
+    read_errors: u64,
+    skipped_devices: u64,
+    bytes_read: u64,
+    remaining_stale: u64,
+}
+
 #[derive(Debug)]
 struct VerificationTarget {
     copy_claim_id: String,
@@ -1950,6 +2030,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             },
             Command::AnnexRemote { command } => execute_annex_remote(cli, &database, command),
             Command::Job { command } => execute_job(cli, &database, command),
+            Command::Background { .. } => Err(AppError::Input(
+                "background work requires a version 2 Archive".to_owned(),
+            )),
             Command::Site { command } => execute_site(cli, &database, command),
             Command::Collection { command } => execute_collection(cli, &database, command),
             Command::Device { command } => execute_device(cli, &database, command),
@@ -7575,6 +7658,7 @@ fn execute_v2_registry_command(
         }
         Command::Stage(args) => execute_v2_stage(cli, database, args)?,
         Command::Job { command } => execute_v2_job(cli, database, command)?,
+        Command::Background { command } => execute_v2_background(cli, database, command)?,
         Command::Report { command } => execute_v2_report(cli, database, command)?,
         _ => return Ok(None),
     };
@@ -8796,6 +8880,9 @@ fn execute_v2_job(
                         },
                     )?;
                 }
+                "background_stale" => {
+                    execute_v2_background_run(cli, database, Some(job.job_id), *max_items)?;
+                }
                 other => {
                     return Err(AppError::Input(format!(
                         "resume is not yet implemented for v2 job type {other}"
@@ -8805,6 +8892,779 @@ fn execute_v2_job(
         }
     }
     Ok(EXIT_OK)
+}
+
+fn execute_v2_background(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    command: &BackgroundCommand,
+) -> Result<u8, AppError> {
+    let mut config = load_background_config(cli)?;
+    match command {
+        BackgroundCommand::Enable { max_items } => {
+            validate_background_limit(*max_items)?;
+            config.enabled = true;
+            config.paused = false;
+            config.max_items = *max_items;
+            save_background_config(cli, &config)?;
+            print_background_status(cli, database, &config)?;
+            Ok(EXIT_OK)
+        }
+        BackgroundCommand::Disable => {
+            config.enabled = false;
+            config.paused = false;
+            save_background_config(cli, &config)?;
+            print_background_status(cli, database, &config)?;
+            Ok(EXIT_OK)
+        }
+        BackgroundCommand::Pause => {
+            config.paused = true;
+            save_background_config(cli, &config)?;
+            print_background_status(cli, database, &config)?;
+            Ok(EXIT_OK)
+        }
+        BackgroundCommand::Status => {
+            print_background_status(cli, database, &config)?;
+            Ok(EXIT_OK)
+        }
+        BackgroundCommand::Run { max_items } => {
+            execute_v2_background_run(cli, database, None, *max_items)
+        }
+    }
+}
+
+fn background_config_path(cli: &Cli) -> Result<PathBuf, AppError> {
+    cli.events_path()
+        .parent()
+        .map(|root| root.join("local/background.json"))
+        .ok_or_else(|| AppError::Input("canonical event path has no Archive parent".to_owned()))
+}
+
+fn load_background_config(cli: &Cli) -> Result<BackgroundConfig, AppError> {
+    let path = background_config_path(cli)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let config: BackgroundConfig = serde_json::from_slice(&bytes).map_err(|error| {
+                AppError::Input(format!(
+                    "background configuration is invalid at {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if config.version != 1 {
+                return Err(AppError::Input(format!(
+                    "unsupported background configuration version {}",
+                    config.version
+                )));
+            }
+            validate_background_limit(config.max_items)?;
+            Ok(config)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(BackgroundConfig::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_background_config(cli: &Cli, config: &BackgroundConfig) -> Result<(), AppError> {
+    let path = background_config_path(cli)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Input("background config path has no parent".to_owned()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".background-{}.tmp",
+        ulid::Ulid::new().to_string().to_ascii_lowercase()
+    ));
+    let bytes = serde_json::to_vec_pretty(config)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+fn validate_background_limit(limit: usize) -> Result<(), AppError> {
+    if !(1..=1_000).contains(&limit) {
+        return Err(AppError::Input(
+            "background max-items must be between 1 and 1000".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn print_background_status(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    config: &BackgroundConfig,
+) -> Result<(), AppError> {
+    let pending = count_background_stale(database)?;
+    let running = running_background_job(database, &cli.host)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "enabled": config.enabled,
+                "paused": config.paused,
+                "max_items": config.max_items,
+                "pending_stale_presence": pending,
+                "running_job_id": running,
+                "execution_model": "external_scheduler_one_shot",
+            }))?
+        );
+    } else {
+        println!(
+            "Background stale-presence refresh: {}{}",
+            if config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if config.paused { " (paused)" } else { "" }
+        );
+        println!("Bound per run: {} Copy claims", config.max_items);
+        println!("Stale presence pending: {pending}");
+        if let Some(job_id) = running {
+            println!("Running/resumable job: {job_id}");
+        }
+        println!("Scheduler command: archive background run");
+    }
+    Ok(())
+}
+
+fn count_background_stale(database: &V2ProjectionDb) -> Result<u64, AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            "SELECT COUNT(DISTINCT cc.copy_claim_id)
+             FROM copy_claims cc
+             JOIN file_refs f ON f.object_id = cc.object_id AND f.path_state = 'active'
+             JOIN collections c ON c.collection_id = f.collection_id AND c.status = 'active'
+             JOIN policies p ON p.policy_id = c.policy_id AND p.status = 'active' AND p.enabled = 1
+             WHERE cc.state = 'present'
+               AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
+                    ?1 - CAST(json_extract(p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000)",
+            [now],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+fn running_background_job(
+    database: &V2ProjectionDb,
+    host_id: &str,
+) -> Result<Option<String>, AppError> {
+    v2_cli_connection(database)?
+        .query_row(
+            "SELECT job_id FROM jobs
+             WHERE job_type = 'background_stale' AND status = 'running' AND host_id = ?1
+             ORDER BY created_time_utc_ms, job_id LIMIT 1",
+            [host_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| v2_cli_sql_error(database, source))
+}
+
+fn background_job_host(
+    database: &V2ProjectionDb,
+    job_id: &str,
+) -> Result<Option<String>, AppError> {
+    v2_cli_connection(database)?
+        .query_row(
+            "SELECT host_id FROM jobs WHERE job_id = ?1 AND job_type = 'background_stale'",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| v2_cli_sql_error(database, source))
+}
+
+fn background_targets(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    limit: usize,
+) -> Result<(Vec<BackgroundTarget>, u64), AppError> {
+    let state = database.registry_state(false)?;
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let connection = v2_cli_connection(database)?;
+    let mut targets = Vec::new();
+    let mut skipped_devices = BTreeSet::new();
+
+    for location in state
+        .locations
+        .iter()
+        .filter(|location| location.status == "active" && location.kind == "filesystem")
+    {
+        if targets.len() >= limit {
+            break;
+        }
+        let Some(device_id) = location.device_id.as_deref() else {
+            continue;
+        };
+        let recognized: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM devices
+                     WHERE device_id = ?1 AND status = 'active'
+                       AND identity_state = 'confirmed'
+                       AND last_fingerprint_status = 'match'
+                 )",
+                [device_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if !recognized {
+            skipped_devices.insert(device_id.to_owned());
+            continue;
+        }
+        let (mounted_location, location_root, fingerprint_status) =
+            match v2_mounted_location_by_selector(cli, database, &state, &location.location_id) {
+                Ok(value) => value,
+                Err(AppError::Input(_)) => {
+                    skipped_devices.insert(device_id.to_owned());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        if fingerprint_status != "match" {
+            skipped_devices.insert(device_id.to_owned());
+            continue;
+        }
+
+        let remaining = limit.saturating_sub(targets.len());
+        let mut statement = connection
+            .prepare(
+                "SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
+                        cc.object_id, o.canonical_hash_hex, o.size_bytes,
+                        f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
+                        cc.relative_path_encoding, cc.relative_path_bytes,
+                        cc.relative_path_display
+                 FROM copy_claims cc
+                 JOIN objects o ON o.object_id = cc.object_id
+                 JOIN file_refs f ON f.file_ref_id = (
+                     SELECT candidate.file_ref_id
+                     FROM file_refs candidate
+                     JOIN collections c ON c.collection_id = candidate.collection_id
+                                         AND c.status = 'active'
+                     JOIN policies p ON p.policy_id = c.policy_id
+                                    AND p.status = 'active' AND p.enabled = 1
+                     WHERE candidate.object_id = cc.object_id
+                       AND candidate.path_state = 'active'
+                       AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
+                            ?2 - CAST(json_extract(
+                                p.requirements_json,
+                                '$.max_observation_age_days'
+                            ) AS INTEGER) * 86400000)
+                     ORDER BY candidate.collection_id, candidate.logical_path_encoding,
+                              candidate.logical_path_bytes, candidate.file_ref_id
+                     LIMIT 1
+                 )
+                 WHERE cc.location_id = ?1 AND cc.state = 'present'
+                 ORDER BY COALESCE(cc.last_seen_time_utc_ms, -1), cc.copy_claim_id
+                 LIMIT ?3",
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    mounted_location.location_id,
+                    now,
+                    i64::try_from(remaining).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    let size: i64 = row.get(6)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        u64::try_from(size)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, Vec<u8>>(11)?,
+                        row.get::<_, String>(12)?,
+                    ))
+                },
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        for row in rows {
+            targets.push(BackgroundTarget {
+                copy_claim_id: row.0,
+                collection_id: row.1,
+                location_id: row.2,
+                file_ref_id: row.3,
+                object_id: row.4,
+                blake3_hex: row.5,
+                size_bytes: row.6,
+                logical_path: registry_path_from_sql(&row.7, &row.8, &row.9)?,
+                copy_path: registry_path_from_sql(&row.10, &row.11, &row.12)?,
+                location_root: location_root.clone(),
+                device_fingerprint_status: fingerprint_status.clone(),
+            });
+        }
+    }
+    Ok((
+        targets,
+        u64::try_from(skipped_devices.len()).unwrap_or(u64::MAX),
+    ))
+}
+
+fn registry_path_from_sql(
+    encoding: &str,
+    bytes: &[u8],
+    display: &str,
+) -> Result<RegistryPath, AppError> {
+    Ok(match encoding {
+        "utf8" => RegistryPath {
+            encoding: encoding.to_owned(),
+            text: Some(
+                std::str::from_utf8(bytes)
+                    .map_err(|error| AppError::Input(format!("invalid UTF-8 path: {error}")))?
+                    .to_owned(),
+            ),
+            base64: None,
+            display: display.to_owned(),
+        },
+        "unix_bytes" | "windows_utf16le" => RegistryPath {
+            encoding: encoding.to_owned(),
+            text: None,
+            base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            display: display.to_owned(),
+        },
+        other => {
+            return Err(AppError::Input(format!(
+                "unsupported stored path encoding: {other}"
+            )))
+        }
+    })
+}
+
+fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppError> {
+    let relative = target.copy_path.to_path_buf().ok_or_else(|| {
+        AppError::Input(format!(
+            "copy path is unavailable on this platform: {}",
+            target.copy_path.display
+        ))
+    })?;
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AppError::Input(format!(
+            "copy path escapes its Location: {}",
+            target.copy_path.display
+        )));
+    }
+    let path = target.location_root.join(&relative);
+    let mut checked = target.location_root.clone();
+    let component_count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        checked.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&checked).map_err(|error| {
+            AppError::Input(format!("cannot inspect {}: {error}", checked.display()))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::Input(format!(
+                "background verification refuses symlinks: {}",
+                checked.display()
+            )));
+        }
+        if index + 1 < component_count && !metadata.is_dir() {
+            return Err(AppError::Input(format!(
+                "copy path has a non-directory parent: {}",
+                checked.display()
+            )));
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Input("copy path has no parent".to_owned()))?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        AppError::Input(format!("cannot resolve {}: {error}", parent.display()))
+    })?;
+    if !canonical_parent.starts_with(&target.location_root) {
+        return Err(AppError::Input(format!(
+            "copy path resolves outside its Location: {}",
+            target.copy_path.display
+        )));
+    }
+    Ok(path)
+}
+
+fn hash_background_file(path: &Path) -> Result<(u64, String, u64, Option<u64>), String> {
+    let started = Instant::now();
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !before.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened {}: {error}", path.display()))?;
+    if !opened.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err(format!(
+                "{} changed before it could be verified",
+                path.display()
+            ));
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck {}: {error}", path.display()))?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err(format!(
+            "{} changed while it was being verified",
+            path.display()
+        ));
+    }
+    let modified_time = after
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .and_then(|value| u64::try_from(value.as_millis()).ok());
+    Ok((
+        size,
+        hasher.finalize().to_hex().to_string(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        modified_time,
+    ))
+}
+
+fn append_background_verification_failure(
+    database: &V2ProjectionDb,
+    store: &V2OriginStore,
+    job_id: &str,
+    input_version: &str,
+    target: &BackgroundTarget,
+    failure: &BackgroundVerificationFailure<'_>,
+) -> Result<(), AppError> {
+    let operation_key = stable_id(
+        "op",
+        &[
+            job_id.as_bytes(),
+            input_version.as_bytes(),
+            target.copy_claim_id.as_bytes(),
+            failure.result.as_bytes(),
+        ],
+    );
+    store.append_batch(
+        "background_verify",
+        1,
+        json!({"job_id": job_id, "job_type": "background_stale"}),
+        json!({}),
+        vec![json!({
+            "kind": "copy_verification_failed",
+            "copy_claim_id": target.copy_claim_id,
+            "object_id": target.object_id,
+            "location_id": target.location_id,
+            "logical_path": target.logical_path,
+            "copy_path": target.copy_path,
+            "result": failure.result,
+            "expected_hash_algo": "blake3",
+            "expected_hash_hex": target.blake3_hex,
+            "observed_hash_hex": failure.observed_hash_hex,
+            "size_bytes": failure.observed_size,
+            "duration_ms": failure.duration_ms,
+            "verified_time_utc_ms": now_utc_ms()?,
+            "device_fingerprint_status": target.device_fingerprint_status,
+            "error_detail": failure.detail,
+            "job_id": job_id,
+            "job_type": "background_stale",
+            "item_type": "copy_claim",
+            "item_key": target.copy_claim_id,
+            "outcome_kind": failure.result,
+            "operation_key": operation_key,
+        })],
+    )?;
+    database.apply(store)?;
+    Ok(())
+}
+
+fn verify_background_target(
+    database: &V2ProjectionDb,
+    store: &V2OriginStore,
+    job_id: &str,
+    input_version: &str,
+    target: &BackgroundTarget,
+    summary: &mut BackgroundRunSummary,
+) -> Result<(), AppError> {
+    let path = match background_content_path(target) {
+        Ok(path) => path,
+        Err(error) => {
+            append_background_verification_failure(
+                database,
+                store,
+                job_id,
+                input_version,
+                target,
+                &BackgroundVerificationFailure {
+                    result: "read_error",
+                    observed_hash_hex: None,
+                    observed_size: None,
+                    duration_ms: 0,
+                    detail: &error.to_string(),
+                },
+            )?;
+            summary.read_errors = summary.read_errors.saturating_add(1);
+            return Ok(());
+        }
+    };
+    match hash_background_file(&path) {
+        Ok((size, hash, duration_ms, modified_time)) => {
+            summary.bytes_read = summary.bytes_read.saturating_add(size);
+            if size == target.size_bytes && hash == target.blake3_hex {
+                archive_ledger::v2_record_placements(
+                    store,
+                    database,
+                    &[archive_ledger::V2Placement {
+                        collection_id: target.collection_id.clone(),
+                        location_id: target.location_id.clone(),
+                        file_ref_id: target.file_ref_id.clone(),
+                        logical_path: target.logical_path.clone(),
+                        copy_path: target.copy_path.clone(),
+                        object_id: target.object_id.clone(),
+                        blake3_hex: target.blake3_hex.clone(),
+                        size_bytes: target.size_bytes,
+                        modified_time_utc_ms: modified_time,
+                        device_fingerprint_status: target.device_fingerprint_status.clone(),
+                        job_id: job_id.to_owned(),
+                        job_type: "background_stale".to_owned(),
+                        input_version: input_version.to_owned(),
+                    }],
+                )?;
+                summary.verified_ok = summary.verified_ok.saturating_add(1);
+            } else {
+                append_background_verification_failure(
+                    database,
+                    store,
+                    job_id,
+                    input_version,
+                    target,
+                    &BackgroundVerificationFailure {
+                        result: "hash_mismatch",
+                        observed_hash_hex: Some(&hash),
+                        observed_size: Some(size),
+                        duration_ms,
+                        detail: "file content does not match the recorded Object",
+                    },
+                )?;
+                summary.hash_mismatches = summary.hash_mismatches.saturating_add(1);
+            }
+        }
+        Err(detail) => {
+            append_background_verification_failure(
+                database,
+                store,
+                job_id,
+                input_version,
+                target,
+                &BackgroundVerificationFailure {
+                    result: "read_error",
+                    observed_hash_hex: None,
+                    observed_size: None,
+                    duration_ms: 0,
+                    detail: &detail,
+                },
+            )?;
+            summary.read_errors = summary.read_errors.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+fn execute_v2_background_run(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    resume_job_id: Option<String>,
+    max_items_override: Option<usize>,
+) -> Result<u8, AppError> {
+    let config = load_background_config(cli)?;
+    if !config.enabled {
+        return Err(AppError::Input(
+            "background work is disabled; run archive background enable first".to_owned(),
+        ));
+    }
+    if config.paused {
+        return Err(AppError::Input(
+            "background work is paused; run archive background enable to resume it".to_owned(),
+        ));
+    }
+    let limit = max_items_override.unwrap_or(config.max_items);
+    validate_background_limit(limit)?;
+    let existing = match resume_job_id {
+        Some(job_id) => Some(job_id),
+        None => running_background_job(database, &cli.host)?,
+    };
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = existing.unwrap_or_else(|| format!("job_{suffix}"));
+    let existing_job = v2_local_job(database, &job_id)?;
+    if existing_job.is_some()
+        && background_job_host(database, &job_id)?.as_deref() != Some(cli.host.as_str())
+    {
+        return Err(AppError::Input(format!(
+            "background job {job_id} belongs to another host and cannot be resumed here"
+        )));
+    }
+    let input_version = existing_job
+        .as_ref()
+        .map(|job| job.input_version.clone())
+        .unwrap_or_else(|| format!("background_{suffix}"));
+    let job_params = existing_job
+        .as_ref()
+        .map(|job| job.params.clone())
+        .unwrap_or_else(|| json!({"max_items": config.max_items}));
+    let (mut targets, skipped_devices) = background_targets(cli, database, limit + 1)?;
+    let has_more = targets.len() > limit;
+    targets.truncate(limit);
+    let mut summary: BackgroundRunSummary = existing_job
+        .as_ref()
+        .and_then(|job| job.progress.clone())
+        .and_then(|progress| serde_json::from_value(progress).ok())
+        .unwrap_or_default();
+    summary.selected = summary
+        .selected
+        .saturating_add(u64::try_from(targets.len()).unwrap_or(u64::MAX));
+    summary.skipped_devices = summary.skipped_devices.max(skipped_devices);
+    if existing_job.is_none() && targets.is_empty() {
+        summary.remaining_stale = count_background_stale(database)?;
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "version": 1, "status": "idle", "job_id": null, "summary": summary
+                }))?
+            );
+        } else {
+            println!(
+                "Background refresh idle: no stale files on recognized connected Devices; {} stale remain elsewhere.",
+                summary.remaining_stale
+            );
+        }
+        return Ok(EXIT_OK);
+    }
+    let store = V2OriginStore::open(cli.events_path())?;
+    ensure_v2_job_started(
+        cli,
+        database,
+        &store,
+        &job_id,
+        "background_stale",
+        &input_version,
+        &job_params,
+    )?;
+    for target in targets {
+        verify_background_target(
+            database,
+            &store,
+            &job_id,
+            &input_version,
+            &target,
+            &mut summary,
+        )?;
+        update_v2_job_progress(database, &job_id, &serde_json::to_value(&summary)?)?;
+    }
+    summary.remaining_stale = count_background_stale(database)?;
+    if has_more {
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "version": 1, "status": "running", "job_id": job_id, "summary": summary
+                }))?
+            );
+        } else {
+            println!(
+                "Background refresh paused after {} Copy claims; {} stale remain.",
+                summary.selected, summary.remaining_stale
+            );
+            println!("Resume with: archive job resume {job_id}");
+        }
+        return Ok(if summary.hash_mismatches > 0 || summary.read_errors > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        });
+    }
+    finish_v2_job(
+        database,
+        &store,
+        &job_id,
+        "background_stale",
+        &input_version,
+        "complete",
+        &serde_json::to_value(&summary)?,
+    )?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 1, "status": "complete", "job_id": job_id, "summary": summary
+            }))?
+        );
+    } else {
+        println!(
+            "Background refresh complete: {} verified; {} mismatches; {} read errors; {} stale remain.",
+            summary.verified_ok,
+            summary.hash_mismatches,
+            summary.read_errors,
+            summary.remaining_stale
+        );
+    }
+    Ok(if summary.hash_mismatches > 0 || summary.read_errors > 0 {
+        EXIT_FINDINGS
+    } else {
+        EXIT_OK
+    })
 }
 
 fn list_v2_jobs(database: &V2ProjectionDb, limit: usize) -> Result<Vec<LocalJob>, AppError> {

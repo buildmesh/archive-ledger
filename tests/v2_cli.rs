@@ -1823,4 +1823,206 @@ mod unix {
         assert_eq!(after["known_at_risk_files"], 3);
         assert_eq!(after["known_policy_unknown_files"], 0);
     }
+
+    #[test]
+    fn background_stale_refresh_is_opt_in_bounded_identity_gated_and_read_only() {
+        // This fixture must live on a filesystem whose UUID is visible so the
+        // fail-closed background reader can prove the Archive Root identity.
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let content = temp.path().join("content/background");
+        fs::create_dir_all(&content).unwrap();
+        fs::write(content.join("one.txt"), b"one\n").unwrap();
+        fs::write(content.join("two.txt"), b"two\n").unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            content.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        success(archive(&temp).args([
+            "device",
+            "identity",
+            "Test Device",
+            "--kind",
+            "serial",
+            "--fingerprint",
+            "BACKGROUND-DEVICE-001",
+        ]));
+
+        let database_path = root(&temp).join("archive.db");
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute("UPDATE copy_claims SET last_seen_time_utc_ms = 0", [])
+            .unwrap();
+        drop(database);
+        let original_one = fs::read(content.join("one.txt")).unwrap();
+        let original_two = fs::read(content.join("two.txt")).unwrap();
+
+        let disabled = archive(&temp)
+            .args(["--json", "background", "run"])
+            .output()
+            .unwrap();
+        assert_eq!(disabled.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&disabled.stderr).contains("disabled"));
+        let default_status = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "status",
+        ])));
+        assert_eq!(default_status["enabled"], false);
+        assert_eq!(default_status["pending_stale_presence"], 2);
+
+        success(archive(&temp).args(["background", "enable", "--max-items", "1"]));
+        let paused = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "pause",
+        ])));
+        assert_eq!(paused["paused"], true);
+        let paused_run = archive(&temp)
+            .args(["--json", "background", "run"])
+            .output()
+            .unwrap();
+        assert_eq!(paused_run.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&paused_run.stderr).contains("paused"));
+        success(archive(&temp).args(["background", "enable", "--max-items", "1"]));
+
+        let first = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "run",
+        ])));
+        assert_eq!(first["status"], "running");
+        assert_eq!(first["summary"]["selected"], 1);
+        assert_eq!(first["summary"]["verified_ok"], 1);
+        let job_id = first["job_id"].as_str().unwrap().to_owned();
+        let visible = json(&success(
+            archive(&temp).args(["--json", "job", "show", &job_id]),
+        ));
+        assert_eq!(visible["status"], "running");
+        let completed = json(&success(
+            archive(&temp).args(["--json", "job", "resume", &job_id]),
+        ));
+        assert_eq!(completed["status"], "complete");
+        assert_eq!(completed["summary"]["selected"], 2);
+        assert_eq!(completed["summary"]["verified_ok"], 2);
+        assert_eq!(completed["summary"]["remaining_stale"], 0);
+        assert_eq!(fs::read(content.join("one.txt")).unwrap(), original_one);
+        assert_eq!(fs::read(content.join("two.txt")).unwrap(), original_two);
+
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "UPDATE copy_claims SET last_seen_time_utc_ms = 0 WHERE relative_path_display = 'one.txt'",
+                [],
+            )
+            .unwrap();
+        drop(database);
+        success(archive(&temp).args(["device", "identity", "Test Device", "--conflict"]));
+        let before_idle = json(&success(
+            archive(&temp).args(["--json", "events", "verify"]),
+        ));
+        let gated = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "run",
+        ])));
+        assert_eq!(gated["status"], "idle");
+        assert_eq!(gated["job_id"], Value::Null);
+        assert_eq!(gated["summary"]["selected"], 0);
+        assert_eq!(gated["summary"]["skipped_devices"], 1);
+        assert_eq!(gated["summary"]["remaining_stale"], 1);
+        let after_idle = json(&success(
+            archive(&temp).args(["--json", "events", "verify"]),
+        ));
+        assert_eq!(before_idle["records"], after_idle["records"]);
+        success(archive(&temp).args([
+            "device",
+            "identity",
+            "Test Device",
+            "--kind",
+            "serial",
+            "--fingerprint",
+            "BACKGROUND-DEVICE-001",
+        ]));
+        let refreshed = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "run",
+        ])));
+        assert_eq!(refreshed["status"], "complete");
+        assert_eq!(refreshed["summary"]["verified_ok"], 1);
+
+        fs::write(content.join("two.txt"), b"tampered\n").unwrap();
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute(
+                "UPDATE copy_claims SET last_seen_time_utc_ms = 0 WHERE relative_path_display = 'two.txt'",
+                [],
+            )
+            .unwrap();
+        drop(database);
+        let mismatch = archive(&temp)
+            .args(["--json", "background", "run"])
+            .output()
+            .unwrap();
+        assert_eq!(mismatch.status.code(), Some(10));
+        let mismatch = json(&mismatch);
+        assert_eq!(mismatch["status"], "complete");
+        assert_eq!(mismatch["summary"]["hash_mismatches"], 1);
+        assert_eq!(fs::read(content.join("two.txt")).unwrap(), b"tampered\n");
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        let state: String = database
+            .query_row(
+                "SELECT state FROM copy_claims WHERE relative_path_display = 'two.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "corrupt");
+        drop(database);
+
+        success(archive(&temp).args(["db", "rebuild"]));
+        let rebuilt = rusqlite::Connection::open(&database_path).unwrap();
+        let rebuilt_state: String = rebuilt
+            .query_row(
+                "SELECT state FROM copy_claims WHERE relative_path_display = 'two.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_state, "corrupt");
+        drop(rebuilt);
+        let config = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "status",
+        ])));
+        assert_eq!(config["enabled"], true);
+        assert_eq!(config["max_items"], 1);
+        assert!(git(&root(&temp).join("canonical"), &["status", "--short"])
+            .stdout
+            .is_empty());
+    }
 }

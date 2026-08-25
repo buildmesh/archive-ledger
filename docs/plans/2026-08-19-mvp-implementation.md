@@ -423,8 +423,10 @@ Implement the accepted revision in dependency order:
 7. add the concise stale-presence report and verify its grouped queries at the
    established 500,000-file scale.
 
-Background scanning of connected Devices and file-copy mutation are separate
-deferred Beads features. They do not expand this read-only phase.
+Background scanning of connected Devices and file-copy mutation did not expand
+this read-only phase. Both were subsequently implemented as narrow post-MVP
+features: verified copy is no-replace, and background work is an opt-in bounded
+one-shot command for external schedulers rather than a custom daemon.
 
 ## Phase 8: Scale and release gate
 

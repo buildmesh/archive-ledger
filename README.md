@@ -13,7 +13,8 @@ registered Locations. It does not move, delete, repair, or drop archive content.
 > Development status: new Archives use the signed version 2 event tree and a
 > rebuildable schema-6 SQLite projection. Setup, inventory, git-annex import,
 > Location scanning and verification, staging, verified copy, resumable jobs,
-> status, risk reporting, enrollment, verified Git synchronization, and portable
+> opt-in targeted background verification, status, risk reporting, enrollment,
+> verified Git synchronization, and portable
 > snapshot clone and layered catalog `fsck` use the v2 path. Topology-aware
 > metadata protection reporting and destructive content operations remain under
 > development. Keep
@@ -501,6 +502,31 @@ The default deduplicates stale Objects per Device. `--locations` adds Location c
 inventory, oldest stale observation, Site and availability context, and a suggested `scan` or
 `import-annex` action. Missing, corrupt, unknown, and unresolved annex states remain separate from
 stale resolved presence.
+
+To refresh only stale Copy claims on recognized connected Devices, enable the bounded one-shot
+runner and invoke it manually or from your operating system's scheduler:
+
+```bash
+archive background enable --max-items 100
+archive background status
+archive background run
+```
+
+The runner queries stale targets from SQLite; it does not list or rescan entire directories. It
+revalidates Device and Archive Root identity before reading, ignores symlinks, never changes archive
+content, and records each successful or failed integrity check. A run processes at most the
+configured number of Copy claims and prints a job ID when more work remains:
+
+```bash
+archive job resume <job-id>
+archive background pause       # preserve settings but refuse scheduled runs
+archive background disable     # opt out
+```
+
+There is no Archive Ledger daemon or installed scheduler service. Configure cron, systemd, or
+launchd to call `archive background run` only after explicitly enabling it. Configuration is local
+to this installation, so another synchronized computer must be enabled separately. An unidentified,
+conflicting, disconnected, or ambiguously mounted Device is skipped and its evidence remains stale.
 
 ## Verify bytes and resume work
 

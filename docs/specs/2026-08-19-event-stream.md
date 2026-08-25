@@ -581,6 +581,14 @@ outcome, the writer holds the exclusive stream lock and rejects any existing
 operation key. A crash can therefore leave local progress behind canonical
 history, but cannot duplicate a canonical outcome.
 
+The opt-in background stale-presence runner uses `job_started` and
+`job_finished` only when a recognized connected Device has eligible work or an
+existing job must be finished. Each successful targeted read emits the ordinary
+content-observation/verification outcome, while mismatch and read failures emit
+the ordinary verification-failure outcome. Deterministic operation keys make a
+bounded run resumable. A disabled, paused, or idle scheduler invocation emits no
+canonical event, and no background-specific content-event vocabulary exists.
+
 ### External staging
 
 `archive stage` emits no canonical event, including no job event. Its checksum
