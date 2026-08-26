@@ -1733,6 +1733,7 @@ struct BackgroundTarget {
     size_bytes: u64,
     logical_path: RegistryPath,
     copy_path: RegistryPath,
+    external_identity_id: Option<String>,
     location_root: PathBuf,
     device_fingerprint_status: String,
 }
@@ -1790,6 +1791,14 @@ struct ArchiveCopyItem {
     logical_path_display: String,
     source_relative_path: PathBuf,
     destination_has_object: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveCopyDestination {
+    content_path: PathBuf,
+    copy_path: PathBuf,
+    representation: String,
+    external_identity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -8529,6 +8538,8 @@ fn execute_v2_stage_import(
                 blake3_hex: candidate.blake3_hex.clone(),
                 size_bytes: candidate.size_bytes,
                 modified_time_utc_ms: candidate.modified_time_utc_ms,
+                representation: "ordinary_file".to_owned(),
+                external_identity_id: None,
                 device_fingerprint_status: fingerprint_status.clone(),
                 job_id: job_id.clone(),
                 job_type: "stage_import".to_owned(),
@@ -9207,7 +9218,7 @@ fn background_targets(
                         cc.object_id, o.canonical_hash_hex, o.size_bytes,
                         f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
                         cc.relative_path_encoding, cc.relative_path_bytes,
-                        cc.relative_path_display
+                        cc.relative_path_display, cc.external_identity_id
                  FROM copy_claims cc
                  JOIN objects o ON o.object_id = cc.object_id
                  JOIN file_refs f ON f.file_ref_id = (
@@ -9257,6 +9268,7 @@ fn background_targets(
                         row.get::<_, String>(10)?,
                         row.get::<_, Vec<u8>>(11)?,
                         row.get::<_, String>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 },
             )
@@ -9274,6 +9286,7 @@ fn background_targets(
                 size_bytes: row.6,
                 logical_path: registry_path_from_sql(&row.7, &row.8, &row.9)?,
                 copy_path: registry_path_from_sql(&row.10, &row.11, &row.12)?,
+                external_identity_id: row.13,
                 location_root: location_root.clone(),
                 device_fingerprint_status: fingerprint_status.clone(),
             });
@@ -9537,6 +9550,12 @@ fn verify_background_target(
                         blake3_hex: target.blake3_hex.clone(),
                         size_bytes: target.size_bytes,
                         modified_time_utc_ms: modified_time,
+                        representation: if target.external_identity_id.is_some() {
+                            "annex_locked_symlink".to_owned()
+                        } else {
+                            "ordinary_file".to_owned()
+                        },
+                        external_identity_id: target.external_identity_id.clone(),
                         device_fingerprint_status: target.device_fingerprint_status.clone(),
                         job_id: job_id.to_owned(),
                         job_type: "background_stale".to_owned(),
@@ -10489,22 +10508,31 @@ fn execute_v2_copy_mutation(
                     source.display()
                 )));
             }
-            let destination = destination_root.join(&item.logical_path);
-            if !destination.starts_with(&destination_root) {
+            let logical_destination = destination_root.join(&item.logical_path);
+            if !logical_destination.starts_with(&destination_root) {
                 return Err(AppError::Input(format!(
                     "copy destination escapes its Location: {}",
                     item.logical_path_display
                 )));
             }
             ensure_safe_destination_parents(&destination_root, &item.logical_path)?;
-            match std::fs::symlink_metadata(&destination) {
+            let destination = v2_copy_destination(
+                database.path(),
+                &destination_root,
+                &destination_location.location_id,
+                item,
+            )?;
+            match std::fs::symlink_metadata(&destination.content_path) {
                 Ok(metadata) if metadata.file_type().is_file() => {
-                    archive_ledger::verify_existing_file(&destination, &item.blake3_hex)?;
+                    archive_ledger::verify_existing_file(
+                        &destination.content_path,
+                        &item.blake3_hex,
+                    )?;
                 }
                 Ok(_) => {
                     return Err(AppError::Input(format!(
                         "copy destination exists and is not the expected regular file: {}",
-                        destination.display()
+                        destination.content_path.display()
                     )))
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -10637,30 +10665,48 @@ fn execute_v2_copy_mutation(
                 return Ok(());
             }
             let source = source_root.join(&item.source_relative_path);
-            let destination = destination_root.join(&item.logical_path);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let copied = match std::fs::symlink_metadata(&destination) {
+            let destination = v2_copy_destination(
+                database.path(),
+                &destination_root,
+                &destination_location.location_id,
+                item,
+            )?;
+            create_safe_destination_parents(&destination_root, &destination.copy_path)?;
+            let copied = match std::fs::symlink_metadata(&destination.content_path) {
                 Ok(metadata) if metadata.file_type().is_file() => {
-                    archive_ledger::verify_existing_file(&destination, &item.blake3_hex)?
+                    archive_ledger::verify_existing_file(
+                        &destination.content_path,
+                        &item.blake3_hex,
+                    )?
                 }
                 Ok(_) => {
                     return Err(AppError::Input(format!(
                         "copy destination appeared as a non-file: {}",
-                        destination.display()
+                        destination.content_path.display()
                     )))
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     archive_ledger::copy_verified_no_replace(
                         &source,
-                        &destination,
+                        &destination.content_path,
                         &item.blake3_hex,
                     )?
                 }
                 Err(error) => return Err(error.into()),
             };
-            let modified_time = std::fs::metadata(&destination)
+            let confirmed_destination = v2_copy_destination(
+                database.path(),
+                &destination_root,
+                &destination_location.location_id,
+                item,
+            )?;
+            if confirmed_destination != destination {
+                return Err(AppError::Input(format!(
+                    "copy destination representation changed during placement: {}",
+                    item.logical_path_display
+                )));
+            }
+            let modified_time = std::fs::metadata(&destination.content_path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
@@ -10670,11 +10716,13 @@ fn execute_v2_copy_mutation(
                 location_id: destination_location.location_id.clone(),
                 file_ref_id: item.file_ref_id.clone(),
                 logical_path: RegistryPath::from_path(&item.logical_path),
-                copy_path: RegistryPath::from_path(&item.logical_path),
+                copy_path: RegistryPath::from_path(&destination.copy_path),
                 object_id: item.object_id.clone(),
                 blake3_hex: item.blake3_hex.clone(),
                 size_bytes: item.size_bytes,
                 modified_time_utc_ms: modified_time,
+                representation: destination.representation,
+                external_identity_id: destination.external_identity_id,
                 device_fingerprint_status: destination_fingerprint.clone(),
                 job_id: job_id.clone(),
                 job_type: "copy".to_owned(),
@@ -10741,6 +10789,190 @@ fn execute_v2_copy_mutation(
         );
     }
     Ok(EXIT_OK)
+}
+
+fn v2_copy_destination(
+    database_path: &Path,
+    destination_root: &Path,
+    destination_location_id: &str,
+    item: &ArchiveCopyItem,
+) -> Result<ArchiveCopyDestination, AppError> {
+    let logical_path = destination_root.join(&item.logical_path);
+    match std::fs::symlink_metadata(&logical_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let connection = Connection::open(database_path).map_err(|source| {
+                AppError::V2Projection(V2ProjectionError::Sqlite {
+                    path: database_path.to_path_buf(),
+                    source,
+                })
+            })?;
+            let annex: Option<(String, String, Option<String>)> = connection
+                .query_row(
+                    "SELECT p.external_identity_id, x.external_key, x.object_id
+                     FROM path_observations p
+                     JOIN external_identities x
+                       ON x.external_identity_id = p.external_identity_id
+                     WHERE p.file_ref_id = ?1 AND p.location_id = ?2
+                       AND p.observed_path_encoding = ?3
+                       AND p.observed_path_bytes = ?4
+                       AND p.representation = 'annex_locked_symlink'",
+                    params![
+                        item.file_ref_id,
+                        destination_location_id,
+                        item.logical_path_encoding,
+                        item.logical_path_bytes,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|source| {
+                    AppError::V2Projection(V2ProjectionError::Sqlite {
+                        path: database_path.to_path_buf(),
+                        source,
+                    })
+                })?;
+            let Some((external_identity_id, external_key, resolved_object_id)) = annex else {
+                return Err(AppError::Input(format!(
+                    "copy destination is an unmanaged symlink; refusing to follow it: {}",
+                    logical_path.display()
+                )));
+            };
+            if resolved_object_id.as_deref() != Some(item.object_id.as_str()) {
+                return Err(AppError::Input(format!(
+                    "copy destination annex identity does not match the selected Object: {}",
+                    item.logical_path_display
+                )));
+            }
+            let target = std::fs::read_link(&logical_path)?;
+            if target.is_absolute() {
+                return Err(AppError::Input(format!(
+                    "copy destination annex symlink has an unsafe absolute target: {}",
+                    logical_path.display()
+                )));
+            }
+            let content_path =
+                lexical_relative_path(logical_path.parent().unwrap_or(destination_root), &target)
+                    .ok_or_else(|| {
+                    AppError::Input(format!(
+                        "copy destination annex symlink cannot be normalized safely: {}",
+                        logical_path.display()
+                    ))
+                })?;
+            let object_root = destination_root.join(".git/annex/objects");
+            let canonical_object_root = std::fs::canonicalize(&object_root).map_err(|error| {
+                AppError::Input(format!(
+                    "copy destination annex object store is unavailable at {}: {error}",
+                    object_root.display()
+                ))
+            })?;
+            if !canonical_object_root.starts_with(destination_root)
+                || !content_path.starts_with(&object_root)
+                || content_path.file_name() != Some(std::ffi::OsStr::new(&external_key))
+                || content_path.parent().and_then(Path::file_name)
+                    != Some(std::ffi::OsStr::new(&external_key))
+            {
+                return Err(AppError::Input(format!(
+                    "copy destination annex symlink does not identify its registered content safely: {}",
+                    logical_path.display()
+                )));
+            }
+            let copy_path = content_path
+                .strip_prefix(destination_root)
+                .map_err(|_| {
+                    AppError::Input(format!(
+                        "copy destination annex content escapes its Location: {}",
+                        logical_path.display()
+                    ))
+                })?
+                .to_path_buf();
+            ensure_safe_destination_parents(destination_root, &copy_path)?;
+            Ok(ArchiveCopyDestination {
+                content_path,
+                copy_path,
+                representation: "annex_locked_symlink".to_owned(),
+                external_identity_id: Some(external_identity_id),
+            })
+        }
+        Ok(metadata) if metadata.file_type().is_file() => Ok(ArchiveCopyDestination {
+            content_path: logical_path,
+            copy_path: item.logical_path.clone(),
+            representation: "ordinary_file".to_owned(),
+            external_identity_id: None,
+        }),
+        Ok(_) => Err(AppError::Input(format!(
+            "copy destination exists and is not the expected regular file: {}",
+            logical_path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ArchiveCopyDestination {
+            content_path: logical_path,
+            copy_path: item.logical_path.clone(),
+            representation: "ordinary_file".to_owned(),
+            external_identity_id: None,
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn lexical_relative_path(base: &Path, target: &Path) -> Option<PathBuf> {
+    if target.is_absolute() {
+        return None;
+    }
+    let mut resolved = base.to_path_buf();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(value) => resolved.push(value),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(resolved)
+}
+
+fn create_safe_destination_parents(root: &Path, relative: &Path) -> Result<(), AppError> {
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut current = root.to_path_buf();
+    for component in parent.components() {
+        let std::path::Component::Normal(value) = component else {
+            return Err(AppError::Input(format!(
+                "copy destination path is not contained: {}",
+                relative.display()
+            )));
+        };
+        current.push(value);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(AppError::Input(format!(
+                    "copy destination parent is not a directory: {}",
+                    current.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = std::fs::symlink_metadata(&current)?;
+                        if !metadata.file_type().is_dir() {
+                            return Err(AppError::Input(format!(
+                                "copy destination parent is not a directory: {}",
+                                current.display()
+                            )));
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn v2_mounted_location_by_selector(
@@ -10819,7 +11051,7 @@ fn visit_v2_copy_items(
                              AND destination.object_id = f.object_id
                              AND destination.state = 'present')
              FROM file_refs f
-             JOIN objects o ON o.object_id = f.object_id
+             LEFT JOIN objects o ON o.object_id = f.object_id
              LEFT JOIN copy_claims source ON source.copy_claim_id = (
                  SELECT candidate.copy_claim_id FROM copy_claims candidate
                  WHERE candidate.location_id = ?2 AND candidate.object_id = f.object_id
@@ -10893,11 +11125,16 @@ fn visit_v2_copy_items(
             continue;
         }
         summary.selected_logical_files = summary.selected_logical_files.saturating_add(1);
-        let object_id: String = row.get(4).map_err(|source| {
+        let object_id: Option<String> = row.get(4).map_err(|source| {
             AppError::V2Projection(V2ProjectionError::Sqlite {
                 path: database_path.to_path_buf(),
                 source,
             })
+        })?;
+        let object_id = object_id.ok_or_else(|| {
+            AppError::Input(format!(
+                "selected File has unresolved content and cannot be copied: {display}"
+            ))
         })?;
         if current_object.as_deref() != Some(&object_id) {
             publish(current_candidate.take(), &mut summary)?;

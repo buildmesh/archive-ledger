@@ -310,6 +310,11 @@ destination is published without replacement and read back for verification. Exi
 never overwritten, and source files are never changed or deleted. If post-publication verification
 fails, the unrecorded suspect destination is left in place for inspection rather than deleted.
 
+When the destination was imported from git-annex, Archive Ledger can safely fill a registered
+dangling annex symlink by writing its missing content beneath that Location's `.git/annex/objects`
+directory. It preserves the symlink and does not run git-annex. Any ordinary or unregistered
+symlink is refused rather than followed.
+
 Long copies have a durable job ID. If a run is interrupted, mount the same registered Devices and
 resume it; completed Objects are reconciled from canonical facts and are not recopied:
 

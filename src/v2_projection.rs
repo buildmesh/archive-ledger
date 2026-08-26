@@ -1875,6 +1875,17 @@ fn project_annex_entry(
     let logical_bytes = registry_path_bytes(&logical)
         .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
     let file_ref_id = string(item, "file_ref_id")?;
+    // A git-annex key identifies the same content across partial repositories.
+    // Importing a repository where that key is absent must not regress a File
+    // that another repository already resolved.
+    let resolved_object_id: Option<String> = transaction
+        .query_row(
+            "SELECT object_id FROM external_identities WHERE external_identity_id = ?1",
+            [external_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let file_object_id = object_id.or(resolved_object_id.as_deref());
     transaction
         .execute(
             "INSERT INTO file_refs(file_ref_id, collection_id, logical_path_bytes, logical_path_encoding, logical_path_display, object_id, external_identity_id, identity_state, path_state, created_time_utc_ms, modified_time_utc_ms, observed_size_bytes, first_seen_record_id, last_seen_record_id, removed_record_id)
@@ -1886,9 +1897,9 @@ fn project_annex_entry(
                 logical_bytes,
                 logical.encoding,
                 logical.display,
-                object_id,
+                file_object_id,
                 external_id,
-                if object_id.is_some() { "resolved" } else { resolution_state },
+                if file_object_id.is_some() { "resolved" } else { resolution_state },
                 item.get("modified_time_utc_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex modified time")).transpose()?,
                 item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex observed size")).transpose()?,
                 record_id,

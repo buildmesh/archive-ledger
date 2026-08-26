@@ -1546,6 +1546,87 @@ mod unix {
             2
         );
         drop(database);
+
+        // A partial annex repository that lacks this content must not regress
+        // the Collection File's identity. Archive Ledger can then populate its
+        // registered dangling annex symlink without invoking git-annex.
+        let destination_repo = temp.path().join("annex-destination");
+        fs::create_dir(&destination_repo).unwrap();
+        git_success(&destination_repo, &["init", "-b", "main"]);
+        git_success(
+            &destination_repo,
+            &["config", "user.name", "Archive Ledger Test"],
+        );
+        git_success(
+            &destination_repo,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git_success(
+            &destination_repo,
+            &["config", "annex.uuid", "fixture-annex-destination-uuid"],
+        );
+        fs::create_dir_all(destination_repo.join(".git/annex/objects")).unwrap();
+        symlink(&absent_target, destination_repo.join("absent.txt")).unwrap();
+        git_success(&destination_repo, &["add", "."]);
+        git_success(&destination_repo, &["commit", "-m", "fixture destination"]);
+        success(archive(&temp).args([
+            "location",
+            "import-annex",
+            destination_repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Annex Destination",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let identity: (String, Option<String>) = database
+            .query_row(
+                "SELECT identity_state, object_id FROM file_refs WHERE logical_path_display = 'absent.txt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(identity.0, "resolved");
+        assert!(identity.1.is_some());
+        drop(database);
+        let planned = json(&success(archive(&temp).current_dir(&repo).args([
+            "--json",
+            "copy",
+            "--to",
+            "Annex Destination",
+            "--collection",
+            "Files",
+            "absent.txt",
+            "--dry-run",
+        ])));
+        assert_eq!(planned["status"], "planned");
+        assert_eq!(planned["summary"]["selected_logical_files"], 1);
+        assert!(!destination_repo.join(&absent_target).exists());
+        success(archive(&temp).current_dir(&repo).args([
+            "copy",
+            "--to",
+            "Annex Destination",
+            "--collection",
+            "Files",
+            "absent.txt",
+            "--yes",
+            "--non-interactive",
+        ]));
+        assert!(fs::symlink_metadata(destination_repo.join("absent.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(destination_repo.join("absent.txt")).unwrap(),
+            absent_content
+        );
+
         fs::write(repo.join(&absent_target), b"corrupt bytes").unwrap();
         let corrupt = archive(&temp)
             .args([
@@ -1584,7 +1665,7 @@ mod unix {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            1
+            2
         );
         assert_eq!(
             rebuilt
@@ -1600,6 +1681,8 @@ mod unix {
 
     #[test]
     fn copy_places_verified_objects_without_overwrite_and_rebuilds() {
+        use std::os::unix::fs::symlink;
+
         let temp = TempDir::new().unwrap();
         success(archive(&temp).args([
             "init",
@@ -1649,6 +1732,27 @@ mod unix {
             "--allow-unidentified-root",
             "--non-interactive",
         ]));
+
+        let outside = temp.path().join("outside.txt");
+        fs::write(&outside, b"outside\n").unwrap();
+        symlink(&outside, destination.join("one.txt")).unwrap();
+        let refused = archive(&temp)
+            .current_dir(&source)
+            .args([
+                "copy",
+                "--to",
+                "Backup",
+                "--collection",
+                "Files",
+                "one.txt",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("unmanaged symlink"));
+        assert_eq!(fs::read(&outside).unwrap(), b"outside\n");
+        fs::remove_file(destination.join("one.txt")).unwrap();
 
         let paused = json(&success(archive(&temp).current_dir(&source).args([
             "--json",
