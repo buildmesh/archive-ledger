@@ -407,8 +407,10 @@ they do not run Git or git-annex. Locked content is read only through a validate
 inside that Location's `.git/annex/objects` directory. Dangling links and annex pointer files remain
 known but absent, and `.git` itself is never traversed as ordinary Collection content. A complete
 `location scan` can therefore detect content that has appeared or disappeared after migration,
-while `collection add` remains positive-only. An annex repository that has not been imported still
-fails closed and directs the user to `--import-annex`.
+while `collection add` remains positive-only. New regular files created after migration are added
+directly as ordinary Archive Ledger Files; they do not need `git annex add` or another annex import.
+An annex repository that has not been imported still fails closed and directs the user to
+`--import-annex`.
 
 For example, photos, documents, and emails repositories normally become three Collections. The
 main photos repository and every partial photos remote are Locations of Photos. Multiple disks that

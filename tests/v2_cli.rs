@@ -1443,6 +1443,20 @@ mod unix {
         git_success(&repo, &["add", "."]);
         git_success(&repo, &["commit", "-m", "fixture"]);
 
+        let refused = archive(&temp)
+            .args([
+                "collection",
+                "add",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr)
+            .contains("cannot inventory an unimported git-annex repository"));
+
         let paused = json(&success(archive(&temp).args([
             "--json",
             "location",
@@ -1522,6 +1536,59 @@ mod unix {
         assert_eq!(first_scan["summary"]["ignored_symlinks"], 1);
         assert_eq!(first_scan["summary"]["missing_paths"], 0);
 
+        fs::write(
+            repo.join("created-after-import.txt"),
+            b"ordinary new file\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join(".git/archive-ledger-must-ignore"),
+            b"git metadata\n",
+        )
+        .unwrap();
+        symlink("present.txt", repo.join("ordinary-alias.txt")).unwrap();
+        let added = json(&success(archive(&temp).args([
+            "--json",
+            "collection",
+            "add",
+            repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ])));
+        assert_eq!(added["summary"]["new_paths"], 1);
+        assert_eq!(added["summary"]["ignored_symlinks"], 2);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let added_file: (String, String, String) = database
+            .query_row(
+                "SELECT f.identity_state, p.representation, c.relative_path_display
+                 FROM file_refs f
+                 JOIN path_observations p ON p.file_ref_id = f.file_ref_id
+                 JOIN copy_claims c ON c.object_id = f.object_id AND c.location_id = p.location_id
+                 WHERE f.logical_path_display = 'created-after-import.txt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            added_file,
+            (
+                "resolved".to_owned(),
+                "ordinary_file".to_owned(),
+                "created-after-import.txt".to_owned(),
+            )
+        );
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM file_refs WHERE logical_path_display IN ('ordinary-alias.txt', '.git/archive-ledger-must-ignore')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(database);
+
         fs::create_dir_all(repo.join(&absent_target).parent().unwrap()).unwrap();
         fs::write(repo.join(&absent_target), absent_content).unwrap();
         let after_get = json(&success(archive(&temp).args([
@@ -1533,7 +1600,7 @@ mod unix {
             "--collection",
             "Files",
         ])));
-        assert_eq!(after_get["summary"]["confirmed_good"], 2);
+        assert_eq!(after_get["summary"]["confirmed_good"], 3);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         assert_eq!(
             database
@@ -1543,7 +1610,7 @@ mod unix {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            2
+            3
         );
         drop(database);
 

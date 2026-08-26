@@ -10144,6 +10144,61 @@ fn v2_stale_location_count(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+fn v2_location_has_completed_annex_import(
+    database: &V2ProjectionDb,
+    collection_id: &str,
+    location_id: &str,
+) -> Result<bool, AppError> {
+    v2_cli_connection(database)?
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM annex_imports
+                 WHERE collection_id = ?1 AND worktree_location_id = ?2
+                   AND status = 'complete'
+             )",
+            params![collection_id, location_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))
+}
+
+fn v2_path_has_completed_annex_import(
+    database: &V2ProjectionDb,
+    scan_path: &Path,
+) -> Result<bool, AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT repo_path_encoding, repo_path_bytes, repo_path_display
+             FROM annex_imports WHERE status = 'complete'",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    for row in rows {
+        let (encoding, bytes, display) =
+            row.map_err(|source| v2_cli_sql_error(database, source))?;
+        let imported_path = registry_path_from_sql(&encoding, &bytes, &display)?
+            .to_path_buf()
+            .ok_or_else(|| {
+                AppError::Input(format!(
+                    "imported annex path is unavailable on this platform: {display}"
+                ))
+            })?;
+        if scan_path.starts_with(imported_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn execute_v2_collection_add(
     cli: &Cli,
     database: &V2ProjectionDb,
@@ -10166,21 +10221,44 @@ fn execute_v2_collection_add(
                 .to_owned(),
         ));
     }
-    if archive_ledger::is_git_annex_repository(&scan_path)? {
-        return Err(AppError::Input(
-            "archive collection add cannot inventory an unimported git-annex repository; use archive location import-annex --collection COLLECTION"
-                .to_owned(),
-        ));
-    }
     let state = database.registry_state(false)?;
-    let (location, location_path, fingerprint_status) =
-        v2_inventory_location_scope(cli, database, &state, &scan_path, args.location.as_deref())?;
+    let (location, location_path, fingerprint_status) = match v2_inventory_location_scope(
+        cli,
+        database,
+        &state,
+        &scan_path,
+        args.location.as_deref(),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            if !v2_path_has_completed_annex_import(database, &scan_path)?
+                && archive_ledger::is_git_annex_repository(&scan_path)?
+            {
+                return Err(AppError::Input(
+                        "archive collection add cannot inventory an unimported git-annex repository; use archive location import-annex --collection COLLECTION"
+                            .to_owned(),
+                    ));
+            }
+            return Err(error);
+        }
+    };
     let collection = if let Some(selector) = args.collection.as_deref() {
         select_collection(&state.collections, selector)?
             .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?
     } else {
         infer_v2_collection_at_location(database, &state, &location.location_id)?
     };
+    let imported_annex = v2_location_has_completed_annex_import(
+        database,
+        &collection.collection_id,
+        &location.location_id,
+    )?;
+    if !imported_annex && archive_ledger::is_git_annex_repository(&scan_path)? {
+        return Err(AppError::Input(
+            "archive collection add cannot inventory an unimported git-annex repository; use archive location import-annex --collection COLLECTION"
+                .to_owned(),
+        ));
+    }
     let relative_prefix = scan_path
         .strip_prefix(&location_path)
         .map_err(|_| AppError::Input("inventory path is outside the selected Location".to_owned()))?
@@ -10348,31 +10426,16 @@ fn execute_v2_location_scan(
     } else {
         infer_v2_collection_at_location(database, &state, &location.location_id)?
     };
-    if archive_ledger::is_git_annex_repository(&location_path)? {
-        let connection = Connection::open(database.path()).map_err(|source| {
-            AppError::V2Projection(V2ProjectionError::Sqlite {
-                path: database.path().to_path_buf(),
-                source,
-            })
-        })?;
-        let imported: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM annex_imports WHERE collection_id = ?1 AND worktree_location_id = ?2 AND status = 'complete')",
-                params![collection.collection_id, location.location_id],
-                |row| row.get(0),
-            )
-            .map_err(|source| {
-                AppError::V2Projection(V2ProjectionError::Sqlite {
-                    path: database.path().to_path_buf(),
-                    source,
-                })
-            })?;
-        if !imported {
-            return Err(AppError::Input(
-                "archive location scan cannot scan an unimported git-annex repository; import it once with archive location import-annex"
-                    .to_owned(),
-            ));
-        }
+    let imported_annex = v2_location_has_completed_annex_import(
+        database,
+        &collection.collection_id,
+        &location.location_id,
+    )?;
+    if !imported_annex && archive_ledger::is_git_annex_repository(&location_path)? {
+        return Err(AppError::Input(
+            "archive location scan cannot scan an unimported git-annex repository; import it once with archive location import-annex"
+                .to_owned(),
+        ));
     }
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let store = V2OriginStore::open(cli.events_path())?;
