@@ -161,6 +161,15 @@ is unfamiliar or because words such as API, migration, production, or deployment
 - For an explicitly maintained multi-task backlog, verify and commit each completed task before beginning a dependent task. Do not batch unrelated tasks.
 - Separate prerequisite refactors only when they are independently useful and verifiable; do not create commits solely for process artifacts.
 - Use isolated worktrees or equivalent isolation when concurrent agents could overlap or when the current tree cannot safely host the work.
+- For staging that must survive a reboot or EC2 instance replacement, use a uniquely named,
+  task-owned direct child of `/home/ubuntu/tmp`, not `/tmp`. Include a stable project key and task
+  identifier in the directory name when practical, plus a unique suffix to avoid collisions.
+- Cleanup of task-created staging is part of completing the task. Keep bulky task-created test,
+  cache, and runtime outputs inside that staging root when practical. On normal completion, remove
+  the staging root and other task-created scratch artifacts unless they are intentionally retained;
+  delete only exact verified owned paths. For each retained artifact, record its exact path, owner,
+  purpose, and removal condition in the established durable tracker. Treat names only as attribution
+  hints and report uncertain leftovers rather than deleting them.
 
 ## Durable State and Documentation
 
