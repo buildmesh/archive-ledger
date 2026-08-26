@@ -1,17 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use archive_ledger::{
-    central_archive, create_portable_snapshot, fsck_v2_archive, inspect_portable_snapshot,
-    install_portable_snapshot, utf8_path, AnnexImportConfig, AnnexImportError, AnnexImportStatus,
-    AnnexImporter, ArchiveRootSnapshot, CachedPolicyStatus, CatalogError, CatalogRegistry,
-    CollectionSnapshot, CopyFilter, CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot,
-    DiscoveryItem, EventReferences, EventRequest, EventStore, EventStoreConfig, EventStoreError,
-    FileDiscovery, FileFilter, FilePageRequest, LocationScanner, LocationSnapshot, LocationStatus,
+    access_plan, central_archive, create_portable_snapshot, fsck_v2_archive,
+    inspect_portable_snapshot, install_portable_snapshot, introduced_files, utf8_path,
+    AnnexImportConfig, AnnexImportError, AnnexImportStatus, AnnexImporter, AppIntegrationError,
+    ArchiveRootSnapshot, CachedPolicyStatus, CatalogError, CatalogRegistry, CollectionSnapshot,
+    CopyFilter, CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot, DiscoveryItem,
+    EventReferences, EventRequest, EventStore, EventStoreConfig, EventStoreError, FileDiscovery,
+    FileFilter, FilePageRequest, LocationScanner, LocationSnapshot, LocationStatus,
     MetadataDestinationSnapshot, MetadataError, MetadataProtector, MetadataRegistry, PolicyError,
     PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter, PolicyFindingPage,
     PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb, ProjectionError, Registry,
@@ -210,6 +211,12 @@ enum Command {
     Object {
         #[command(subcommand)]
         command: ObjectCommand,
+    },
+    /// Read-only integration queries for applications built above Archive Ledger.
+    #[command(visible_alias = "integration")]
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
     },
     /// Copy verified content to a Location, or inspect current Copy claims.
     Copy(CopyArgs),
@@ -723,6 +730,42 @@ enum ObjectCommand {
         #[arg(long = "continue")]
         continuation: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AppCommand {
+    /// List active Files first introduced after a canonical Git commit.
+    Changes(AppChangesArgs),
+    /// Resolve requested File IDs to local paths and an attachment plan.
+    Access(AppAccessArgs),
+}
+
+#[derive(Debug, Args)]
+struct AppChangesArgs {
+    /// Collection name or stable ID.
+    #[arg(long)]
+    collection: String,
+    /// Reachable commit from this Archive's canonical Git history.
+    #[arg(long)]
+    since: String,
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    #[arg(long = "continue")]
+    continuation: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AppAccessArgs {
+    /// Collection name or stable ID.
+    #[arg(long)]
+    collection: String,
+    /// JSONL file containing one File ID string/object per line; `-` reads stdin.
+    #[arg(long, default_value = "-")]
+    input: PathBuf,
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    #[arg(long = "continue")]
+    continuation: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1371,6 +1414,7 @@ enum AppError {
     V2Projection(V2ProjectionError),
     V2Fsck(V2FsckError),
     V2Inventory(archive_ledger::V2InventoryError),
+    AppIntegration(AppIntegrationError),
     Io(std::io::Error),
     Json(serde_json::Error),
     Clock,
@@ -1397,6 +1441,7 @@ impl AppError {
             Self::V2Projection(error) => error.code(),
             Self::V2Fsck(error) => error.code(),
             Self::V2Inventory(error) => error.code(),
+            Self::AppIntegration(error) => error.code(),
             Self::Io(_) => "io_error",
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
@@ -1425,6 +1470,7 @@ impl std::fmt::Display for AppError {
             Self::V2Projection(error) => error.fmt(formatter),
             Self::V2Fsck(error) => error.fmt(formatter),
             Self::V2Inventory(error) => error.fmt(formatter),
+            Self::AppIntegration(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
@@ -1532,6 +1578,12 @@ impl From<V2FsckError> for AppError {
 impl From<archive_ledger::V2InventoryError> for AppError {
     fn from(error: archive_ledger::V2InventoryError) -> Self {
         Self::V2Inventory(error)
+    }
+}
+
+impl From<AppIntegrationError> for AppError {
+    fn from(error: AppIntegrationError) -> Self {
+        Self::AppIntegration(error)
     }
 }
 
@@ -2015,6 +2067,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         if let Command::Object { command } = &cli.command {
             return execute_v2_object(&database, cli.events_path(), command, cli.json);
         }
+        if let Command::App { command } = &cli.command {
+            return execute_v2_app(cli, &database, command);
+        }
         if let Some(result) = execute_v2_registry_command(cli, &database)? {
             return Ok(result);
         }
@@ -2043,6 +2098,7 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             Command::Stage(args) => execute_stage(cli, &database, args),
             Command::File { command } => execute_file(&database, command, cli.json),
             Command::Object { command } => execute_object(&database, command, cli.json),
+            Command::App { .. } => unreachable!("application integration requires version 2"),
             Command::Copy(args) => execute_copy(cli, &database, args),
             Command::Scan(args) => execute_scan(cli, &database, args),
             Command::Verify(args) => execute_verify(cli, &database, args),
@@ -15185,6 +15241,122 @@ fn execute_file(
                 if let Some(next) = page.next_seq {
                     println!("More history: rerun with --after-seq {next}");
                 }
+            }
+        }
+    }
+    Ok(EXIT_OK)
+}
+
+fn execute_v2_app(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    command: &AppCommand,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let store = V2OriginStore::open(cli.events_path())?;
+    match command {
+        AppCommand::Changes(args) => {
+            let collection =
+                select_collection(&state.collections, &args.collection)?.ok_or_else(|| {
+                    AppError::Input(format!("Collection not found: {:?}", args.collection))
+                })?;
+            let page = introduced_files(
+                database,
+                &store,
+                &collection.collection_id,
+                &args.since,
+                args.limit,
+                args.continuation.as_deref(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&page)?);
+            } else {
+                println!(
+                    "{} newly introduced active Files in {}:",
+                    page.items.len(),
+                    collection.display_name
+                );
+                for file in &page.items {
+                    println!("  {}  {}", file.file_ref_id, file.logical_path.display);
+                }
+                println!("Current commit: {}", page.current.git_commit);
+                if let Some(next) = page.next {
+                    println!("More results: rerun with --continue {next}");
+                }
+                println!("Use --json for the stable application contract.");
+            }
+        }
+        AppCommand::Access(args) => {
+            let collection =
+                select_collection(&state.collections, &args.collection)?.ok_or_else(|| {
+                    AppError::Input(format!("Collection not found: {:?}", args.collection))
+                })?;
+            if args.input == Path::new("-") && std::io::stdin().is_terminal() {
+                return Err(AppError::Input(
+                    "app access expects JSONL on stdin; use --input FILE or pipe one File ID JSON string per line"
+                        .to_owned(),
+                ));
+            }
+            let page = if args.input == Path::new("-") {
+                access_plan(
+                    database,
+                    &store,
+                    &collection.collection_id,
+                    &cli.host,
+                    BufReader::new(std::io::stdin()),
+                    args.limit,
+                    args.continuation.as_deref(),
+                )?
+            } else {
+                let input = File::open(&args.input)?;
+                access_plan(
+                    database,
+                    &store,
+                    &collection.collection_id,
+                    &cli.host,
+                    BufReader::new(input),
+                    args.limit,
+                    args.continuation.as_deref(),
+                )?
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&page)?);
+            } else {
+                println!(
+                    "File access for {} ({} requested):",
+                    collection.display_name, page.requested_file_count
+                );
+                for item in &page.items {
+                    if let Some(candidate) = &item.local_candidate {
+                        println!(
+                            "  {} — available at {}",
+                            item.requested_file_ref_id, candidate.path.display
+                        );
+                    } else {
+                        println!("  {} — {}", item.requested_file_ref_id, item.state);
+                    }
+                }
+                if let Some(plan) = &page.attachment_plan {
+                    if !plan.steps.is_empty() {
+                        println!("Attach in this order (deterministic greedy plan):");
+                        for step in &plan.steps {
+                            println!(
+                                "  {} — {} requested Files",
+                                step.device_name, step.newly_covered_files
+                            );
+                        }
+                    }
+                    if plan.no_attachable_copy_count > 0 {
+                        println!(
+                            "No attachable Copy is known for {} requested Files.",
+                            plan.no_attachable_copy_count
+                        );
+                    }
+                }
+                if let Some(next) = page.next {
+                    println!("More results: rerun with the same --input and --continue {next}");
+                }
+                println!("Use --json for the stable application contract.");
             }
         }
     }

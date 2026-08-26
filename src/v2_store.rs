@@ -92,6 +92,12 @@ pub enum V2StoreError {
         operation: &'static str,
         path: PathBuf,
     },
+    #[error("canonical cursor {cursor:?} does not name an available Git commit")]
+    CursorNotFound { cursor: String },
+    #[error("canonical cursor commit {cursor} is not an ancestor of current commit {current}")]
+    CursorNotReachable { cursor: String, current: String },
+    #[error("canonical cursor commit {cursor} belongs to a different Archive")]
+    CursorArchiveMismatch { cursor: String },
 }
 
 impl V2StoreError {
@@ -100,6 +106,9 @@ impl V2StoreError {
             Self::Io { .. } => "v2_store_io",
             Self::Json { .. } => "v2_store_json_invalid",
             Self::Git { .. } => "v2_store_git",
+            Self::CursorNotFound { .. } => "cursor_not_found",
+            Self::CursorNotReachable { .. } => "cursor_not_reachable",
+            Self::CursorArchiveMismatch { .. } => "cursor_archive_mismatch",
             Self::Invalid(_)
             | Self::Genesis(_)
             | Self::Frontier(_)
@@ -364,6 +373,16 @@ pub struct V2VerificationReport {
     pub frontiers: u64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct V2CanonicalCursor {
+    pub version: u32,
+    pub archive_id: String,
+    pub genesis_hash: String,
+    pub git_commit: String,
+    pub accepted_frontier_hash: String,
+    pub frontier: CausalFrontier,
+}
+
 #[derive(Debug, Clone)]
 pub struct V2ArchiveInitialization {
     pub archive_id: String,
@@ -477,6 +496,96 @@ impl V2OriginStore {
 
     pub fn canonical_commit(&self) -> Result<String> {
         git_stdout(&self.root, "read canonical commit", &["rev-parse", "HEAD"])
+    }
+
+    /// Resolves a Git commit that is part of this Archive's current canonical
+    /// history and reads the deterministic accepted frontier recorded there.
+    /// This is intentionally a fast cursor check; full segment/history
+    /// verification remains the job of `archive fsck` and `events verify`.
+    pub fn canonical_cursor(&self, selector: &str) -> Result<V2CanonicalCursor> {
+        let resolved = git_resolve_commit(&self.root, selector)?;
+        let current = self.canonical_commit()?;
+        if !git_is_ancestor(&self.root, &resolved, &current)? {
+            return Err(V2StoreError::CursorNotReachable {
+                cursor: resolved,
+                current,
+            });
+        }
+
+        let current_genesis_path = self.root.join("genesis.json");
+        let current_genesis: SignedGenesis =
+            parse_json(&current_genesis_path, &read_file(&current_genesis_path)?)?;
+        current_genesis.body.validate()?;
+        let historical_genesis_bytes = git_blob(
+            &self.root,
+            &resolved,
+            "genesis.json",
+            "read canonical cursor genesis",
+        )?;
+        let historical_genesis_path =
+            PathBuf::from(format!("{}:{resolved}:genesis.json", self.root.display()));
+        let historical_genesis: SignedGenesis =
+            parse_json(&historical_genesis_path, &historical_genesis_bytes)?;
+        historical_genesis.body.validate()?;
+        if historical_genesis.canonical_bytes()? != current_genesis.canonical_bytes()? {
+            return Err(V2StoreError::CursorArchiveMismatch { cursor: resolved });
+        }
+        let genesis_hash = current_genesis.genesis_hash()?;
+
+        let head_bytes = git_blob(
+            &self.root,
+            &resolved,
+            "frontiers/v2/HEAD",
+            "read canonical cursor frontier head",
+        )?;
+        let frontier_hash = String::from_utf8(head_bytes)
+            .map_err(|_| {
+                V2StoreError::Invalid("canonical cursor frontier HEAD is not UTF-8".to_owned())
+            })?
+            .trim()
+            .to_owned();
+        let hash_hex = frontier_hash
+            .strip_prefix("blake3:")
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or_else(|| {
+                V2StoreError::Invalid(
+                    "canonical cursor frontier HEAD is not a lowercase BLAKE3 ID".to_owned(),
+                )
+            })?;
+        let frontier_path = format!("frontiers/v2/frontier-{hash_hex}.json");
+        let frontier_bytes = git_blob(
+            &self.root,
+            &resolved,
+            &frontier_path,
+            "read canonical cursor frontier",
+        )?;
+        let display_path = PathBuf::from(format!(
+            "{}:{resolved}:{frontier_path}",
+            self.root.display()
+        ));
+        let frontier: CausalFrontier = parse_json(&display_path, &frontier_bytes)?;
+        frontier.validate()?;
+        if frontier.frontier_hash()? != frontier_hash
+            || frontier.archive_id != current_genesis.body.archive_id
+            || frontier.genesis_hash != genesis_hash
+        {
+            return Err(V2StoreError::Invalid(
+                "canonical cursor frontier does not match its Archive or filename".to_owned(),
+            ));
+        }
+        Ok(V2CanonicalCursor {
+            version: 1,
+            archive_id: current_genesis.body.archive_id,
+            genesis_hash,
+            git_commit: resolved,
+            accepted_frontier_hash: frontier_hash,
+            frontier,
+        })
     }
 
     pub fn sign_portable_snapshot_manifest(
@@ -4014,6 +4123,41 @@ fn git_stdout(root: &Path, operation: &'static str, args: &[&str]) -> Result<Str
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_resolve_commit(root: &Path, selector: &str) -> Result<String> {
+    let revision = format!("{selector}^{{commit}}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("LC_ALL", "C")
+        .args(["rev-parse", "--verify", "--end-of-options", &revision])
+        .output()
+        .map_err(|source| io_error("resolve canonical cursor", root, source))?;
+    if !output.status.success() {
+        return Err(V2StoreError::CursorNotFound {
+            cursor: selector.to_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_blob(root: &Path, commit: &str, path: &str, operation: &'static str) -> Result<Vec<u8>> {
+    let object = format!("{commit}:{path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("LC_ALL", "C")
+        .args(["show", &object])
+        .output()
+        .map_err(|source| io_error("read canonical cursor object", root, source))?;
+    if !output.status.success() {
+        return Err(V2StoreError::Git {
+            operation,
+            path: root.to_path_buf(),
+        });
+    }
+    Ok(output.stdout)
 }
 
 struct GitWorktree {

@@ -10,7 +10,7 @@ CARGO := $(HOME)/.cargo/bin/cargo
 endif
 endif
 
-.PHONY: all check-deps build install
+.PHONY: all check-deps build install test test-scale
 
 all: build
 
@@ -27,3 +27,11 @@ install: build
 	"$(INSTALL)" -d "$(DESTDIR)$(PREFIX)/bin"
 	"$(INSTALL)" -m 0755 target/release/archive "$(DESTDIR)$(PREFIX)/bin/archive"
 	@echo "Installed archive to $(DESTDIR)$(PREFIX)/bin/archive"
+
+# Routine development suite. Large acceptance gates are #[ignore]d by default.
+test: check-deps
+	"$(CARGO)" test --locked
+
+# Explicit scale milestone; do not run on every feature iteration.
+test-scale: check-deps
+	"$(CARGO)" test --locked --test v2_scale_100k -- --ignored --nocapture --test-threads=1

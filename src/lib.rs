@@ -1,6 +1,7 @@
 //! Core library for Archive Ledger.
 
 pub mod annex;
+pub mod app_integration;
 pub mod catalog;
 pub mod discovery;
 pub mod event_store;
@@ -27,6 +28,11 @@ pub mod v2_store;
 pub use annex::{
     is_git_annex_repository, validate_annex_repository, AnnexImportConfig, AnnexImportError,
     AnnexImportResult, AnnexImportStatus, AnnexImporter, AnnexSummary, V2AnnexImporter,
+};
+pub use app_integration::{
+    access_plan, introduced_files, AccessCandidate, AccessPlanPage, AccessRequestSummary,
+    AppCheckpoint, AppIntegrationError, AppPath, AttachmentLocation, AttachmentPlan,
+    AttachmentStep, ChangeFeedPage, FileAccess, IntroducedFile,
 };
 pub use catalog::{central_archive, CatalogError, CatalogRegistry, KnownArchive};
 pub use discovery::{
@@ -114,6 +120,6 @@ pub use v2_snapshot::{
 pub use v2_store::{
     initialize_v2_archive, is_v2_event_tree, EnrollmentRequestBody, PortableSnapshotManifestBody,
     SignedEnrollmentRequest, SignedPortableSnapshotManifest, V2AppendResult,
-    V2ArchiveInitialization, V2CoordinationLease, V2OriginCursor, V2OriginStore, V2StoreError,
-    V2SyncRemote, V2SyncResult, V2VerificationReport, VerifiedV2Client,
+    V2ArchiveInitialization, V2CanonicalCursor, V2CoordinationLease, V2OriginCursor, V2OriginStore,
+    V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport, VerifiedV2Client,
 };

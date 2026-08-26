@@ -668,6 +668,45 @@ findings were found, and 2 means a requested check could not be completed.
 `restore check` verifies the chain and builds a new database; it does not overwrite the current
 catalog.
 
+## Use Archive Ledger from another app
+
+Higher-level applications can use a versioned, read-only CLI contract without opening the private
+SQLite schema or listing storage directories. For example, a photo application can remember the
+Archive's canonical Git commit after a successful import, then ask which active Files were first
+introduced afterward:
+
+```bash
+archive --json app changes \
+  --collection "Photos" \
+  --since <previous-canonical-commit> \
+  --limit 100
+```
+
+Each page returns stable File/Object IDs, current lossless Collection-relative paths, the resolved
+starting cursor, the current commit/frontier checkpoint, and an opaque continuation. This is an
+introduction feed: it does not treat a rename as a newly introduced File, and it omits Files that
+are no longer active.
+
+To locate a requested set of Files, write one File ID JSON string (or a
+`{"file_ref_id":"..."}` object) per JSONL line and run:
+
+```bash
+archive --json app access \
+  --collection "Photos" \
+  --input album-files.jsonl \
+  --limit 100
+```
+
+The response gives at most one deterministic local candidate per File with the underlying presence
+and verification evidence. “Accessible” means the Copy is claimed present and its registered
+Archive Root is currently revalidated on this host; it is not a new integrity scan. Files that are
+offline receive a deterministic greedy Device/Location attachment plan whose optimality is
+explicitly not guaranteed. Files with no known attachable Copy and unknown IDs remain distinct.
+The whole-request summary appears on every page, while the more expensive attachment plan is
+returned on the first page only. Later pages must use the same input file and continuation; a
+changed request or advanced Archive frontier fails closed. These commands never copy, retrieve,
+scan, or otherwise mutate content or ledger state.
+
 ## Automation and exit status
 
 - `0`: command completed and the selected check has no findings.
@@ -725,4 +764,6 @@ publishes 111 bounded physical records in one Git commit, rebuilds the projectio
 interactive status latency. Earlier streaming-foundation tests cover 500,000 paths. Discovery,
 hashing, projection, and large result lists are bounded or paged. SQLite intentionally trades some
 storage for low-latency indexed review; canonical history remains the recovery source. Reproducible
-measurements live under `docs/benchmarks/`.
+measurements live under `docs/benchmarks/`. The 100,000-file gate is ignored by routine
+`make test`; run it deliberately with `make test-scale` only when changing traversal, batching,
+projection-scale, or memory behavior.

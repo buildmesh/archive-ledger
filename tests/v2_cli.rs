@@ -635,6 +635,60 @@ mod unix {
                 .unwrap(),
             1
         );
+        drop(replica_database);
+
+        let base_commit =
+            String::from_utf8(git(&primary.join("canonical"), &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_owned();
+        let desktop_batch = content.join("desktop-batch");
+        fs::create_dir(&desktop_batch).unwrap();
+        let desktop_file = desktop_batch.join("desktop-only.txt");
+        fs::write(&desktop_file, b"desktop\n").unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            desktop_batch.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        let laptop_batch = content.join("laptop-batch");
+        fs::create_dir(&laptop_batch).unwrap();
+        let laptop_file = laptop_batch.join("laptop-only.txt");
+        fs::write(&laptop_file, b"laptop\n").unwrap();
+        success(archive(&temp).arg("--archive").arg(&replica).args([
+            "collection",
+            "add",
+            laptop_batch.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        success(archive(&temp).args(["sync", "central"]));
+        success(archive(&temp).arg("--archive").arg(&replica).args(["sync"]));
+        success(archive(&temp).args(["sync", "central"]));
+        let changes = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "changes",
+            "--collection",
+            "Files",
+            "--since",
+            &base_commit,
+        ])));
+        let paths = changes["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["logical_path"]["display"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "desktop-batch/desktop-only.txt",
+                "laptop-batch/laptop-only.txt"
+            ]
+        );
     }
 
     #[test]
@@ -2245,5 +2299,252 @@ mod unix {
         assert!(git(&root(&temp).join("canonical"), &["status", "--short"])
             .stdout
             .is_empty());
+    }
+
+    #[test]
+    fn app_change_feed_and_access_planning_are_cursor_bound_and_set_oriented() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let content = temp.path().join("content");
+        fs::create_dir(&content).unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            content.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let canonical = root(&temp).join("canonical");
+        let base_commit = String::from_utf8(git(&canonical, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        // Both logical Files deliberately share one Object so candidate lookup
+        // cannot expand into a File-by-Copy Cartesian product.
+        fs::write(content.join("one.jpg"), b"same bytes\n").unwrap();
+        fs::write(content.join("two.jpg"), b"same bytes\n").unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+
+        let first = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "changes",
+            "--collection",
+            "Files",
+            "--since",
+            &base_commit,
+            "--limit",
+            "1",
+        ])));
+        assert_eq!(first["version"], 1);
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            first["semantics"],
+            "currently_active_files_first_introduced_after_cursor"
+        );
+        let continuation = first["next"].as_str().unwrap();
+        let second = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "changes",
+            "--collection",
+            "Files",
+            "--since",
+            &base_commit,
+            "--limit",
+            "1",
+            "--continue",
+            continuation,
+        ])));
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert!(second["next"].is_null());
+        assert_ne!(
+            first["items"][0]["file_ref_id"],
+            second["items"][0]["file_ref_id"]
+        );
+
+        let current_commit = first["current"]["git_commit"].as_str().unwrap();
+        let none = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "changes",
+            "--collection",
+            "Files",
+            "--since",
+            current_commit,
+        ])));
+        assert!(none["items"].as_array().unwrap().is_empty());
+        let missing_cursor = archive(&temp)
+            .args([
+                "app",
+                "changes",
+                "--collection",
+                "Files",
+                "--since",
+                "not-a-commit",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(missing_cursor.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&missing_cursor.stderr).contains("[cursor_not_found]"));
+
+        let files = json(&success(archive(&temp).args([
+            "--json",
+            "file",
+            "find",
+            "--collection",
+            "Files",
+        ])));
+        let first_id = files["items"][0]["file_ref_id"].as_str().unwrap();
+        let second_id = files["items"][1]["file_ref_id"].as_str().unwrap();
+        let request = temp.path().join("request.jsonl");
+        fs::write(
+            &request,
+            format!("{first_id:?}\n{{\"file_ref_id\":{second_id:?}}}\n\"file_missing\"\n"),
+        )
+        .unwrap();
+        let access = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "access",
+            "--collection",
+            "Files",
+            "--input",
+            request.to_str().unwrap(),
+        ])));
+        assert_eq!(access["requested_file_count"], 3);
+        assert_eq!(access["summary"]["accessible"], 2);
+        assert_eq!(access["summary"]["not_found"], 1);
+        assert_eq!(access["items"][0]["state"], "accessible");
+        assert_eq!(
+            access["items"][0]["local_candidate"]["evidence"],
+            "present_claim_on_revalidated_mount_not_freshly_verified"
+        );
+        assert!(Path::new(
+            access["items"][0]["local_candidate"]["path"]["text"]
+                .as_str()
+                .unwrap()
+        )
+        .starts_with(&content));
+        assert_eq!(access["items"][2]["state"], "not_found");
+
+        let page = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "access",
+            "--collection",
+            "Files",
+            "--input",
+            request.to_str().unwrap(),
+            "--limit",
+            "1",
+        ])));
+        let access_continuation = page["next"].as_str().unwrap().to_owned();
+        fs::write(&request, format!("{first_id:?}\n{second_id:?}\n")).unwrap();
+        let changed_request = archive(&temp)
+            .args([
+                "--json",
+                "app",
+                "access",
+                "--collection",
+                "Files",
+                "--input",
+                request.to_str().unwrap(),
+                "--limit",
+                "1",
+                "--continue",
+                &access_continuation,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(changed_request.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&changed_request.stderr)
+                .contains("\"code\":\"stale_continuation\""),
+            "unexpected error: {}",
+            String::from_utf8_lossy(&changed_request.stderr)
+        );
+
+        let database_path = root(&temp).join("archive.db");
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute("UPDATE device_mounts SET status = 'unmounted'", [])
+            .unwrap();
+        drop(database);
+        let offline = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "access",
+            "--collection",
+            "Files",
+            "--input",
+            request.to_str().unwrap(),
+        ])));
+        assert!(offline["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["state"] == "attachment_required"));
+        assert_eq!(offline["summary"]["attachment_required"], 2);
+        assert_eq!(
+            offline["attachment_plan"]["steps"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            offline["attachment_plan"]["steps"][0]["device_name"],
+            "Test Device"
+        );
+        assert_eq!(
+            offline["attachment_plan"]["steps"][0]["newly_covered_files"],
+            2
+        );
+        assert_eq!(offline["attachment_plan"]["optimality"], "not_guaranteed");
+
+        let database = rusqlite::Connection::open(&database_path).unwrap();
+        database
+            .execute("UPDATE copy_claims SET state = 'missing'", [])
+            .unwrap();
+        drop(database);
+        let unavailable = json(&success(archive(&temp).args([
+            "--json",
+            "app",
+            "access",
+            "--collection",
+            "Files",
+            "--input",
+            request.to_str().unwrap(),
+        ])));
+        assert!(unavailable["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["state"] == "no_known_copy"));
+        assert_eq!(unavailable["summary"]["no_known_copy"], 2);
+        assert_eq!(
+            unavailable["attachment_plan"]["no_attachable_copy_count"],
+            2
+        );
     }
 }
