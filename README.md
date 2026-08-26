@@ -671,9 +671,14 @@ catalog.
 ## Use Archive Ledger from another app
 
 Higher-level applications can use a versioned, read-only CLI contract without opening the private
-SQLite schema or listing storage directories. For example, a photo application can remember the
-Archive's canonical Git commit after a successful import, then ask which active Files were first
-introduced afterward:
+SQLite schema or listing storage directories. Maintainers implementing a photo or album
+application should use the complete
+[photo album integration guide](docs/integrations/photo-album.md). It documents ownership
+boundaries, first-time bootstrap, checkpoint safety, pagination, exact response fields, lossless
+paths, availability evidence, stable errors, and a disposable contract test.
+
+For example, a photo application can remember the Archive's canonical Git commit after a
+successful import, then ask which active Files were first introduced afterward:
 
 ```bash
 archive --json app changes \
