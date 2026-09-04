@@ -21,6 +21,9 @@ registered Locations. It does not move, delete, repair, or drop archive content.
 > an independent backup of each Archive's canonical event tree and do not rely on
 > this pre-production build as the only catalog for irreplaceable data.
 
+See [Example workflows](docs/workflows.md) for task-oriented walkthroughs based on realistic
+Archive Ledger use.
+
 ## Concepts and relationships
 
 An **Archive** is one complete catalog. It is not a directory or storage device: one Archive can
