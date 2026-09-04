@@ -3,7 +3,7 @@ name = "archive-ledger"
 version = "0.1.0"
 edition = "2021"
 description = "Local-first preservation inventory and disaster-risk ledger"
-license = "GPL-3.0-only"
+license = "AGPL-3.0-only"
 repository = "https://github.com/buildmesh/archive-ledger"
 
 [lib]

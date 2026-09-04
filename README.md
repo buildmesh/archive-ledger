@@ -778,5 +778,5 @@ projection-scale, or memory behavior.
 
 ## License
 
-Archive Ledger is licensed under the GNU General Public License, version 3 only
-(`GPL-3.0-only`). See [LICENSE](LICENSE) for the complete license terms.
+Archive Ledger is licensed under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the complete license terms.

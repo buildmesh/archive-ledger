@@ -43,4 +43,4 @@ any checks that could not be run. Prefer focused semantic commits and avoid unre
 refactoring.
 
 By submitting a contribution, you agree that it may be distributed under the repository's
-[GNU General Public License, version 3 only](LICENSE).
+[GNU Affero General Public License, version 3 only](LICENSE).
