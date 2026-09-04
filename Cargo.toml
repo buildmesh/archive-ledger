@@ -3,6 +3,7 @@ name = "archive-ledger"
 version = "0.1.0"
 edition = "2021"
 description = "Local-first preservation inventory and disaster-risk ledger"
+license = "GPL-3.0-only"
 
 [lib]
 name = "archive_ledger"
