@@ -1,0 +1,7 @@
+.beads
+.git
+.github
+target
+
+compose.override.yaml
+.env

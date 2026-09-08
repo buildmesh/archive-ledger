@@ -8,3 +8,7 @@
 
 # Rust build output
 /target/
+
+# Local Docker bind-mount configuration
+/.env
+/compose.override.yaml

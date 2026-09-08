@@ -1,0 +1,24 @@
+# Optional override for Archive Roots that do not share the parent configured by
+# ARCHIVE_LEDGER_LOCATIONS_DIR. Copy this file to compose.override.yaml, add one
+# short entry per exceptional root, and let Compose load it automatically:
+#
+#   cp compose.locations.example.yaml compose.override.yaml
+#   docker compose run --rm archive ...
+services:
+  archive:
+    volumes:
+      - type: bind
+        source: /media/you/photos-disk
+        target: /locations/photos-disk
+        read_only: true
+        bind:
+          create_host_path: false
+
+      # Only destinations used by commands that intentionally create content
+      # should omit read_only or set it to false.
+      - type: bind
+        source: /media/you/backup-disk
+        target: /locations/backup-disk
+        read_only: false
+        bind:
+          create_host_path: false

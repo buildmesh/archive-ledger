@@ -1,0 +1,36 @@
+services:
+  archive:
+    build:
+      context: .
+    image: archive-ledger:local
+    user: "${ARCHIVE_LEDGER_UID:-1000}:${ARCHIVE_LEDGER_GID:-1000}"
+    entrypoint:
+      - /usr/local/bin/archive
+      - --host
+      - "${ARCHIVE_LEDGER_HOST_ID:-docker-host}"
+    command:
+      - --help
+    environment:
+      HOME: /state
+      XDG_CONFIG_HOME: /state/config
+      XDG_DATA_HOME: /state/data
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${ARCHIVE_LEDGER_STATE_DIR:?Set ARCHIVE_LEDGER_STATE_DIR in .env}"
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${ARCHIVE_LEDGER_LOCATIONS_DIR:?Set ARCHIVE_LEDGER_LOCATIONS_DIR in .env}"
+        target: "${ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR:-/locations}"
+        read_only: true
+        bind:
+          create_host_path: false
+    working_dir: "${ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR:-/locations}"
+    stdin_open: true
+    tty: true

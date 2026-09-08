@@ -110,6 +110,74 @@ archive --version
 `make install` checks dependencies, performs a locked release build, and installs
 `$HOME/.local/bin/archive`. Use `make install PREFIX=/usr/local` or `DESTDIR` when packaging.
 
+### Run with Docker Compose
+
+The repository includes a multi-stage `Dockerfile` and a Compose configuration. Compose is used as
+a reusable definition for this one-shot CLI, not as a long-running service: run a fresh container
+for each command so external devices mounted on the host before the command are visible.
+
+Create a private state directory and one host directory beneath which external devices are
+mounted. The device directories may remain empty while their devices are disconnected:
+
+```bash
+cp .env.example .env
+# Edit the absolute paths, UID/GID, and stable host ID in .env.
+mkdir -p "$HOME/.local/share/archive-ledger-container" /mnt/archive-ledger
+docker compose build
+docker compose run --rm archive --version
+```
+
+For example, arrange host mountpoints as `/mnt/archive-ledger/photos-disk`,
+`/mnt/archive-ledger/backup-disk`, and so on. The single parent bind mount makes them appear as
+`/locations/photos-disk` and `/locations/backup-disk` in the container, so twelve devices do not
+require twelve command-line mount arguments. Mount a device before starting a command; an empty
+mountpoint is not the device and must never be used to initialize a Collection or Location.
+
+Archive Ledger's catalog and local configuration persist beneath `ARCHIVE_LEDGER_STATE_DIR`.
+Location content is read-only by default, while the image filesystem is also read-only. Initialize
+and use an Archive with:
+
+```bash
+docker compose run --rm archive init "Personal archive"
+docker compose run --rm archive location discover /locations/photos-disk
+docker compose run --rm archive collection init /locations/photos-disk/documents \
+  --name "Documents" --device "Photos disk" --site "Home"
+docker compose run --rm archive collection add /locations/photos-disk/documents
+```
+
+A shell function can shorten repeated commands without hiding the Compose definition:
+
+```bash
+archive-docker() { docker compose run --rm archive "$@"; }
+archive-docker status
+```
+
+If Archive Roots are scattered under unrelated host parents, copy
+`compose.locations.example.yaml` to the ignored `compose.override.yaml` and list those exceptional
+bind mounts there. Compose loads that override automatically:
+
+```bash
+cp compose.locations.example.yaml compose.override.yaml
+docker compose run --rm archive status
+```
+
+The override example also shows how to make one deliberate copy destination writable. Keep source
+Locations read-only. Do not run native and containerized writers against the same catalog at the
+same time.
+
+The container runs as `ARCHIVE_LEDGER_UID:ARCHIVE_LEDGER_GID`; the state directory must be writable
+and Location files readable by that identity. `findmnt` runs inside the container, and Docker may
+not expose the underlying filesystem UUID for every bind mount. Always inspect a representative
+root with `location discover`. If stable identity is unavailable, `--allow-unidentified-root` is an
+explicit weaker fallback whose safety depends on keeping both the container mount path and
+`ARCHIVE_LEDGER_HOST_ID` stable. Mounting a host root at the same absolute container path is also
+possible by setting `ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR` to the host parent path.
+
+The parent-directory approach recursively includes devices already mounted beneath it when the
+container starts. On older Linux kernels, Docker may be unable to make nested submounts read-only
+even though the parent bind is read-only. Use explicit per-root entries like those in
+`compose.locations.example.yaml` when read-only enforcement by the container boundary is required.
+
 ## Create an Archive and first Collection
 
 Create one named catalog. This does not inspect the current directory or tie the Archive to any
