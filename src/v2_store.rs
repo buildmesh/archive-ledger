@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -21,6 +21,9 @@ use crate::frontier::{
     CausalFrontier, OriginFrontier, FRONTIER_VERSION, INITIAL_ITEM_PROJECTION_VERSION,
 };
 use crate::genesis::{client_id, GenesisBody, SignedGenesis};
+use crate::git::{
+    managed_git_command, validate_git_ref, validate_git_remote_locator, validate_git_remote_name,
+};
 use crate::v2_batch::{BatchChunkDescriptor, BatchCompletion, BatchLimits, BatchValidator};
 use crate::v2_event::{
     parse_v2_record, V2Record, V2RecordEnvelope, V2RecordKind, DEFAULT_MAX_V2_RECORD_BYTES,
@@ -702,12 +705,7 @@ impl V2OriginStore {
         let names = git_stdout(&self.root, "list synchronization remotes", &["remote"])?;
         let mut remotes = Vec::new();
         for name in names.lines().filter(|name| !name.is_empty()) {
-            validate_remote_name(name)?;
-            let locator = git_stdout(
-                &self.root,
-                "read synchronization remote",
-                &["remote", "get-url", name],
-            )?;
+            let locator = configured_remote_locator(&self.root, name)?;
             remotes.push(V2SyncRemote {
                 name: name.to_owned(),
                 locator,
@@ -807,7 +805,7 @@ impl V2OriginStore {
     }
 
     pub fn sync_remote(&self, remote: &str) -> Result<V2SyncResult> {
-        validate_remote_name(remote)?;
+        configured_remote_locator(&self.root, remote)?;
         ensure_git_clean(&self.root)?;
         let local_verified = self.verify_compact()?;
         let local_before =
@@ -956,7 +954,7 @@ impl V2OriginStore {
         remote: &str,
         duration_ms: u64,
     ) -> Result<V2CoordinationLease> {
-        validate_remote_name(remote)?;
+        configured_remote_locator(&self.root, remote)?;
         if duration_ms == 0 {
             return Err(V2StoreError::Invalid(
                 "coordination lease duration must be positive".to_owned(),
@@ -1074,7 +1072,7 @@ impl V2OriginStore {
     }
 
     pub fn release_archive_lease(&self, lease: &V2CoordinationLease) -> Result<()> {
-        validate_remote_name(&lease.remote)?;
+        configured_remote_locator(&self.root, &lease.remote)?;
         let verified = self.verify_compact()?;
         if lease.scope_kind != "archive"
             || lease.scope_id != verified.genesis.body.archive_id
@@ -4057,7 +4055,7 @@ fn commit_initial_tree(root: &Path) -> Result<String> {
             "frontiers",
         ],
     )?;
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4084,7 +4082,7 @@ fn commit_canonical_tree(root: &Path, operation_kind: &str) -> Result<String> {
         &["add", "--", "events", "manifests", "frontiers"],
     )?;
     let message = format!("Archive Ledger: {operation_kind}");
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4109,7 +4107,7 @@ fn run_git(root: &Path, operation: &'static str, args: &[&str]) -> Result<()> {
 }
 
 fn git_stdout(root: &Path, operation: &'static str, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4127,7 +4125,7 @@ fn git_stdout(root: &Path, operation: &'static str, args: &[&str]) -> Result<Str
 
 fn git_resolve_commit(root: &Path, selector: &str) -> Result<String> {
     let revision = format!("{selector}^{{commit}}");
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4144,7 +4142,7 @@ fn git_resolve_commit(root: &Path, selector: &str) -> Result<String> {
 
 fn git_blob(root: &Path, commit: &str, path: &str, operation: &'static str) -> Result<Vec<u8>> {
     let object = format!("{commit}:{path}");
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4170,7 +4168,7 @@ impl GitWorktree {
         let path =
             std::env::temp_dir().join(format!("archive-ledger-sync-worktree-{}", lower_ulid()));
         let path_text = path_text(&path)?;
-        let output = Command::new("git")
+        let output = managed_git_command()
             .arg("-C")
             .arg(repository)
             .env("LC_ALL", "C")
@@ -4198,7 +4196,7 @@ impl GitWorktree {
 
 impl Drop for GitWorktree {
     fn drop(&mut self) {
-        let _ = Command::new("git")
+        let _ = managed_git_command()
             .arg("-C")
             .arg(&self.repository)
             .env("LC_ALL", "C")
@@ -4212,40 +4210,22 @@ impl Drop for GitWorktree {
 }
 
 fn validate_remote_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.starts_with('.')
-        || name.ends_with('.')
-        || name.contains("..")
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(V2StoreError::Invalid(format!(
-            "invalid synchronization remote name {name:?}"
-        )));
-    }
-    Ok(())
+    validate_git_remote_name(name).map_err(V2StoreError::Invalid)
 }
 
 fn validate_remote_locator(locator: &str) -> Result<()> {
-    if locator.trim() != locator || locator.is_empty() || locator.contains(['\n', '\r', '\0']) {
-        return Err(V2StoreError::Invalid(
-            "synchronization remote locator is empty or contains control characters".to_owned(),
-        ));
-    }
-    if let Some((_, remainder)) = locator.split_once("://") {
-        let authority = remainder.split('/').next().unwrap_or(remainder);
-        if authority
-            .split_once('@')
-            .is_some_and(|(userinfo, _)| userinfo.contains(':'))
-        {
-            return Err(V2StoreError::Invalid(
-                "remote locators must not embed passwords or tokens; use Git credential configuration"
-                    .to_owned(),
-            ));
-        }
-    }
-    Ok(())
+    validate_git_remote_locator(locator).map_err(V2StoreError::Invalid)
+}
+
+fn configured_remote_locator(root: &Path, remote: &str) -> Result<String> {
+    validate_remote_name(remote)?;
+    let locator = git_stdout(
+        root,
+        "read synchronization remote",
+        &["remote", "get-url", remote],
+    )?;
+    validate_remote_locator(&locator)?;
+    Ok(locator)
 }
 
 fn ensure_git_clean(root: &Path) -> Result<()> {
@@ -4268,11 +4248,13 @@ fn remote_archive_commit(root: &Path, remote: &str) -> Result<Option<String>> {
 }
 
 fn remote_ref_commit(root: &Path, remote: &str, remote_ref: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
+    validate_remote_name(remote)?;
+    validate_git_ref(remote_ref).map_err(V2StoreError::Invalid)?;
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
-        .args(["ls-remote", remote, remote_ref])
+        .args(["ls-remote", "--", remote, remote_ref])
         .output()
         .map_err(|source| io_error("query synchronization remote", root, source))?;
     if !output.status.success() {
@@ -4318,6 +4300,7 @@ fn fetch_ref(root: &Path, remote: &str, remote_ref: &str, local_ref: String) -> 
             OsString::from("fetch"),
             OsString::from("--quiet"),
             OsString::from("--no-tags"),
+            OsString::from("--"),
             OsString::from(remote),
             OsString::from(refspec),
         ],
@@ -4332,6 +4315,7 @@ fn push_new_archive_ref(root: &Path, remote: &str, commit: &str) -> Result<bool>
         [
             OsString::from("push"),
             OsString::from("--quiet"),
+            OsString::from("--"),
             OsString::from(remote),
             OsString::from(refspec),
         ],
@@ -4347,6 +4331,7 @@ fn push_archive_ref_cas(root: &Path, remote: &str, commit: &str, expected: &str)
             OsString::from("push"),
             OsString::from("--quiet"),
             OsString::from(lease),
+            OsString::from("--"),
             OsString::from(remote),
             OsString::from(refspec),
         ],
@@ -4371,6 +4356,7 @@ fn push_ref_cas(
             OsString::from("push"),
             OsString::from("--quiet"),
             OsString::from(lease),
+            OsString::from("--"),
             OsString::from(remote),
             OsString::from(refspec),
         ],
@@ -4525,7 +4511,7 @@ fn create_coordination_commit(
         "read coordination commit tree",
         &["rev-parse", "HEAD^{tree}"],
     )?;
-    let mut command = Command::new("git");
+    let mut command = managed_git_command();
     command
         .arg("-C")
         .arg(root)
@@ -4564,7 +4550,7 @@ fn create_coordination_commit(
 }
 
 fn git_stdout_preserve(root: &Path, operation: &'static str, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4585,7 +4571,7 @@ fn git_command_status<I>(root: &Path, args: I) -> Result<bool>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let status = Command::new("git")
+    let status = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4599,7 +4585,7 @@ fn git_command<I>(root: &Path, operation: &'static str, args: I) -> Result<Strin
 where
     I: IntoIterator<Item = OsString>,
 {
-    let output = Command::new("git")
+    let output = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4616,7 +4602,7 @@ where
 }
 
 fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
-    let status = Command::new("git")
+    let status = managed_git_command()
         .arg("-C")
         .arg(root)
         .env("LC_ALL", "C")
@@ -4893,7 +4879,7 @@ fn create_union_commit(
         "write synchronization union tree",
         &["write-tree"],
     )?;
-    let mut child = Command::new("git")
+    let mut child = managed_git_command()
         .arg("-C")
         .arg(worktree)
         .env("LC_ALL", "C")
@@ -5229,6 +5215,7 @@ fn io_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn copy_tree(source: &Path, target: &Path) {

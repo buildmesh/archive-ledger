@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod event_store;
 pub mod frontier;
 pub mod genesis;
+mod git;
 mod job;
 pub mod metadata;
 pub mod policy;
@@ -51,6 +52,9 @@ pub use frontier::{
 };
 pub use genesis::{
     client_id, GenesisBody, GenesisError, SignedGenesis, GENESIS_VERSION, V2_SCHEMA_VERSION,
+};
+pub use git::{
+    managed_git_command, validate_git_ref, validate_git_remote_locator, validate_git_remote_name,
 };
 pub use job::validate_job_id;
 pub use metadata::{

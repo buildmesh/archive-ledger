@@ -644,9 +644,16 @@ durable rebuild source, so protecting only `archive.db` is insufficient. `archiv
 prints the Archive root; its SQLite view is `archive.db`, its Git-backed event tree is `canonical/`,
 and its private client key stays under `local/`.
 
-Configure a Git remote for the Archive's canonical history, then synchronize. The remote may be a
-local bare repository, an SSH Git URL, or another locator supported by Git. Do not embed passwords
-or tokens in it; use normal Git/SSH credential configuration.
+Configure a Git remote for the Archive's canonical history, then synchronize. Supported transports
+are local paths and `file://`, `http://`, `https://`, SSH, and scp-style SSH locators. Option-shaped
+locators and arbitrary Git remote helpers are refused. Do not embed passwords or tokens in a
+locator; use normal Git/SSH credential configuration.
+
+Archive Ledger retains system, user, and repository Git configuration needed for credential
+helpers, proxies, certificate authorities, SSH, and URL rewrites. For its application-managed Git
+commands it overrides executable hooks and filesystem monitors, disables automatic signing
+programs and paging, and permits only the transports above. A URL rewrite cannot enable a
+disallowed helper or protocol.
 
 ```bash
 archive sync remote add central ssh://backup.example/personal-archive.git

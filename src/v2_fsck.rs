@@ -12,6 +12,7 @@ use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::git::managed_git_command;
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 use crate::v2_store::{V2OriginStore, V2StoreError};
 
@@ -168,7 +169,7 @@ pub fn fsck_v2_archive(
 
     let started = Instant::now();
     let git = bounded_command(
-        Command::new("git")
+        managed_git_command()
             .arg("-C")
             .arg(store.root())
             .args(["fsck", "--full", "--strict"]),
@@ -463,8 +464,8 @@ fn run_full_check(
     let mut temp = FsckTemp::new(&base)?;
     let clone = temp.path.join("canonical");
     let clone_result = bounded_command(
-        Command::new("git")
-            .args(["clone", "--quiet", "--no-hardlinks"])
+        managed_git_command()
+            .args(["clone", "--quiet", "--no-hardlinks", "--"])
             .arg(store.root())
             .arg(&clone),
     )?;
@@ -479,7 +480,7 @@ fn run_full_check(
         );
         return Ok(());
     }
-    let checkout = bounded_command(Command::new("git").arg("-C").arg(&clone).args([
+    let checkout = bounded_command(managed_git_command().arg("-C").arg(&clone).args([
         "checkout",
         "--quiet",
         "--detach",
@@ -945,7 +946,7 @@ fn commit_containing_frontier(
     frontier_hash: &str,
 ) -> Result<Option<String>> {
     let pickaxe = format!("-S{frontier_hash}");
-    let candidates = bounded_command(Command::new("git").arg("-C").arg(store.root()).args([
+    let candidates = bounded_command(managed_git_command().arg("-C").arg(store.root()).args([
         "log",
         "--all",
         "--format=%H",
@@ -966,7 +967,7 @@ fn commit_containing_frontier(
         }
         let object = format!("{commit}:frontiers/v2/HEAD");
         let head = bounded_command(
-            Command::new("git")
+            managed_git_command()
                 .arg("-C")
                 .arg(store.root())
                 .args(["show", &object]),

@@ -750,6 +750,32 @@ mod unix {
     }
 
     #[test]
+    fn sync_clone_rejects_an_option_shaped_locator_before_git_runs() {
+        let temp = TempDir::new().unwrap();
+        let fake_bin = temp.path().join("bin");
+        let marker = temp.path().join("git-was-run");
+        fs::create_dir(&fake_bin).unwrap();
+        let fake_git = fake_bin.join("git");
+        fs::write(&fake_git, "#!/bin/sh\ntouch \"$MARKER\"\nexit 99\n").unwrap();
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = archive(&temp)
+            .env("PATH", &fake_bin)
+            .env("MARKER", &marker)
+            .args([
+                "sync",
+                "clone",
+                "--",
+                "--upload-pack=/tmp/untrusted-program",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("option-shaped"));
+        assert!(!marker.exists(), "Git ran before locator validation");
+    }
+
+    #[test]
     fn verification_rejects_corruption_and_pre_v2_trees_clearly() {
         let temp = TempDir::new().unwrap();
         success(archive(&temp).args([

@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
+use crate::git::managed_git_command;
 use crate::job::{validate_job_id, JobDirectory};
 use crate::projection::{ProjectionDb, ProjectionError};
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
@@ -2355,7 +2356,7 @@ fn worktree_metadata_digest(_repo: &Path) -> Result<String> {
 }
 
 fn git_command(repo: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = managed_git_command();
     command
         .arg("-C")
         .arg(repo)
