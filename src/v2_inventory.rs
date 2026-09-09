@@ -431,6 +431,12 @@ pub fn add_files(
              path_encoding TEXT NOT NULL,
              path_bytes BLOB NOT NULL,
              PRIMARY KEY(path_encoding, path_bytes)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS ignored_entries(
+             entry_kind TEXT NOT NULL,
+             path_encoding TEXT NOT NULL,
+             path_bytes BLOB NOT NULL,
+             PRIMARY KEY(entry_kind, path_encoding, path_bytes)
          ) WITHOUT ROWID;",
     )
     .map_err(|source| V2InventoryError::Sqlite {
@@ -542,6 +548,15 @@ pub fn add_files(
         })?;
     let mut already_seen = seen
         .prepare("SELECT EXISTS(SELECT 1 FROM seen WHERE path_encoding = ?1 AND path_bytes = ?2)")
+        .map_err(|source| V2InventoryError::Sqlite {
+            path: seen_path.clone(),
+            source,
+        })?;
+    let mut record_ignored = seen
+        .prepare(
+            "INSERT OR IGNORE INTO ignored_entries(entry_kind, path_encoding, path_bytes)
+             VALUES (?1, ?2, ?3)",
+        )
         .map_err(|source| V2InventoryError::Sqlite {
             path: seen_path.clone(),
             source,
@@ -779,13 +794,25 @@ pub fn add_files(
                 summary.bytes_observed = summary.bytes_observed.saturating_add(hashed.size_bytes);
             }
             DiscoveryItem::Symlink(path) => {
-                if !annex_imported {
-                    summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
-                    continue;
-                }
                 let relative = raw_relative_path(&path)?;
                 let logical_path = prefixed_path(config.logical_prefix.as_deref(), &relative);
                 let logical_encoded = encode_relative_path(&logical_path);
+                if !annex_imported {
+                    let inserted = record_ignored
+                        .execute(params![
+                            "symlink",
+                            logical_encoded.encoding.as_str(),
+                            logical_encoded.bytes,
+                        ])
+                        .map_err(|source| V2InventoryError::Sqlite {
+                            path: seen_path.clone(),
+                            source,
+                        })?;
+                    if inserted > 0 {
+                        summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
+                    }
+                    continue;
+                }
                 let was_seen: bool = already_seen
                     .query_row(
                         params![logical_encoded.encoding.as_str(), logical_encoded.bytes],
@@ -928,6 +955,7 @@ pub fn add_files(
     drop(known);
     drop(record_seen);
     drop(already_seen);
+    drop(record_ignored);
     spool.sync()?;
     seen.execute_batch("COMMIT")
         .map_err(|source| V2InventoryError::Sqlite {
