@@ -203,8 +203,10 @@ fn decode_blake3(value: &str) -> Result<[u8; 32]> {
         return Err(BatchValidationError::InvalidRecordHash);
     }
     let mut bytes = [0_u8; 32];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        bytes[index] = (decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?;
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (index, [high, low]) in pairs.iter().copied().enumerate() {
+        bytes[index] = (decode_nibble(high)? << 4) | decode_nibble(low)?;
     }
     Ok(bytes)
 }
@@ -298,6 +300,11 @@ mod tests {
         ));
 
         let mut invalid_hash = chunk(0, 1, 'g');
+        assert_eq!(
+            validator.accept_chunk(&invalid_hash),
+            Err(BatchValidationError::InvalidRecordHash)
+        );
+        invalid_hash.record_hash.pop();
         assert_eq!(
             validator.accept_chunk(&invalid_hash),
             Err(BatchValidationError::InvalidRecordHash)
