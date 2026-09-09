@@ -3,19 +3,45 @@
 use std::process::Command;
 
 const ALLOWED_URL_SCHEMES: &[&str] = &["file", "http", "https", "ssh"];
+const REMOVED_GIT_ENVIRONMENT: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_ASKPASS",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_EDITOR",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PROXY_COMMAND",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_TEMPLATE_DIR",
+    "GIT_WORK_TREE",
+    "SSH_ASKPASS",
+];
 
 /// Returns a Git command with Archive Ledger's constrained execution policy.
 ///
-/// System, global, and repository configuration remains available for credentials, proxies,
-/// certificate authorities, SSH configuration, and URL rewrites. Command-scoped overrides disable
-/// executable hooks, filesystem monitors, automatic signing programs, and all transports except
-/// local files, HTTP(S), and SSH. Unknown remote helpers therefore fail closed.
+/// System, global, and repository configuration is trusted operator-controlled state and remains
+/// available for credentials, proxies, certificate authorities, filters, SSH configuration, and
+/// URL rewrites. Command-scoped overrides disable incidental executable selectors and all
+/// transports except local files, HTTP(S), and SSH. Unknown remote helpers therefore fail closed.
 pub fn managed_git_command() -> Command {
     let mut command = Command::new("git");
     command.arg("--no-pager");
     for setting in [
         "core.hooksPath=/dev/null",
         "core.fsmonitor=false",
+        "core.sshCommand=ssh",
         "commit.gpgSign=false",
         "tag.gpgSign=false",
         "protocol.allow=never",
@@ -25,6 +51,9 @@ pub fn managed_git_command() -> Command {
         "protocol.ssh.allow=always",
     ] {
         command.arg("-c").arg(setting);
+    }
+    for variable in REMOVED_GIT_ENVIRONMENT {
+        command.env_remove(variable);
     }
     command.env("LC_ALL", "C");
     command
@@ -234,6 +263,7 @@ mod tests {
         for setting in [
             "core.hooksPath=/dev/null",
             "core.fsmonitor=false",
+            "core.sshCommand=ssh",
             "commit.gpgSign=false",
             "tag.gpgSign=false",
             "protocol.allow=never",
@@ -244,5 +274,61 @@ mod tests {
         ] {
             assert!(args.iter().any(|argument| argument == setting));
         }
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<std::collections::HashMap<_, _>>();
+        for variable in REMOVED_GIT_ENVIRONMENT {
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(variable)),
+                Some(&None),
+                "{variable} was inherited"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_ssh_ignores_repository_command_override() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let marker = temp.path().join("marker");
+        let command = temp.path().join("repository-ssh");
+        fs::create_dir(&repository).unwrap();
+        fs::write(
+            &command,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["config", "--local", "core.sshCommand"])
+            .arg(&command)
+            .status()
+            .unwrap()
+            .success());
+
+        let output = managed_git_command()
+            .arg("-C")
+            .arg(&repository)
+            .args(["ls-remote", "--", "ssh://127.0.0.1:1/archive.git", "HEAD"])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(!marker.exists());
     }
 }
