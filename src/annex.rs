@@ -2,14 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt as _;
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -391,32 +388,28 @@ impl<'a> V2AnnexImporter<'a> {
             "git_head_commit": initial.head,
             "source_fingerprint": initial.fingerprint(),
         });
-        let new_job = !config_path.exists();
-        if new_job {
-            fs::write(
-                &config_path,
-                serde_json::to_vec(&config_value)
-                    .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?,
-            )
-            .map_err(|source| {
-                io_error("write annex import job configuration", &config_path, source)
+        let existing_config = job.read_optional("annex-config.json").map_err(|source| {
+            io_error("read annex import job configuration", &config_path, source)
+        })?;
+        if let Some(bytes) = existing_config {
+            let existing: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                AnnexImportError::InvalidConfig(format!(
+                    "annex job configuration is invalid: {error}"
+                ))
             })?;
-        } else {
-            let existing: Value =
-                serde_json::from_slice(&fs::read(&config_path).map_err(|source| {
-                    io_error("read annex import job configuration", &config_path, source)
-                })?)
-                .map_err(|error| {
-                    AnnexImportError::InvalidConfig(format!(
-                        "annex job configuration is invalid: {error}"
-                    ))
-                })?;
             if existing != config_value {
                 return Err(AnnexImportError::InvalidConfig(format!(
                     "job {} belongs to a different repository snapshot or import",
                     self.config.job_id
                 )));
             }
+        } else {
+            let bytes = serde_json::to_vec(&config_value)
+                .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
+            job.write_new("annex-config.json", &bytes)
+                .map_err(|source| {
+                    io_error("write annex import job configuration", &config_path, source)
+                })?;
         }
         let connection = rusqlite::Connection::open(self.projection.path()).map_err(|source| {
             AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
@@ -477,6 +470,7 @@ impl<'a> V2AnnexImporter<'a> {
             job.cleanup(&[
                 "annex-items.jsonl",
                 "annex-summary.json",
+                "annex-summary.json.tmp",
                 "annex-config.json",
             ])
             .map_err(|source| {
@@ -490,28 +484,21 @@ impl<'a> V2AnnexImporter<'a> {
             });
         }
 
-        let checkpoint: Option<AnnexLocalCheckpoint> = if summary_path.exists() {
-            Some(
-                serde_json::from_slice(&fs::read(&summary_path).map_err(|source| {
-                    io_error("read annex import job summary", &summary_path, source)
-                })?)
-                .map_err(|error| {
+        let checkpoint: Option<AnnexLocalCheckpoint> = job
+            .read_optional("annex-summary.json")
+            .map_err(|source| io_error("read annex import job summary", &summary_path, source))?
+            .map(|bytes| {
+                serde_json::from_slice(&bytes).map_err(|error| {
                     AnnexImportError::InvalidConfig(format!(
                         "annex job summary is invalid: {error}"
                     ))
-                })?,
-            )
-        } else {
-            None
-        };
+                })
+            })
+            .transpose()?;
         let fresh_progress = checkpoint.is_none();
         let checkpoint_len = checkpoint.as_ref().map_or(0, |value| value.spool_len);
-        let spool_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&spool_path)
+        let spool_file = job
+            .open_read_write("annex-items.jsonl")
             .map_err(|source| io_error("open annex import spool", &spool_path, source))?;
         spool_file
             .set_len(checkpoint_len)
@@ -557,7 +544,7 @@ impl<'a> V2AnnexImporter<'a> {
         }
         let mut summary = checkpoint.map_or_else(AnnexSummary::default, |value| value.summary);
         if fresh_progress {
-            save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+            save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
         }
         let mut index = IndexStream::open(&self.config.repo_path)?;
         let mut cat_file = CatFile::open(&self.config.repo_path)?;
@@ -585,7 +572,7 @@ impl<'a> V2AnnexImporter<'a> {
                     .entries_seen
                     .is_multiple_of(self.config.batch_entries as u64)
                 {
-                    save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+                    save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
                 }
                 continue;
             }
@@ -599,7 +586,7 @@ impl<'a> V2AnnexImporter<'a> {
                     .entries_seen
                     .is_multiple_of(self.config.batch_entries as u64)
                 {
-                    save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+                    save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
                 }
                 continue;
             };
@@ -616,7 +603,7 @@ impl<'a> V2AnnexImporter<'a> {
                 .entries_seen
                 .is_multiple_of(self.config.batch_entries as u64)
             {
-                save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+                save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
             }
         }
         if interrupted {
@@ -629,7 +616,7 @@ impl<'a> V2AnnexImporter<'a> {
             return Err(AnnexImportError::SourceChanged);
         }
         if interrupted {
-            save_annex_checkpoint(&mut spool, &spool_path, &summary_path, &summary)?;
+            save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
             connection
                 .execute(
                     "UPDATE jobs SET progress_json = ?2 WHERE job_id = ?1",
@@ -704,6 +691,7 @@ impl<'a> V2AnnexImporter<'a> {
         job.cleanup(&[
             "annex-items.jsonl",
             "annex-summary.json",
+            "annex-summary.json.tmp",
             "annex-config.json",
         ])
         .map_err(|source| io_error("remove completed annex import job files", &job_root, source))?;
@@ -1421,6 +1409,7 @@ fn write_v2_item(writer: &mut BufWriter<File>, item: &Value, path: &Path) -> Res
 }
 
 fn save_annex_checkpoint(
+    job: &JobDirectory,
     spool: &mut BufWriter<File>,
     spool_path: &Path,
     checkpoint_path: &Path,
@@ -1437,19 +1426,9 @@ fn save_annex_checkpoint(
         summary: summary.clone(),
         spool_len,
     };
-    let temporary = checkpoint_path.with_extension("json.tmp");
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&temporary)
-        .map_err(|source| io_error("create annex import checkpoint", &temporary, source))?;
-    serde_json::to_writer(&mut file, &checkpoint)
+    let bytes = serde_json::to_vec(&checkpoint)
         .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
-    file.sync_all()
-        .map_err(|source| io_error("sync annex import checkpoint", &temporary, source))?;
-    fs::rename(&temporary, checkpoint_path)
+    job.replace("annex-summary.json", "annex-summary.json.tmp", &bytes)
         .map_err(|source| io_error("publish annex import checkpoint", checkpoint_path, source))
 }
 

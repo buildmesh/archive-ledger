@@ -71,6 +71,37 @@ mod unix {
         }
     }
 
+    fn assert_job_resume_refuses_symlink(temp: &TempDir, job_id: &str, name: &str) {
+        use std::os::unix::fs::symlink;
+
+        let path = root(temp).join("local/jobs").join(job_id).join(name);
+        let original = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read job fixture {path:?}: {error}"),
+        };
+        if original.is_some() {
+            fs::remove_file(&path).unwrap();
+        }
+        let sentinel = temp
+            .path()
+            .join(format!("sentinel-{}", name.replace('.', "-")));
+        fs::write(&sentinel, b"preserve me").unwrap();
+        symlink(&sentinel, &path).unwrap();
+
+        let output = archive(temp)
+            .args(["job", "resume", job_id])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "resumed through symlink {name}");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+
+        fs::remove_file(&path).unwrap();
+        if let Some(bytes) = original {
+            fs::write(path, bytes).unwrap();
+        }
+    }
+
     #[test]
     fn init_status_verify_and_rebuild_use_one_verified_v2_state() {
         let temp = TempDir::new().unwrap();
@@ -1053,6 +1084,15 @@ mod unix {
             "job_inventory_resume",
         ])));
         assert_eq!(job["status"], "running");
+        for name in [
+            "inventory-config.json",
+            "inventory-items.jsonl",
+            "inventory-seen.sqlite3",
+            "inventory-seen.sqlite3-wal",
+            "inventory-summary.json",
+        ] {
+            assert_job_resume_refuses_symlink(&temp, "job_inventory_resume", name);
+        }
         let added = json(&success(archive(&temp).args([
             "--json",
             "job",
@@ -1559,6 +1599,13 @@ mod unix {
         ])));
         assert_eq!(paused["annex_import"]["status"], "running");
         assert_eq!(paused["annex_import"]["summary"]["entries_seen"], 1);
+        for name in [
+            "annex-config.json",
+            "annex-summary.json",
+            "annex-items.jsonl",
+        ] {
+            assert_job_resume_refuses_symlink(&temp, "job_annex_resume", name);
+        }
         fs::OpenOptions::new()
             .append(true)
             .open(root(&temp).join("local/jobs/job_annex_resume/annex-items.jsonl"))
