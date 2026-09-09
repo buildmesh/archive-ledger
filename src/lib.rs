@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod event_store;
 pub mod frontier;
 pub mod genesis;
+mod job;
 pub mod metadata;
 pub mod policy;
 pub mod projection;
@@ -51,6 +52,7 @@ pub use frontier::{
 pub use genesis::{
     client_id, GenesisBody, GenesisError, SignedGenesis, GENESIS_VERSION, V2_SCHEMA_VERSION,
 };
+pub use job::validate_job_id;
 pub use metadata::{
     initialize_metadata_repository, restore_check, IndependenceAssessment,
     MetadataCheckpointResult, MetadataDestinationSnapshot, MetadataDestinationState, MetadataError,

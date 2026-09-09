@@ -5433,12 +5433,7 @@ fn execute_stage_import(
         .job_id
         .clone()
         .unwrap_or_else(|| format!("job_{suffix}"));
-    if !job_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err(AppError::Input("invalid stage import job ID".to_owned()));
-    }
+    archive_ledger::validate_job_id(&job_id).map_err(AppError::Input)?;
     let input_version = reviewed_plan.input_version().to_owned();
     let params_value = json!({
         "source": source,
@@ -8405,12 +8400,7 @@ fn execute_v2_stage_import(
         .job_id
         .clone()
         .unwrap_or_else(|| format!("job_{}", ulid::Ulid::new().to_string().to_ascii_lowercase()));
-    if !job_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err(AppError::Input("invalid stage import job ID".to_owned()));
-    }
+    archive_ledger::validate_job_id(&job_id).map_err(AppError::Input)?;
     let plan = archive_ledger::select_stage_import_v2(database, reviewed, &job_id)?;
     let input_version = plan.input_version().to_owned();
     let job_params = json!({

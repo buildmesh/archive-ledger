@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
+use crate::job::{validate_job_id, JobDirectory};
 use crate::projection::{ProjectionDb, ProjectionError};
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 use crate::v2_store::{V2OriginStore, V2StoreError};
@@ -135,6 +136,7 @@ impl AnnexImportConfig {
                 )));
             }
         }
+        validate_job_id(&self.job_id).map_err(AnnexImportError::InvalidConfig)?;
         if !self.repo_path.is_dir() {
             return Err(AnnexImportError::InvalidConfig(format!(
                 "repository is not a directory: {}",
@@ -360,13 +362,17 @@ impl<'a> V2AnnexImporter<'a> {
                 "repository has no annex.uuid".to_owned(),
             ));
         }
-        let job_root = self
+        let archive_root = self
             .projection
             .path()
             .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("local/jobs")
-            .join(&self.config.job_id);
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let job = JobDirectory::new(archive_root, &self.config.job_id)
+            .map_err(|source| io_error("prepare annex import job path", archive_root, source))?;
+        job.ensure()
+            .map_err(|source| io_error("create annex import job directory", job.path(), source))?;
+        let job_root = job.path().to_path_buf();
         let spool_path = job_root.join("annex-items.jsonl");
         let summary_path = job_root.join("annex-summary.json");
         let config_path = job_root.join("annex-config.json");
@@ -384,8 +390,6 @@ impl<'a> V2AnnexImporter<'a> {
             "git_head_commit": initial.head,
             "source_fingerprint": initial.fingerprint(),
         });
-        fs::create_dir_all(&job_root)
-            .map_err(|source| io_error("create annex import job directory", &job_root, source))?;
         let new_job = !config_path.exists();
         if new_job {
             fs::write(
@@ -469,11 +473,14 @@ impl<'a> V2AnnexImporter<'a> {
                     ))
                 })?
                 .unwrap_or_default();
-            if job_root.is_dir() {
-                fs::remove_dir_all(&job_root).map_err(|source| {
-                    io_error("remove completed annex import job files", &job_root, source)
-                })?;
-            }
+            job.cleanup(&[
+                "annex-items.jsonl",
+                "annex-summary.json",
+                "annex-config.json",
+            ])
+            .map_err(|source| {
+                io_error("remove completed annex import job files", &job_root, source)
+            })?;
             return Ok(AnnexImportResult {
                 status: AnnexImportStatus::Complete,
                 annex_uuid,
@@ -693,9 +700,12 @@ impl<'a> V2AnnexImporter<'a> {
         )?;
         self.projection.apply(self.store)?;
         drop(connection);
-        fs::remove_dir_all(&job_root).map_err(|source| {
-            io_error("remove completed annex import job files", &job_root, source)
-        })?;
+        job.cleanup(&[
+            "annex-items.jsonl",
+            "annex-summary.json",
+            "annex-config.json",
+        ])
+        .map_err(|source| io_error("remove completed annex import job files", &job_root, source))?;
         Ok(AnnexImportResult {
             status: AnnexImportStatus::Complete,
             annex_uuid,

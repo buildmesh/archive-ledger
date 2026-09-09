@@ -20,6 +20,7 @@ use crate::discovery::{
     encode_relative_path, modified_time_ms, DiscoveredFile, DiscoveryError, DiscoveryItem,
     EncodedPath, FileDiscovery,
 };
+use crate::job::{validate_job_id, JobDirectory};
 use crate::registry::RegistryPath;
 use crate::scan::ScanMode;
 use crate::v2_projection::{V2ApplyStats, V2ProjectionDb, V2ProjectionError};
@@ -275,12 +276,14 @@ pub fn add_files(
     } else {
         "location_scan"
     };
-    let job_root = projection
+    let archive_root = projection
         .path()
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("local/jobs")
-        .join(&config.job_id);
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let job = JobDirectory::new(archive_root, &config.job_id)
+        .map_err(|source| io_error("prepare inventory job path", archive_root, source))?;
+    let job_root = job.path().to_path_buf();
     let config_path = job_root.join("inventory-config.json");
     let spool_path = job_root.join("inventory-items.jsonl");
     let seen_path = job_root.join("inventory-seen.sqlite3");
@@ -325,11 +328,16 @@ pub fn add_files(
             .transpose()
             .map_err(|error| V2InventoryError::Invalid(format!("job summary is invalid: {error}")))?
             .unwrap_or_default();
-        if job_root.is_dir() {
-            fs::remove_dir_all(&job_root).map_err(|source| {
-                io_error("remove completed inventory job files", &job_root, source)
-            })?;
-        }
+        job.cleanup(&[
+            "inventory-config.json",
+            "inventory-items.jsonl",
+            "inventory-seen.sqlite3",
+            "inventory-seen.sqlite3-wal",
+            "inventory-seen.sqlite3-shm",
+            "inventory-seen.sqlite3-journal",
+            "inventory-summary.json",
+        ])
+        .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
         return Ok(V2InventoryResult {
             version: 2,
             status: "complete".to_owned(),
@@ -340,7 +348,7 @@ pub fn add_files(
             apply: Some(initial_apply),
         });
     }
-    fs::create_dir_all(&job_root)
+    job.ensure()
         .map_err(|source| io_error("create inventory job directory", &job_root, source))?;
     let new_job = !config_path.exists();
     if new_job {
@@ -1115,8 +1123,16 @@ pub fn add_files(
         store.append_jsonl_batch(operation_kind, 2, context, defaults, &spool_path)?
     };
     let apply = projection.apply(store)?;
-    fs::remove_dir_all(&job_root)
-        .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
+    job.cleanup(&[
+        "inventory-config.json",
+        "inventory-items.jsonl",
+        "inventory-seen.sqlite3",
+        "inventory-seen.sqlite3-wal",
+        "inventory-seen.sqlite3-shm",
+        "inventory-seen.sqlite3-journal",
+        "inventory-summary.json",
+    ])
+    .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
     Ok(V2InventoryResult {
         version: 2,
         status: completion_status.to_owned(),
@@ -1138,6 +1154,7 @@ fn validate_config(config: &V2InventoryConfig) -> Result<()> {
             "Collection and Location IDs are required".to_owned(),
         ));
     }
+    validate_job_id(&config.job_id).map_err(V2InventoryError::Invalid)?;
     if config.scan_mode == ScanMode::Complete
         && (config.location_prefix.is_some() || config.logical_prefix.is_some())
     {
