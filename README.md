@@ -738,7 +738,9 @@ event-derived table, then removes only that tool-owned rebuild. A behind
 projection can therefore pass logical comparison through its applied frontier
 while separately telling you to run `archive db apply`. Use `--keep-rebuild` to
 retain the diagnostic database or `--rebuild-dir <directory>` to select a volume
-with enough free space.
+with enough free space. Each external Git step has a 30-minute wall-clock deadline. A timeout stops
+the command's Unix process group, reports `fsck_git_timeout`, and makes the requested integrity
+check incomplete rather than successful.
 
 Exit status 0 means all performed checks passed, 10 means health or currency
 findings were found, and 2 means a requested check could not be completed.
