@@ -66,19 +66,24 @@ pub fn validate_git_remote_locator(locator: &str) -> Result<(), String> {
         return Err("Git remote helpers are not supported; use file, HTTP(S), or SSH".to_owned());
     }
     if let Some((scheme, remainder)) = locator.split_once("://") {
-        if !ALLOWED_URL_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) {
-            return Err(format!("unsupported Git remote URL scheme {scheme:?}"));
+        let scheme = scheme.to_ascii_lowercase();
+        if !ALLOWED_URL_SCHEMES.contains(&scheme.as_str()) {
+            return Err("unsupported Git remote URL scheme".to_owned());
         }
         if remainder.is_empty() {
             return Err("Git remote URL has no location".to_owned());
         }
-        let authority = remainder.split('/').next().unwrap_or(remainder);
-        if authority
-            .split_once('@')
-            .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+        if matches!(scheme.as_str(), "http" | "https")
+            && (remainder.contains('?') || remainder.contains('#'))
         {
             return Err(
-                "Git remote locators must not embed passwords or tokens; use credential configuration"
+                "HTTP(S) Git remote locators must not contain a query or fragment".to_owned(),
+            );
+        }
+        let authority = remainder.split('/').next().unwrap_or(remainder);
+        if matches!(scheme.as_str(), "http" | "https") && authority.contains('@') {
+            return Err(
+                "HTTP(S) Git remote locators must not contain user information; use credential configuration"
                     .to_owned(),
             );
         }
@@ -159,12 +164,35 @@ mod tests {
             "ext::command",
             "helper::address",
             "ftp://example.test/archive.git",
+            "https://credential@example.test/archive.git",
             "https://user:password@example.test/archive.git",
+            "https://user%3Apassword@example.test/archive.git",
+            "https://USER%3apassword@example.test/archive.git",
+            "https://example.test/archive.git?auth=credential",
+            "https://example.test/archive.git?key=credential",
+            "https://example.test/archive.git?sig=credential",
             "https://example.test/archive.git?token=secret",
+            "https://example.test/archive.git#credential",
         ] {
             assert!(
                 validate_git_remote_locator(invalid).is_err(),
                 "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_remote_locator_errors_do_not_repeat_candidate_secrets() {
+        for invalid in [
+            "sensitive-marker-123://example.test/archive.git",
+            "https://sensitive-marker-123@example.test/archive.git",
+            "https://example.test/archive.git?auth=sensitive-marker-123",
+            "https://example.test/archive.git#sensitive-marker-123",
+        ] {
+            let error = validate_git_remote_locator(invalid).unwrap_err();
+            assert!(
+                !error.contains("sensitive-marker-123"),
+                "unsafe error: {error:?}"
             );
         }
     }

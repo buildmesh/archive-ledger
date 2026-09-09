@@ -15,7 +15,7 @@ use crate::discovery::{EncodedPath, PathEncoding};
 use crate::event_store::{
     EventCursor, EventReadStats, EventRecord, EventStore, EventStoreError, PositionedEvent,
 };
-use crate::metadata::{locator_is_secret_free, MetadataDestinationSnapshot};
+use crate::metadata::MetadataDestinationSnapshot;
 use crate::policy::PolicyRequirements;
 use crate::registry::{
     ArchiveRootSnapshot, CollectionSnapshot, DeviceSnapshot, LocationSnapshot, PolicySnapshot,
@@ -4033,6 +4033,9 @@ fn project_metadata_destination(
     record: &EventRecord,
 ) -> std::result::Result<(), BatchError> {
     let value: MetadataDestinationSnapshot = payload(record)?;
+    // Admission and subprocess boundaries apply the current locator policy. Replay deliberately
+    // keeps older immutable records projectable; rejecting one here cannot remove a secret that
+    // is already in canonical history, and would instead make recovery fail.
     validate_snapshot(
         record,
         &value.destination_id,
@@ -4043,7 +4046,6 @@ fn project_metadata_destination(
         || value.location_id.is_empty()
         || value.git_remote_name.is_empty()
         || value.remote_locator.is_empty()
-        || !locator_is_secret_free(&value.remote_locator)
     {
         return Err(invalid_payload(
             record,

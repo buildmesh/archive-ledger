@@ -820,23 +820,6 @@ fn is_local_locator(value: &str) -> bool {
     !value.contains(':')
 }
 
-pub(crate) fn locator_is_secret_free(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    if ["password=", "token=", "secret=", "access_key="]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
-        return false;
-    }
-    let Some((_, remainder)) = value.split_once("://") else {
-        return true;
-    };
-    let authority = remainder.split('/').next().unwrap_or(remainder);
-    authority
-        .split_once('@')
-        .is_none_or(|(userinfo, _)| !userinfo.contains(':'))
-}
-
 fn is_git_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
@@ -1176,6 +1159,46 @@ mod tests {
             .unwrap();
         database.apply(&events).unwrap();
         (events, database)
+    }
+
+    #[test]
+    fn destination_registration_rejects_secret_bearing_http_locators() {
+        let temp = TempDir::new().unwrap();
+        let (events, database) = fixture(&temp);
+        let registry = MetadataRegistry::new(&events, &database);
+
+        for (index, locator) in [
+            "https://sensitive-marker-123@example.test/archive.git",
+            "https://example.test/archive.git?auth=sensitive-marker-123",
+            "https://example.test/archive.git#sensitive-marker-123",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = registry.record_destination(
+                RegistryAction::Register,
+                MetadataDestinationSnapshot {
+                    destination_id: format!("destination_rejected_{index}"),
+                    display_name: "Rejected remote".to_owned(),
+                    location_id: "location_remote".to_owned(),
+                    git_remote_name: "backup".to_owned(),
+                    remote_locator: locator.to_owned(),
+                    remote_ref: "refs/heads/archive-ledger".to_owned(),
+                    status: "active".to_owned(),
+                },
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(
+                !error.contains("sensitive-marker-123"),
+                "unsafe error: {error:?}"
+            );
+        }
+
+        assert!(database
+            .metadata_protection_status()
+            .unwrap()
+            .destinations
+            .is_empty());
     }
 
     #[test]

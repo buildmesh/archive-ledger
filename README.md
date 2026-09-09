@@ -646,8 +646,8 @@ and its private client key stays under `local/`.
 
 Configure a Git remote for the Archive's canonical history, then synchronize. Supported transports
 are local paths and `file://`, `http://`, `https://`, SSH, and scp-style SSH locators. Option-shaped
-locators and arbitrary Git remote helpers are refused. Do not embed passwords or tokens in a
-locator; use normal Git/SSH credential configuration.
+locators and arbitrary Git remote helpers are refused. HTTP(S) locators containing user
+information, a query, or a fragment are also refused; use normal Git/SSH credential configuration.
 
 Archive Ledger retains system, user, and repository Git configuration needed for credential
 helpers, proxies, certificate authorities, SSH, and URL rewrites. For its application-managed Git
