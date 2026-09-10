@@ -15,8 +15,12 @@ services:
       XDG_CONFIG_HOME: /state/config
       XDG_DATA_HOME: /state/data
     read_only: true
+    cap_drop:
+      - ALL
+    # Local commands need no network. Enable bridge explicitly for remote sync.
+    network_mode: "${ARCHIVE_LEDGER_NETWORK_MODE:-none}"
     tmpfs:
-      - /tmp:mode=1777
+      - /tmp:mode=1777,noexec,nosuid,nodev
     security_opt:
       - no-new-privileges:true
     volumes:

@@ -10,7 +10,7 @@ use base64::Engine as _;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 
 use crate::discovery::{
@@ -641,7 +641,13 @@ pub fn add_files(
                         summary.observed_without_verification.saturating_add(1);
                     continue;
                 }
-                let hashed = match hash_file_stable(&absolute, &file) {
+                let hashed = match hash_file_stable(
+                    &absolute,
+                    &file,
+                    annex
+                        .as_ref()
+                        .is_some_and(|known| known.expected_hash_algo.as_deref() == Some("sha512")),
+                ) {
                     HashOutcome::Stable(hashed) => hashed,
                     HashOutcome::ReadError => {
                         record_seen
@@ -675,13 +681,11 @@ pub fn add_files(
                     .and_then(|known| known.copy_path.clone())
                     .unwrap_or(ordinary_copy_path);
                 if annex.as_ref().is_some_and(|known| {
-                    known
-                        .expected_sha256
-                        .as_deref()
-                        .is_some_and(|expected| expected != hashed.sha256_hex)
-                        || known
-                            .expected_size
-                            .is_some_and(|expected| expected != hashed.size_bytes)
+                    known.expected_hash_hex.as_deref().is_some_and(|expected| {
+                        Some(expected) != hashed.hash_hex(known.expected_hash_algo.as_deref())
+                    }) || known
+                        .expected_size
+                        .is_some_and(|expected| expected != hashed.size_bytes)
                 }) {
                     if let Some(item) = annex.as_ref().and_then(|known| {
                         annex_verification_failure_item(
@@ -763,6 +767,7 @@ pub fn add_files(
                     "object_id": object_id,
                     "blake3_hex": hashed.blake3_hex,
                     "sha256_hex": annex.as_ref().map(|_| &hashed.sha256_hex),
+                    "sha512_hex": annex.as_ref().map(|_| &hashed.sha512_hex),
                     "size_bytes": hashed.size_bytes,
                     "modified_time_utc_ms": file.modified_time_utc_ms,
                     "duration_ms": hashed.duration_ms,
@@ -1241,7 +1246,8 @@ struct KnownAnnexEntry {
     representation: String,
     file_ref_id: String,
     external_identity_id: String,
-    expected_sha256: Option<String>,
+    expected_hash_hex: Option<String>,
+    expected_hash_algo: Option<String>,
     expected_size: Option<u64>,
     object_id: Option<String>,
     copy_claim_id: Option<String>,
@@ -1260,7 +1266,7 @@ fn known_annex_entry(
             "SELECT p.representation, f.file_ref_id, e.external_identity_id,
                     e.expected_hash_hex, e.expected_size_bytes, e.object_id,
                     c.copy_claim_id, c.relative_path_encoding, c.relative_path_bytes,
-                    c.relative_path_display
+                    c.relative_path_display, e.expected_hash_algo
              FROM file_refs f
              JOIN path_observations p ON p.file_ref_id = f.file_ref_id
              JOIN external_identities e ON e.external_identity_id = f.external_identity_id
@@ -1288,6 +1294,7 @@ fn known_annex_entry(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<Vec<u8>>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )
@@ -1300,13 +1307,14 @@ fn known_annex_entry(
         representation,
         file_ref_id,
         external_identity_id,
-        expected_sha256,
+        expected_hash_hex,
         expected_size,
         object_id,
         copy_claim_id,
         copy_encoding,
         copy_bytes,
         copy_display,
+        expected_hash_algo,
     )) = row
     else {
         return Ok(None);
@@ -1332,7 +1340,8 @@ fn known_annex_entry(
         representation,
         file_ref_id,
         external_identity_id,
-        expected_sha256,
+        expected_hash_hex,
+        expected_hash_algo,
         object_id,
         expected_size: expected_size
             .map(|value| {
@@ -1374,9 +1383,9 @@ fn annex_verification_failure_item(
         "logical_path": RegistryPath::from_path(logical_path),
         "copy_path": RegistryPath::from_path(copy_path),
         "result": "hash_mismatch",
-        "expected_hash_algo": "sha256",
-        "expected_hash_hex": known.expected_sha256,
-        "observed_hash_hex": hashed.sha256_hex,
+        "expected_hash_algo": known.expected_hash_algo,
+        "expected_hash_hex": known.expected_hash_hex,
+        "observed_hash_hex": hashed.hash_hex(known.expected_hash_algo.as_deref()),
         "size_bytes": hashed.size_bytes,
         "duration_ms": hashed.duration_ms,
         "verified_time_utc_ms": observed_time_utc_ms,
@@ -1450,17 +1459,19 @@ fn observe_annex_symlink(
         size_bytes: metadata.len(),
         modified_time_utc_ms: modified_time_ms(&metadata),
     };
-    let hashed = match hash_file_stable(&content, &discovered) {
+    let hashed = match hash_file_stable(
+        &content,
+        &discovered,
+        known.expected_hash_algo.as_deref() == Some("sha512"),
+    ) {
         HashOutcome::Stable(hashed) => hashed,
         HashOutcome::ReadError | HashOutcome::Changed => return Ok(AnnexSymlinkObservation::Error),
     };
-    if known
-        .expected_sha256
-        .as_deref()
-        .is_some_and(|expected| expected != hashed.sha256_hex)
-        || known
-            .expected_size
-            .is_some_and(|expected| expected != hashed.size_bytes)
+    if known.expected_hash_hex.as_deref().is_some_and(|expected| {
+        Some(expected) != hashed.hash_hex(known.expected_hash_algo.as_deref())
+    }) || known
+        .expected_size
+        .is_some_and(|expected| expected != hashed.size_bytes)
     {
         return Ok(AnnexSymlinkObservation::Mismatch {
             item: annex_verification_failure_item(
@@ -1497,6 +1508,7 @@ fn observe_annex_symlink(
         "object_id": object_id,
         "blake3_hex": hashed.blake3_hex,
         "sha256_hex": hashed.sha256_hex,
+        "sha512_hex": hashed.sha512_hex,
         "size_bytes": hashed.size_bytes,
         "modified_time_utc_ms": discovered.modified_time_utc_ms,
         "duration_ms": hashed.duration_ms,
@@ -1515,8 +1527,19 @@ fn observe_annex_symlink(
 struct HashedContent {
     blake3_hex: String,
     sha256_hex: String,
+    sha512_hex: Option<String>,
     size_bytes: u64,
     duration_ms: u64,
+}
+
+impl HashedContent {
+    fn hash_hex(&self, algorithm: Option<&str>) -> Option<&str> {
+        match algorithm {
+            Some("sha256") => Some(&self.sha256_hex),
+            Some("sha512") => self.sha512_hex.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 enum HashOutcome {
@@ -1525,7 +1548,7 @@ enum HashOutcome {
     Changed,
 }
 
-fn hash_file_stable(path: &Path, discovered: &DiscoveredFile) -> HashOutcome {
+fn hash_file_stable(path: &Path, discovered: &DiscoveredFile, hash_sha512: bool) -> HashOutcome {
     let started = Instant::now();
     let before = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -1542,6 +1565,7 @@ fn hash_file_stable(path: &Path, discovered: &DiscoveredFile) -> HashOutcome {
     };
     let mut hasher = blake3::Hasher::new();
     let mut sha256 = Sha256::new();
+    let mut sha512 = hash_sha512.then(Sha512::new);
     let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
     let mut bytes_read = 0_u64;
     loop {
@@ -1550,6 +1574,9 @@ fn hash_file_stable(path: &Path, discovered: &DiscoveredFile) -> HashOutcome {
             Ok(read) => {
                 hasher.update(&buffer[..read]);
                 sha256.update(&buffer[..read]);
+                if let Some(sha512) = &mut sha512 {
+                    sha512.update(&buffer[..read]);
+                }
                 bytes_read = bytes_read.saturating_add(read as u64);
             }
             Err(_) => return HashOutcome::ReadError,
@@ -1568,6 +1595,7 @@ fn hash_file_stable(path: &Path, discovered: &DiscoveredFile) -> HashOutcome {
     HashOutcome::Stable(HashedContent {
         blake3_hex: hasher.finalize().to_hex().to_string(),
         sha256_hex: format!("{:x}", sha256.finalize()),
+        sha512_hex: sha512.map(|hasher| format!("{:x}", hasher.finalize())),
         size_bytes: bytes_read,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })

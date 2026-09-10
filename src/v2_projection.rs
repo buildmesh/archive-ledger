@@ -1853,13 +1853,18 @@ fn project_annex_entry(
                 params![object_id, hash, sql_i64(size, "annex object size")?, record_id, observed_time],
             )
             .map_err(|source| sqlite_error(database_path, source))?;
-        if let Some(sha256) = item.get("sha256_hex").and_then(Value::as_str) {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, 'sha256', ?2, 'annex_import', ?3)",
-                    params![object_id, sha256, record_id],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
+        for algorithm in ["sha256", "sha512"] {
+            if let Some(hash) = item
+                .get(&format!("{algorithm}_hex"))
+                .and_then(Value::as_str)
+            {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, ?2, ?3, 'annex_import', ?4)",
+                        params![object_id, algorithm, hash, record_id],
+                    )
+                    .map_err(|source| sqlite_error(database_path, source))?;
+            }
         }
         transaction
             .execute(
@@ -1962,7 +1967,7 @@ fn project_annex_entry(
                 .execute(
                     "INSERT INTO verification_results(verification_id, record_id, item_index, job_id, copy_claim_id, object_id, location_id, result, expected_hash_algo, expected_hash_hex, observed_hash_hex, size_bytes, bytes_read, duration_ms, verified_time_utc_ms, path_observed_bytes, path_observed_encoding, path_observed_display, device_fingerprint_status, error_code, error_detail)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'not_checked', ?19, ?20)",
-                    params![verification_id, record_id, sql_i64(item_index, "annex item index")?, string(item, "job_id")?, copy_claim_id, object_id, location_id, result, item.get("expected_hash_algo").and_then(Value::as_str), item.get("expected_hash_hex").and_then(Value::as_str), item.get("sha256_hex").and_then(Value::as_str), expected_size, item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex bytes read")).transpose()?, item.get("duration_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex duration")).transpose()?, observed_time, copy_bytes, copy.encoding, copy.display, (result != "ok").then_some("annex_content_error"), item.get("error_detail").and_then(Value::as_str)],
+                    params![verification_id, record_id, sql_i64(item_index, "annex item index")?, string(item, "job_id")?, copy_claim_id, object_id, location_id, result, item.get("expected_hash_algo").and_then(Value::as_str), item.get("expected_hash_hex").and_then(Value::as_str), item.get("expected_hash_algo").and_then(Value::as_str).and_then(|algo| item.get(&format!("{algo}_hex"))).and_then(Value::as_str), expected_size, item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex bytes read")).transpose()?, item.get("duration_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex duration")).transpose()?, observed_time, copy_bytes, copy.encoding, copy.display, (result != "ok").then_some("annex_content_error"), item.get("error_detail").and_then(Value::as_str)],
                 )
                 .map_err(|source| sqlite_error(database_path, source))?;
             transaction
@@ -2217,13 +2222,23 @@ fn project_content_observed(
             "conflicting content identity for {object_id}"
         )));
     }
-    if let Some(sha256) = item.get("sha256_hex").and_then(Value::as_str) {
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, 'sha256', ?2, ?3, ?4)",
-                params![object_id, sha256, string(item, "representation")?, record_id],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
+    for algorithm in ["sha256", "sha512"] {
+        if let Some(hash) = item
+            .get(&format!("{algorithm}_hex"))
+            .and_then(Value::as_str)
+        {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![object_id, algorithm, hash, string(item, "representation")?, record_id],
+                )
+                .map_err(|source| sqlite_error(database_path, source))?;
+        }
+    }
+    if ["sha256_hex", "sha512_hex"]
+        .iter()
+        .any(|field| item.get(*field).and_then(Value::as_str).is_some())
+    {
         if let Some(external_identity_id) = external_identity_id {
             transaction
                 .execute(

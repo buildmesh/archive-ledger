@@ -6,6 +6,9 @@ verification, synchronization, and recovery.
 
 Available workflows:
 
+- [Seven git-annex workflows in Docker](guides/annex-workflows.md): import legacy repositories
+  without git-annex, verify and add files, register an existing clone, copy to an ordinary
+  Location, and review copy requirements.
 - [Check files on another laptop without copying them first](#check-files-on-another-laptop-without-copying-them-first)
 
 ## Check files on another laptop without copying them first
