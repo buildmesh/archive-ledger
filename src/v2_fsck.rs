@@ -3,8 +3,8 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags};
@@ -12,10 +12,14 @@ use serde::Serialize;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::git::managed_git_command;
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 use crate::v2_store::{V2OriginStore, V2StoreError};
 
 const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 const DERIVED_TABLES: &[(&str, Option<&str>)] = &[
     ("archive_meta", Some("key NOT IN ('projection_generation','policy_input_generation','last_verified_checkpoint_id','last_verified_checkpoint_frontier_hash')")),
@@ -75,6 +79,14 @@ pub enum V2FsckError {
     },
     #[error("fsck configuration is invalid: {0}")]
     Invalid(String),
+    #[error(
+        "fsck Git command timed out after {timeout_ms} ms while attempting to {operation}; integrity check is incomplete; process cleanup {cleanup}"
+    )]
+    GitTimeout {
+        operation: &'static str,
+        timeout_ms: u64,
+        cleanup: String,
+    },
 }
 
 impl V2FsckError {
@@ -85,6 +97,7 @@ impl V2FsckError {
             Self::Io { .. } => "fsck_io",
             Self::Sqlite { .. } => "fsck_sqlite",
             Self::Invalid(_) => "fsck_invalid",
+            Self::GitTimeout { .. } => "fsck_git_timeout",
         }
     }
 }
@@ -167,11 +180,12 @@ pub fn fsck_v2_archive(
     };
 
     let started = Instant::now();
-    let git = bounded_command(
-        Command::new("git")
+    let git = fsck_git_command(
+        managed_git_command()
             .arg("-C")
             .arg(store.root())
             .args(["fsck", "--full", "--strict"]),
+        "verify Git objects and references",
     )?;
     let git_success = git.success;
     push_check(
@@ -462,11 +476,12 @@ fn run_full_check(
     let started = Instant::now();
     let mut temp = FsckTemp::new(&base)?;
     let clone = temp.path.join("canonical");
-    let clone_result = bounded_command(
-        Command::new("git")
-            .args(["clone", "--quiet", "--no-hardlinks"])
+    let clone_result = fsck_git_command(
+        managed_git_command()
+            .args(["clone", "--quiet", "--no-hardlinks", "--"])
             .arg(store.root())
             .arg(&clone),
+        "clone disposable canonical history",
     )?;
     if !clone_result.success {
         push_error(
@@ -479,12 +494,15 @@ fn run_full_check(
         );
         return Ok(());
     }
-    let checkout = bounded_command(Command::new("git").arg("-C").arg(&clone).args([
-        "checkout",
-        "--quiet",
-        "--detach",
-        &captured_commit,
-    ]))?;
+    let checkout = fsck_git_command(
+        managed_git_command().arg("-C").arg(&clone).args([
+            "checkout",
+            "--quiet",
+            "--detach",
+            &captured_commit,
+        ]),
+        "check out the captured canonical commit",
+    )?;
     if !checkout.success {
         push_error(
             report,
@@ -812,6 +830,7 @@ fn digest_value(hasher: &mut blake3::Hasher, value: ValueRef<'_>) {
     };
 }
 
+#[derive(Debug)]
 struct CommandResult {
     success: bool,
     stdout: String,
@@ -829,8 +848,17 @@ impl CommandResult {
     }
 }
 
-fn bounded_command(command: &mut Command) -> Result<CommandResult> {
+fn fsck_git_command(command: &mut Command, operation: &'static str) -> Result<CommandResult> {
+    command_with_timeout(command, operation, GIT_COMMAND_TIMEOUT)
+}
+
+fn command_with_timeout(
+    command: &mut Command,
+    operation: &'static str,
+    timeout: Duration,
+) -> Result<CommandResult> {
     let display = format!("{command:?}");
+    configure_process_group(command);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -843,15 +871,90 @@ fn bounded_command(command: &mut Command) -> Result<CommandResult> {
     let stderr = child.stderr.take().expect("stderr was piped");
     let out = std::thread::spawn(move || drain_bounded(stdout));
     let err = std::thread::spawn(move || drain_bounded(stderr));
-    let status = child.wait().map_err(|source| V2FsckError::Io {
-        path: PathBuf::from(display),
-        source,
+    let started = Instant::now();
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => status = observed,
+                Err(source) => {
+                    let _ = terminate_process_tree(&mut child);
+                    return Err(V2FsckError::Io {
+                        path: PathBuf::from(display),
+                        source,
+                    });
+                }
+            }
+        }
+        if let Some(status) = status.filter(|_| out.is_finished() && err.is_finished()) {
+            return Ok(CommandResult {
+                success: status.success(),
+                stdout: out.join().unwrap_or_default(),
+                stderr: err.join().unwrap_or_default(),
+            });
+        }
+        if started.elapsed() >= timeout {
+            let cleanup = terminate_process_tree(&mut child)
+                .map(|()| "completed".to_owned())
+                .unwrap_or_else(|error| format!("failed: {error}"));
+            return Err(V2FsckError::GitTimeout {
+                operation,
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                cleanup,
+            });
+        }
+        std::thread::sleep(COMMAND_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())));
+    }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    let process_group = i32::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "child process ID does not fit a Unix process-group ID",
+        )
     })?;
-    Ok(CommandResult {
-        success: status.success(),
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
-    })
+    signal_process_group(process_group, libc::SIGTERM)?;
+    let grace_started = Instant::now();
+    while grace_started.elapsed() < PROCESS_TERMINATION_GRACE {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        std::thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+    signal_process_group(process_group, libc::SIGKILL)?;
+    child.wait().map(|_| ())
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group: i32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `process_group` came from the child PID created in its own process group. A negative
+    // PID addresses that group, never the Archive Ledger process group.
+    if unsafe { libc::kill(-process_group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_tree(child: &mut Child) -> std::io::Result<()> {
+    child.kill()?;
+    child.wait().map(|_| ())
 }
 
 fn drain_bounded(mut reader: impl Read) -> String {
@@ -945,14 +1048,17 @@ fn commit_containing_frontier(
     frontier_hash: &str,
 ) -> Result<Option<String>> {
     let pickaxe = format!("-S{frontier_hash}");
-    let candidates = bounded_command(Command::new("git").arg("-C").arg(store.root()).args([
-        "log",
-        "--all",
-        "--format=%H",
-        &pickaxe,
-        "--",
-        "frontiers/v2/HEAD",
-    ]))?;
+    let candidates = fsck_git_command(
+        managed_git_command().arg("-C").arg(store.root()).args([
+            "log",
+            "--all",
+            "--format=%H",
+            &pickaxe,
+            "--",
+            "frontiers/v2/HEAD",
+        ]),
+        "search canonical history for a projection frontier",
+    )?;
     if !candidates.success {
         return Err(V2FsckError::Invalid(format!(
             "could not search canonical Git history for frontier {frontier_hash}: {}",
@@ -965,11 +1071,12 @@ fn commit_containing_frontier(
             continue;
         }
         let object = format!("{commit}:frontiers/v2/HEAD");
-        let head = bounded_command(
-            Command::new("git")
+        let head = fsck_git_command(
+            managed_git_command()
                 .arg("-C")
                 .arg(store.root())
                 .args(["show", &object]),
+            "read a candidate projection frontier",
         )?;
         if head.success && head.stdout.trim() == frontier_hash {
             return Ok(Some(commit.to_owned()));
@@ -989,5 +1096,54 @@ fn io_error(path: &Path, source: std::io::Error) -> V2FsckError {
     V2FsckError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn timed_out_command_kills_its_helper_process() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("slow-command");
+        let helper_pid = temp.path().join("helper.pid");
+        fs::write(
+            &script,
+            "#!/bin/sh\nsleep 30 &\nhelper=$!\nprintf '%s\\n' \"$helper\" > \"$1\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = Instant::now();
+        let error = command_with_timeout(
+            Command::new(&script).arg(&helper_pid),
+            "run the timeout regression fixture",
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "fsck_git_timeout");
+        assert!(error.to_string().contains("integrity check is incomplete"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let helper: i32 = fs::read_to_string(&helper_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(helper) && Instant::now() < reap_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!process_exists(helper), "helper process {helper} survived");
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal zero only queries the PID and has no process side effect.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }

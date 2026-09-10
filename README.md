@@ -173,6 +173,11 @@ explicit weaker fallback whose safety depends on keeping both the container moun
 `ARCHIVE_LEDGER_HOST_ID` stable. Mounting a host root at the same absolute container path is also
 possible by setting `ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR` to the host parent path.
 
+The writable state directory is trusted Archive Ledger state. Do not mount it into PhotoDB or other
+application containers; those applications should use the Archive Ledger CLI or a service boundary.
+Any Git, SSH, or credential configuration deliberately mounted into the Archive Ledger container is
+also operator-trusted and may select executable credential helpers or filters.
+
 The parent-directory approach recursively includes devices already mounted beneath it when the
 container starts. On older Linux kernels, Docker may be unable to make nested submounts read-only
 even though the parent bind is read-only. Use explicit per-root entries like those in
@@ -644,9 +649,23 @@ durable rebuild source, so protecting only `archive.db` is insufficient. `archiv
 prints the Archive root; its SQLite view is `archive.db`, its Git-backed event tree is `canonical/`,
 and its private client key stays under `local/`.
 
-Configure a Git remote for the Archive's canonical history, then synchronize. The remote may be a
-local bare repository, an SSH Git URL, or another locator supported by Git. Do not embed passwords
-or tokens in it; use normal Git/SSH credential configuration.
+Configure a Git remote for the Archive's canonical history, then synchronize. Supported transports
+are local paths and `file://`, `http://`, `https://`, SSH, and scp-style SSH locators. Option-shaped
+locators and arbitrary Git remote helpers are refused. HTTP(S) locators containing user
+information, a query, or a fragment are also refused; use normal Git/SSH credential configuration.
+
+Archive Ledger treats its writable state directory—including repository-local Git
+configuration—and deliberately supplied system, user, SSH, and credential configuration as trusted
+operator input. Credential helpers and filters configured there may execute programs. Managed Git
+commands remove inherited Git/SSH command selectors, force the standard `ssh` executable, override
+hooks and filesystem monitors, disable automatic signing and paging, and permit only the transports
+above. Use SSH configuration rather than `core.sshCommand` for ports, identities, and proxying. A
+URL rewrite cannot enable a disallowed helper or protocol.
+
+This boundary is deliberate: distrusting writable Git configuration while preserving arbitrary
+credential helpers, filters, and URL rewrites would require a separate Git-configuration
+virtualization subsystem. Archive Ledger instead keeps `/state` private to its own container and
+treats canonical content and supplied remote locators—not operator configuration—as untrusted.
 
 ```bash
 archive sync remote add central ssh://backup.example/personal-archive.git
@@ -731,7 +750,9 @@ event-derived table, then removes only that tool-owned rebuild. A behind
 projection can therefore pass logical comparison through its applied frontier
 while separately telling you to run `archive db apply`. Use `--keep-rebuild` to
 retain the diagnostic database or `--rebuild-dir <directory>` to select a volume
-with enough free space.
+with enough free space. Each external Git step has a 30-minute wall-clock deadline. A timeout stops
+the command's Unix process group, reports `fsck_git_timeout`, and makes the requested integrity
+check incomplete rather than successful.
 
 Exit status 0 means all performed checks passed, 10 means health or currency
 findings were found, and 2 means a requested check could not be completed.

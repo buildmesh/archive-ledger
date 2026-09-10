@@ -13,6 +13,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::event_store::{Checkpoint, EventRequest, EventStore, EventStoreConfig, EventStoreError};
+use crate::git::{
+    managed_git_command, validate_git_ref, validate_git_remote_locator, validate_git_remote_name,
+};
 use crate::projection::{ProjectionConfig, ProjectionDb, ProjectionError};
 use crate::registry::RegistryAction;
 
@@ -332,24 +335,43 @@ impl<'a> MetadataProtector<'a> {
         destination: &MetadataDestinationSnapshot,
         push: bool,
     ) -> Result<()> {
-        let assessment = match git_required(
-            self.events.root(),
-            "read metadata remote configuration",
-            &["remote", "get-url", &destination.git_remote_name],
-        ) {
-            Ok(configured) if configured == destination.remote_locator => {
-                self.projection.assess_metadata_independence(destination)?
+        let boundary_error = validate_destination_git_fields(destination).err();
+        let mut remote_matches = false;
+        let assessment = if boundary_error.is_some() {
+            IndependenceAssessment {
+                status: "unknown".to_owned(),
+                reasons: json!(["git_remote_configuration_invalid"]),
             }
-            Ok(_) => IndependenceAssessment {
-                status: "unknown".to_owned(),
-                reasons: json!(["git_remote_locator_mismatch"]),
-            },
-            Err(_) => IndependenceAssessment {
-                status: "unknown".to_owned(),
-                reasons: json!(["git_remote_unconfigured"]),
-            },
+        } else {
+            match git_required(
+                self.events.root(),
+                "read metadata remote configuration",
+                &["remote", "get-url", &destination.git_remote_name],
+            ) {
+                Ok(configured) if configured == destination.remote_locator => {
+                    remote_matches = true;
+                    self.projection.assess_metadata_independence(destination)?
+                }
+                Ok(_) => IndependenceAssessment {
+                    status: "unknown".to_owned(),
+                    reasons: json!(["git_remote_locator_mismatch"]),
+                },
+                Err(_) => IndependenceAssessment {
+                    status: "unknown".to_owned(),
+                    reasons: json!(["git_remote_unconfigured"]),
+                },
+            }
         };
-        let observation = observe_remote(self.events.root(), destination, checkpoint, commit, push);
+        let observation = if let Some(error) = boundary_error {
+            Err(error)
+        } else if !remote_matches {
+            Err(MetadataError::Invalid(
+                "configured Git remote does not match the registered metadata destination"
+                    .to_owned(),
+            ))
+        } else {
+            observe_remote(self.events.root(), destination, checkpoint, commit, push)
+        };
         let (status, observed_commit, observed_seq, observed_hash, error_code) = match observation {
             Ok(Some(observed)) if observed == commit => (
                 "present",
@@ -709,16 +731,7 @@ fn validate_destination(
             return Err(MetadataError::Invalid(format!("{field} is required")));
         }
     }
-    if !value.remote_ref.starts_with("refs/") {
-        return Err(MetadataError::Invalid(
-            "remote_ref must begin with refs/".to_owned(),
-        ));
-    }
-    if !locator_is_secret_free(&value.remote_locator) {
-        return Err(MetadataError::Invalid(
-            "remote_locator must not contain embedded credentials or secret parameters".to_owned(),
-        ));
-    }
+    validate_destination_git_fields(value)?;
     let expected_status = if action == RegistryAction::Retire {
         "retired"
     } else {
@@ -745,6 +758,12 @@ fn validate_destination(
         return Err(MetadataError::NotFound(value.destination_id.clone()));
     }
     Ok(())
+}
+
+fn validate_destination_git_fields(value: &MetadataDestinationSnapshot) -> Result<()> {
+    validate_git_remote_name(&value.git_remote_name).map_err(MetadataError::Invalid)?;
+    validate_git_remote_locator(&value.remote_locator).map_err(MetadataError::Invalid)?;
+    validate_git_ref(&value.remote_ref).map_err(MetadataError::Invalid)
 }
 
 fn require_active_location(path: &Path, location_id: &str) -> Result<()> {
@@ -799,23 +818,6 @@ fn is_local_locator(value: &str) -> bool {
         return true;
     }
     !value.contains(':')
-}
-
-pub(crate) fn locator_is_secret_free(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    if ["password=", "token=", "secret=", "access_key="]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
-        return false;
-    }
-    let Some((_, remainder)) = value.split_once("://") else {
-        return true;
-    };
-    let authority = remainder.split('/').next().unwrap_or(remainder);
-    authority
-        .split_once('@')
-        .is_none_or(|(userinfo, _)| !userinfo.contains(':'))
 }
 
 fn is_git_object_id(value: &str) -> bool {
@@ -928,7 +930,7 @@ fn verify_checkpoint_commit(
         let worktree_object = git_required(
             repository,
             "hash checkpoint file",
-            &["hash-object", &relative],
+            &["hash-object", "--", &relative],
         )?;
         let committed = git_required(
             repository,
@@ -966,7 +968,7 @@ fn observe_remote(
         git_required(
             repository,
             "push metadata checkpoint",
-            &["push", &destination.git_remote_name, &refspec],
+            &["push", "--", &destination.git_remote_name, &refspec],
         )?;
     }
     let output = git_required(
@@ -974,6 +976,7 @@ fn observe_remote(
         "observe metadata checkpoint remote",
         &[
             "ls-remote",
+            "--",
             &destination.git_remote_name,
             &destination.remote_ref,
         ],
@@ -1007,8 +1010,8 @@ fn ensure_git_repository(repository: &Path) -> Result<()> {
 }
 
 fn git_command(repository: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(repository).env("LC_ALL", "C");
+    let mut command = managed_git_command();
+    command.arg("-C").arg(repository);
     command
 }
 
@@ -1156,6 +1159,46 @@ mod tests {
             .unwrap();
         database.apply(&events).unwrap();
         (events, database)
+    }
+
+    #[test]
+    fn destination_registration_rejects_secret_bearing_http_locators() {
+        let temp = TempDir::new().unwrap();
+        let (events, database) = fixture(&temp);
+        let registry = MetadataRegistry::new(&events, &database);
+
+        for (index, locator) in [
+            "https://sensitive-marker-123@example.test/archive.git",
+            "https://example.test/archive.git?auth=sensitive-marker-123",
+            "https://example.test/archive.git#sensitive-marker-123",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = registry.record_destination(
+                RegistryAction::Register,
+                MetadataDestinationSnapshot {
+                    destination_id: format!("destination_rejected_{index}"),
+                    display_name: "Rejected remote".to_owned(),
+                    location_id: "location_remote".to_owned(),
+                    git_remote_name: "backup".to_owned(),
+                    remote_locator: locator.to_owned(),
+                    remote_ref: "refs/heads/archive-ledger".to_owned(),
+                    status: "active".to_owned(),
+                },
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(
+                !error.contains("sensitive-marker-123"),
+                "unsafe error: {error:?}"
+            );
+        }
+
+        assert!(database
+            .metadata_protection_status()
+            .unwrap()
+            .destinations
+            .is_empty());
     }
 
     #[test]

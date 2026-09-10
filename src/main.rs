@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitCode};
+use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use archive_ledger::{
@@ -2290,6 +2290,7 @@ fn execute_v2_clone(
     if remote.trim().is_empty() {
         return Err(AppError::Input("clone remote cannot be empty".to_owned()));
     }
+    archive_ledger::validate_git_remote_locator(remote).map_err(AppError::Input)?;
     let archive_parent = central_archive("clone-target", "clone-target")?
         .root
         .parent()
@@ -2303,24 +2304,23 @@ fn execute_v2_clone(
     std::fs::create_dir(&prepared)?;
     let result = (|| {
         let canonical = prepared.join("canonical");
-        let output = ProcessCommand::new("git")
+        let output = archive_ledger::managed_git_command()
             .args([
                 "clone",
                 "--quiet",
                 "--branch",
                 "archive-ledger",
                 "--single-branch",
+                "--",
             ])
             .arg(remote)
             .arg(&canonical)
             .output()?;
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(AppError::Input(if detail.is_empty() {
-                format!("Git could not clone {remote}")
-            } else {
-                format!("Git could not clone {remote}: {detail}")
-            }));
+            return Err(AppError::Input(
+                "Git could not clone the requested remote; credentials and remote details were not logged"
+                    .to_owned(),
+            ));
         }
         let store = V2OriginStore::open(&canonical)?;
         let verified = store.verification_report()?;
@@ -5433,12 +5433,7 @@ fn execute_stage_import(
         .job_id
         .clone()
         .unwrap_or_else(|| format!("job_{suffix}"));
-    if !job_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err(AppError::Input("invalid stage import job ID".to_owned()));
-    }
+    archive_ledger::validate_job_id(&job_id).map_err(AppError::Input)?;
     let input_version = reviewed_plan.input_version().to_owned();
     let params_value = json!({
         "source": source,
@@ -8405,12 +8400,7 @@ fn execute_v2_stage_import(
         .job_id
         .clone()
         .unwrap_or_else(|| format!("job_{}", ulid::Ulid::new().to_string().to_ascii_lowercase()));
-    if !job_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        return Err(AppError::Input("invalid stage import job ID".to_owned()));
-    }
+    archive_ledger::validate_job_id(&job_id).map_err(AppError::Input)?;
     let plan = archive_ledger::select_stage_import_v2(database, reviewed, &job_id)?;
     let input_version = plan.input_version().to_owned();
     let job_params = json!({
