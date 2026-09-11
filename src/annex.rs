@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
@@ -993,7 +993,7 @@ impl<'a> AnnexImporter<'a> {
             });
         }
 
-        match hash_file(&worktree_path, &content_metadata) {
+        match hash_file(&worktree_path, &content_metadata, false) {
             Ok(content) => {
                 let size_matches = key.expected_size.is_none_or(|size| size == content.size);
                 let hash_matches = key.expected_sha256.as_deref() == Some(&content.sha256_hex);
@@ -1498,8 +1498,8 @@ fn v2_annex_entry_item(
         "external_identity_id": external_identity_id,
         "external_key": key.raw,
         "backend": key.backend,
-        "expected_hash_algo": key.expected_sha256.as_ref().map(|_| "sha256"),
-        "expected_hash_hex": key.expected_sha256,
+        "expected_hash_algo": key.expected_hash().map(|(algo, _)| algo),
+        "expected_hash_hex": key.expected_hash().map(|(_, hex)| hex),
         "expected_size_bytes": key.expected_size,
         "resolution_state": if resolved { "resolved" } else if key.state == KeyState::Unsupported { "unsupported" } else { "unresolved" },
         "file_ref_id": file_ref_id,
@@ -1510,6 +1510,7 @@ fn v2_annex_entry_item(
         "object_id": object_id,
         "blake3_hex": outcome.content.as_ref().filter(|_| resolved).map(|content| &content.blake3_hex),
         "sha256_hex": outcome.content.as_ref().map(|content| &content.sha256_hex),
+        "sha512_hex": outcome.content.as_ref().map(|content| &content.sha512_hex),
         "observed_size_bytes": outcome.content.as_ref().map(|content| content.size).or(key.expected_size),
         "modified_time_utc_ms": outcome.content.as_ref().and_then(|content| content.modified_time_utc_ms),
         "duration_ms": outcome.content.as_ref().map(|content| content.duration_ms),
@@ -1631,7 +1632,7 @@ fn inspect_entry_v2(
     let Some(content_metadata) = content_metadata else {
         return Ok(EntryOutcome::absent(representation, path_present));
     };
-    if key.expected_sha256.is_none() {
+    if key.expected_hash().is_none() {
         return Ok(EntryOutcome {
             category: EntryCategory::SupportedUnresolved,
             representation,
@@ -1642,10 +1643,14 @@ fn inspect_entry_v2(
             copy_path,
         });
     }
-    match hash_file(&worktree_path, &content_metadata) {
+    match hash_file(
+        &worktree_path,
+        &content_metadata,
+        key.expected_sha512.is_some(),
+    ) {
         Ok(content) => {
             let matches = key.expected_size.is_none_or(|size| size == content.size)
-                && key.expected_sha256.as_deref() == Some(&content.sha256_hex);
+                && key.matches_content(&content);
             Ok(EntryOutcome {
                 category: if matches {
                     EntryCategory::Present
@@ -1785,17 +1790,19 @@ impl EntryOutcome {
 struct ContentHashes {
     blake3_hex: String,
     sha256_hex: String,
+    sha512_hex: Option<String>,
     size: u64,
     duration_ms: u64,
     modified_time_utc_ms: Option<u64>,
 }
 
-fn hash_file(path: &Path, initial_metadata: &Metadata) -> Result<ContentHashes> {
+fn hash_file(path: &Path, initial_metadata: &Metadata, hash_sha512: bool) -> Result<ContentHashes> {
     let start = std::time::Instant::now();
     let mut file =
         File::open(path).map_err(|source| io_error("open annex content", path, source))?;
     let mut blake3 = blake3::Hasher::new();
     let mut sha256 = Sha256::new();
+    let mut sha512 = hash_sha512.then(Sha512::new);
     let mut size = 0u64;
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
@@ -1810,6 +1817,9 @@ fn hash_file(path: &Path, initial_metadata: &Metadata) -> Result<ContentHashes> 
         })?;
         blake3.update(&buffer[..read]);
         sha256.update(&buffer[..read]);
+        if let Some(sha512) = &mut sha512 {
+            sha512.update(&buffer[..read]);
+        }
     }
     let final_metadata = file
         .metadata()
@@ -1823,6 +1833,7 @@ fn hash_file(path: &Path, initial_metadata: &Metadata) -> Result<ContentHashes> 
     Ok(ContentHashes {
         blake3_hex: blake3.finalize().to_hex().to_string(),
         sha256_hex: format!("{:x}", sha256.finalize()),
+        sha512_hex: sha512.map(|hasher| format!("{:x}", hasher.finalize())),
         size,
         duration_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         modified_time_utc_ms: modified_time_ms(&final_metadata),
@@ -1840,10 +1851,26 @@ struct AnnexKey {
     backend: String,
     expected_size: Option<u64>,
     expected_sha256: Option<String>,
+    expected_sha512: Option<String>,
     state: KeyState,
 }
 
 impl AnnexKey {
+    fn expected_hash(&self) -> Option<(&'static str, &str)> {
+        self.expected_sha256
+            .as_deref()
+            .map(|hash| ("sha256", hash))
+            .or_else(|| self.expected_sha512.as_deref().map(|hash| ("sha512", hash)))
+    }
+
+    fn matches_content(&self, content: &ContentHashes) -> bool {
+        match self.expected_hash() {
+            Some(("sha256", expected)) => expected == content.sha256_hex,
+            Some(("sha512", expected)) => Some(expected) == content.sha512_hex.as_deref(),
+            _ => false,
+        }
+    }
+
     fn parse(raw: &str) -> Self {
         let (metadata, name) = raw.split_once("--").unwrap_or((raw, ""));
         let mut fields = metadata.split('-');
@@ -1856,6 +1883,14 @@ impl AnnexKey {
             "SHA256E" if name.len() >= 64 && is_lower_hex(&name[..64], 64) => {
                 Some(name[..64].to_owned())
             }
+            _ => None,
+        };
+        let expected_sha512 = match backend.as_str() {
+            "SHA512" if is_lower_hex(name, 128) => Some(name.to_owned()),
+            "SHA512E" => name
+                .get(..128)
+                .filter(|hash| is_lower_hex(hash, 128))
+                .map(str::to_owned),
             _ => None,
         };
         let recognized = matches!(
@@ -1881,6 +1916,7 @@ impl AnnexKey {
             backend,
             expected_size,
             expected_sha256,
+            expected_sha512,
             state,
         }
     }
@@ -2267,8 +2303,8 @@ impl SourceSnapshot {
             )?,
             index_status_digest: git_output_digest(
                 repo,
-                "inspect tracked worktree state",
-                &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+                "inspect tracked index state",
+                &["ls-files", "--stage", "-z"],
             )?,
             worktree_metadata_digest: worktree_metadata_digest(repo)?,
         })
@@ -2662,6 +2698,15 @@ mod tests {
         let sha512 = AnnexKey::parse("SHA512E-s3--abc.txt");
         assert_eq!(sha512.state, KeyState::Supported);
         assert!(sha512.expected_sha256.is_none());
+        assert!(sha512.expected_hash().is_none());
+        for malformed in [
+            format!("SHA512-s3--{}", "a".repeat(127)),
+            format!("SHA512E-s3--{}.txt", "g".repeat(128)),
+            format!("SHA512E-s3--{}é.txt", "a".repeat(127)),
+            format!("SHA512-s3--{}.txt", "a".repeat(128)),
+        ] {
+            assert!(AnnexKey::parse(&malformed).expected_hash().is_none());
+        }
 
         let worm = AnnexKey::parse("WORM-s3--file.txt");
         assert_eq!(worm.state, KeyState::Unsupported);

@@ -10968,14 +10968,7 @@ fn v2_copy_destination(
                     ))
                 })?;
             let object_root = destination_root.join(".git/annex/objects");
-            let canonical_object_root = std::fs::canonicalize(&object_root).map_err(|error| {
-                AppError::Input(format!(
-                    "copy destination annex object store is unavailable at {}: {error}",
-                    object_root.display()
-                ))
-            })?;
-            if !canonical_object_root.starts_with(destination_root)
-                || !content_path.starts_with(&object_root)
+            if !content_path.starts_with(&object_root)
                 || content_path.file_name() != Some(std::ffi::OsStr::new(&external_key))
                 || content_path.parent().and_then(Path::file_name)
                     != Some(std::ffi::OsStr::new(&external_key))

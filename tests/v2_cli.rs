@@ -7,7 +7,7 @@ mod unix {
     use std::process::{Command, Output};
 
     use serde_json::Value;
-    use sha2::{Digest as _, Sha256};
+    use sha2::{Digest as _, Sha256, Sha512};
     use tempfile::TempDir;
 
     fn archive(temp: &TempDir) -> Command {
@@ -1509,6 +1509,255 @@ mod unix {
     }
 
     #[test]
+    fn annex_sha512_native_import_scan_and_verify_without_git_filters() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let seed = temp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            seed.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let repo = temp.path().join("annex-sha512");
+        fs::create_dir(&repo).unwrap();
+        git_success(&repo, &["init", "-b", "main"]);
+        git_success(&repo, &["config", "user.name", "Archive Ledger Test"]);
+        git_success(&repo, &["config", "user.email", "test@example.invalid"]);
+        git_success(&repo, &["config", "annex.uuid", "sha512-fixture"]);
+        let contents: [&[u8]; 4] = [
+            b"locked bytes\n",
+            b"unlocked bytes\n",
+            b"absent bytes\n",
+            b"expected bytes\n",
+        ];
+        let names = ["locked.txt", "unlocked.txt", "absent.txt", "corrupt.txt"];
+        let mut targets = Vec::new();
+        let mut digests = Vec::new();
+        for (index, content) in contents.iter().enumerate() {
+            let digest = format!("{:x}", Sha512::digest(content));
+            let backend = if index % 2 == 0 { "SHA512" } else { "SHA512E" };
+            let extension = if index % 2 == 0 { "" } else { ".txt" };
+            let key = format!("{backend}-s{}--{digest}{extension}", content.len());
+            let target = PathBuf::from(format!(".git/annex/objects/aa/bb/{key}/{key}"));
+            if index == 1 {
+                fs::write(repo.join(names[index]), format!("/annex/objects/{key}\n")).unwrap();
+            } else {
+                symlink(&target, repo.join(names[index])).unwrap();
+                if index != 2 {
+                    fs::create_dir_all(repo.join(&target).parent().unwrap()).unwrap();
+                    let bytes = if index == 3 {
+                        vec![b'x'; content.len()]
+                    } else {
+                        content.to_vec()
+                    };
+                    fs::write(repo.join(&target), bytes).unwrap();
+                }
+            }
+            targets.push(target);
+            digests.push(digest);
+        }
+        git_success(&repo, &["add", "."]);
+        git_success(&repo, &["commit", "-m", "SHA512 fixture"]);
+        fs::write(repo.join("unlocked.txt"), contents[1]).unwrap();
+        // A cold index requires Git status to consult this filter. Native import
+        // must read the index and worktree directly without invoking it.
+        fs::write(
+            repo.join(".git/info/attributes"),
+            "unlocked.txt filter=annex\n",
+        )
+        .unwrap();
+        git_success(
+            &repo,
+            &[
+                "config",
+                "filter.annex.process",
+                "printf invoked > .git/filter-invoked; exit 1",
+            ],
+        );
+        git_success(&repo, &["config", "filter.annex.required", "true"]);
+        fs::remove_file(repo.join(".git/index")).unwrap();
+        git_success(&repo, &["read-tree", "HEAD"]);
+        let initial_index = fs::read(repo.join(".git/index")).unwrap();
+        let import_output = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "import-annex",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--location-name",
+                "SHA512 Location",
+                "--device",
+                "Test Device",
+                "--site",
+                "Home",
+                "--allow-unidentified-root",
+                "--non-interactive",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            import_output.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&import_output.stderr)
+        );
+        let imported = json(&import_output);
+        assert_eq!(imported["annex_import"]["summary"]["present"], 2);
+        assert_eq!(imported["annex_import"]["summary"]["absent"], 1);
+        assert_eq!(imported["annex_import"]["summary"]["mismatched"], 1);
+        assert!(!repo.join(".git/filter-invoked").exists());
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), initial_index);
+        assert_eq!(fs::read(repo.join("unlocked.txt")).unwrap(), contents[1]);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let absent: (String, String, Option<String>) = database.query_row(
+            "SELECT e.expected_hash_algo, e.expected_hash_hex, e.object_id FROM external_identities e JOIN file_refs f ON f.external_identity_id = e.external_identity_id WHERE f.logical_path_display = 'absent.txt'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(absent, ("sha512".to_owned(), digests[2].clone(), None));
+        assert_eq!(database.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'ok' AND expected_hash_hex = observed_hash_hex", [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 2);
+        assert_eq!(database.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'hash_mismatch' AND expected_hash_hex != observed_hash_hex AND length(observed_hash_hex) = 128", [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 1);
+        drop(database);
+
+        // Recovered absent bytes resolve from the recorded SHA512 key. Both
+        // locked and unlocked content are rechecked against that key on scans.
+        fs::create_dir_all(repo.join(&targets[2]).parent().unwrap()).unwrap();
+        fs::write(repo.join(&targets[2]), contents[2]).unwrap();
+        fs::write(repo.join(&targets[3]), contents[3]).unwrap();
+        let scanned = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "scan",
+            "--path",
+            repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ])));
+        assert_eq!(scanned["summary"]["confirmed_good"], 4);
+        // Re-import fills checksum metadata missing from an older projection
+        // while preserving the same Location and Collection File identities.
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        database.execute("UPDATE external_identities SET expected_hash_algo = NULL, expected_hash_hex = NULL, object_id = NULL, resolution_state = 'unresolved' WHERE namespace = 'git-annex'", []).unwrap();
+        drop(database);
+        let reimported = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "import-annex",
+            repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "SHA512 Location",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ])));
+        assert_eq!(
+            reimported["location"]["location_id"],
+            imported["location"]["location_id"]
+        );
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM file_refs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        assert_eq!(database.query_row("SELECT COUNT(*) FROM external_identities WHERE expected_hash_algo = 'sha512' AND length(expected_hash_hex) = 128 AND resolution_state = 'resolved' AND object_id IS NOT NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
+        drop(database);
+        success(archive(&temp).args([
+            "verify",
+            "SHA512 Location",
+            "--path",
+            repo.to_str().unwrap(),
+        ]));
+        fs::write(repo.join(&targets[0]), vec![b'x'; contents[0].len()]).unwrap();
+        fs::write(repo.join("unlocked.txt"), vec![b'x'; contents[1].len()]).unwrap();
+        let corrupt = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(corrupt.status.code(), Some(10));
+        assert_eq!(json(&corrupt)["summary"]["integrity_mismatches"], 2);
+        let verification = archive(&temp)
+            .args([
+                "--json",
+                "verify",
+                "SHA512 Location",
+                "--path",
+                repo.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(verification.status.code(), Some(10));
+        assert!(!repo.join(".git/filter-invoked").exists());
+        success(archive(&temp).args(["db", "rebuild"]));
+        let rebuilt = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT COUNT(*) FROM objects WHERE canonical_hash_algo = 'blake3'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            4
+        );
+        for digest in &digests {
+            assert_eq!(rebuilt.query_row(
+                "SELECT COUNT(*) FROM object_hashes WHERE hash_algo = 'sha512' AND hash_hex = ?1", [digest], |row| row.get::<_, i64>(0)
+            ).unwrap(), 1);
+        }
+        assert_eq!(rebuilt.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'hash_mismatch' AND length(observed_hash_hex) = 128 AND expected_hash_hex != observed_hash_hex", [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 5);
+        // Prove this fixture would trigger the filter under the old snapshot
+        // command, rather than merely configuring an unused filter.
+        fs::remove_file(repo.join(".git/index")).unwrap();
+        git_success(&repo, &["read-tree", "HEAD"]);
+        let status = git(
+            &repo,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=no"],
+        );
+        assert!(!status.status.success());
+        assert!(repo.join(".git/filter-invoked").exists());
+    }
+
+    #[test]
     fn location_import_annex_records_all_keys_and_only_present_bytes_as_copies() {
         use std::os::unix::fs::symlink;
 
@@ -1759,7 +2008,6 @@ mod unix {
             &destination_repo,
             &["config", "annex.uuid", "fixture-annex-destination-uuid"],
         );
-        fs::create_dir_all(destination_repo.join(".git/annex/objects")).unwrap();
         symlink(&absent_target, destination_repo.join("absent.txt")).unwrap();
         git_success(&destination_repo, &["add", "."]);
         git_success(&destination_repo, &["commit", "-m", "fixture destination"]);
@@ -1802,6 +2050,36 @@ mod unix {
         assert_eq!(planned["status"], "planned");
         assert_eq!(planned["summary"]["selected_logical_files"], 1);
         assert!(!destination_repo.join(&absent_target).exists());
+        assert!(!destination_repo.join(".git/annex/objects").exists());
+
+        // Missing object-store parents are allowed, but existing symlink
+        // ancestors must still fail closed for both planning and copying.
+        let outside = temp.path().join("outside-annex");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"unchanged").unwrap();
+        symlink(&outside, destination_repo.join(".git/annex")).unwrap();
+        for controls in [&["--dry-run"][..], &["--yes", "--non-interactive"][..]] {
+            let refused = archive(&temp)
+                .current_dir(&repo)
+                .args([
+                    "copy",
+                    "--to",
+                    "Annex Destination",
+                    "--collection",
+                    "Files",
+                    "absent.txt",
+                ])
+                .args(controls)
+                .output()
+                .unwrap();
+            assert!(!refused.status.success());
+            assert!(String::from_utf8_lossy(&refused.stderr)
+                .contains("copy destination parent is not a directory"));
+            assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"unchanged");
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        }
+        fs::remove_file(destination_repo.join(".git/annex")).unwrap();
+
         success(archive(&temp).current_dir(&repo).args([
             "copy",
             "--to",
@@ -1812,6 +2090,7 @@ mod unix {
             "--yes",
             "--non-interactive",
         ]));
+        assert!(destination_repo.join(".git/annex/objects").is_dir());
         assert!(fs::symlink_metadata(destination_repo.join("absent.txt"))
             .unwrap()
             .file_type()

@@ -24,6 +24,11 @@ registered Locations. It does not move, delete, repair, or drop archive content.
 See [Example workflows](docs/workflows.md) for task-oriented walkthroughs based on realistic
 Archive Ledger use.
 
+For the initial git-annex workflow, follow [Seven git-annex workflows in Docker](docs/guides/annex-workflows.md):
+create an Archive and Collection, verify a Location, add new files from a subtree, register a
+clone, make verified copies, and list every File below a chosen copy count. The guide includes a
+repeatable Docker end-to-end test using a disposable copy of an existing annex repository.
+
 ## Concepts and relationships
 
 An **Archive** is one complete catalog. It is not a directory or storage device: one Archive can
@@ -97,8 +102,10 @@ history must be checkpointed and independently protected.
 ## Install
 
 Archive Ledger currently targets Linux and builds from source. It requires Rust/Cargo, Git,
-`findmnt` from util-linux, and the POSIX `install` utility. Git-annex is useful for managing annex
-repositories but is not required by the read-only importer.
+`findmnt` from util-linux, and the POSIX `install` utility. Legacy git-annex repositories are input
+data; no git-annex binary is required for import, integrity checks, or copying. Initial import
+reads Git metadata without invoking configured content filters. Subsequent inventory and copy
+operations use direct filesystem access.
 
 ```bash
 cd /path/to/archive-ledger
@@ -164,6 +171,25 @@ docker compose run --rm archive status
 The override example also shows how to make one deliberate copy destination writable. Keep source
 Locations read-only. Do not run native and containerized writers against the same catalog at the
 same time.
+
+Compose drops all Linux capabilities, prevents privilege escalation, and mounts `/tmp` with
+`noexec,nosuid,nodev`. Runtime networking defaults to `none`: this CLI has no container peers to
+contact, so it needs no Compose network. These controls accompany the read-only image and source
+mounts; `/state` and explicit copy destinations remain writable. See the
+[Docker Compose service reference](https://docs.docker.com/reference/compose-file/services/) for
+the capability and network controls.
+
+Remote HTTP(S)/SSH synchronization and cloning require an explicit network opt-in for that command:
+
+```bash
+ARCHIVE_LEDGER_NETWORK_MODE=bridge docker compose run --rm archive sync
+```
+
+This enables Docker's default bridge with outbound network access, including reachable host/LAN
+services; it is not a destination allowlist. Keep the variable unset for ordinary local commands.
+Local Git remotes work offline when their paths are explicitly mounted with the required access.
+Image builds still need network access to download dependencies. The runtime restrictions apply
+through Compose; plain `docker run` does not inherit them.
 
 The container runs as `ARCHIVE_LEDGER_UID:ARCHIVE_LEDGER_GID`; the state directory must be writable
 and Location files readable by that identity. `findmnt` runs inside the container, and Docker may
@@ -464,12 +490,20 @@ exact path, `location import-annex` reuses the Location and fills in its annex
 inventory rather than creating a duplicate.
 
 The importer is a one-time migration/bootstrap step. It reads the Git index, annex keys, and local
-object bytes without invoking mutating git-annex commands, and it verifies that HEAD and worktree
-status stay unchanged. Every annex-managed path becomes a File
-reference. A dangling annex link remains an unresolved external identity and is absent from that
+object bytes without invoking git-annex or configured Git content filters, and checks source
+consistency. SHA256/SHA256E and SHA512/SHA512E keys retain their original expected checksum for
+direct integrity verification; BLAKE3 remains the canonical Object identity. Every annex-managed
+path becomes a File reference. A dangling annex link remains an unresolved external identity and is absent from that
 Location; readable content becomes a BLAKE3 Object and verified present copy. Other symlinks,
 including Git-tracked organizational links, are counted and explicitly reported as ignored. They
 create no File, Object, path-observation, or Copy facts.
+
+For SHA512 entries imported by an earlier version without their expected checksum metadata,
+rerun `location import-annex` on the same registered path with its existing Collection and
+Location settings, then run `verify`. Re-import preserves the Location and File identities while
+learning the original checksum; a database rebuild alone does not discover missing hashes. See
+the [legacy annex guide](docs/guides/annex-workflows.md#2-create-a-collection-by-importing-git-annex)
+for commands.
 
 After a successful import, use the normal inventory commands:
 
