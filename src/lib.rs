@@ -1,6 +1,7 @@
 //! Core library for Archive Ledger.
 
 pub mod annex;
+pub mod annex_progress;
 pub mod app_integration;
 pub mod catalog;
 pub mod discovery;

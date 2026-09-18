@@ -1508,6 +1508,493 @@ mod unix {
         );
     }
 
+    fn inventory_only_annex_fixture(temp: &TempDir) -> PathBuf {
+        use std::os::unix::fs::symlink;
+
+        let repo = temp.path().join("annex-inventory");
+        fs::create_dir(&repo).unwrap();
+        git_success(&repo, &["init", "-b", "main"]);
+        git_success(&repo, &["config", "user.name", "Archive Ledger Test"]);
+        git_success(&repo, &["config", "user.email", "test@example.invalid"]);
+        git_success(&repo, &["config", "annex.uuid", "inventory-fixture"]);
+        fs::create_dir(repo.join("src")).unwrap();
+        fs::create_dir(repo.join("data")).unwrap();
+        for (name, bytes, sha512, available, corrupt) in [
+            ("sha256", b"available sha256".as_slice(), false, true, false),
+            ("sha512", b"available sha512".as_slice(), true, true, false),
+            (
+                "missing",
+                b"missing content".as_slice(),
+                false,
+                false,
+                false,
+            ),
+            ("corrupt", b"expected content".as_slice(), true, true, true),
+        ] {
+            let (backend, digest) = if sha512 {
+                ("SHA512E", format!("{:x}", Sha512::digest(bytes)))
+            } else {
+                ("SHA256E", format!("{:x}", Sha256::digest(bytes)))
+            };
+            let key = format!("{backend}-s{}--{digest}.txt", bytes.len());
+            let object = PathBuf::from(format!(".git/annex/objects/aa/bb/{key}/{key}"));
+            symlink(Path::new("..").join(&object), repo.join("src").join(name)).unwrap();
+            symlink(format!("../src/{name}"), repo.join("data").join(name)).unwrap();
+            if available {
+                fs::create_dir_all(repo.join(&object).parent().unwrap()).unwrap();
+                fs::write(
+                    repo.join(&object),
+                    if corrupt {
+                        vec![b'x'; bytes.len()]
+                    } else {
+                        bytes.to_vec()
+                    },
+                )
+                .unwrap();
+            }
+        }
+        git_success(&repo, &["add", "."]);
+        git_success(&repo, &["commit", "-m", "inventory-only fixture"]);
+        repo
+    }
+
+    #[test]
+    fn annex_inventory_only_collection_init_then_scan_establishes_integrity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let repo = inventory_only_annex_fixture(&temp);
+        symlink(
+            fs::read_link(repo.join("src/sha256")).unwrap(),
+            repo.join("src/sha256-alias"),
+        )
+        .unwrap();
+        git_success(&repo, &["add", "src/sha256-alias"]);
+        git_success(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "second tracked reference to same annex object",
+            ],
+        );
+        let original_index = fs::read(repo.join(".git/index")).unwrap();
+        let original_content: Vec<_> = ["sha256", "sha512", "corrupt"]
+            .iter()
+            .map(|name| {
+                (
+                    repo.join("src").join(name),
+                    fs::read(repo.join("src").join(name)).unwrap(),
+                )
+            })
+            .collect();
+        let output = success(archive(&temp).args([
+            "--json",
+            "collection",
+            "init",
+            repo.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--location-name",
+            "Annex Location",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--import-annex",
+            "--inventory-only",
+        ]));
+        let imported = json(&output);
+        assert_eq!(imported["annex_import"]["summary"]["unchecked"], 5);
+        assert_eq!(imported["annex_import"]["summary"]["ignored_symlinks"], 4);
+        assert_eq!(imported["annex_import"]["summary"]["present"], 0);
+        assert_eq!(imported["annex_import"]["summary"]["absent"], 0);
+        assert_eq!(imported["annex_import"]["summary"]["mismatched"], 0);
+        let progress = String::from_utf8_lossy(&output.stderr);
+        assert!(progress.contains("Annex import: Preparing"), "{progress}");
+        let final_progress = progress
+            .lines()
+            .find(|line| line.contains("Annex import: Complete"))
+            .expect("annex import reports completion on stderr");
+        assert!(final_progress.contains("5 unchecked"), "{final_progress}");
+        assert!(
+            final_progress.contains("4 skipped links"),
+            "{final_progress}"
+        );
+        assert!(
+            !progress.contains('\u{1b}'),
+            "captured progress has ANSI escapes: {progress}"
+        );
+
+        // Both the immediate projection and canonical replay must preserve
+        // uncertainty rather than treating indexed references as verified bytes.
+        for rebuild in [false, true] {
+            if rebuild {
+                success(archive(&temp).args(["db", "rebuild"]));
+            }
+            let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+            let inventory: (i64, i64, i64, i64, i64) = database.query_row(
+                "SELECT (SELECT COUNT(*) FROM file_refs),
+                        (SELECT COUNT(*) FROM objects),
+                        (SELECT COUNT(*) FROM verification_results),
+                        (SELECT COUNT(*) FROM copy_claims WHERE state = 'unknown' AND claim_basis = 'source_metadata'),
+                        (SELECT COUNT(*) FROM external_identities WHERE resolution_state = 'unresolved' AND object_id IS NULL)",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).unwrap();
+            assert_eq!(inventory, (5, 0, 0, 4, 4));
+        }
+
+        // Removing one logical reference must not withdraw the shared CAS
+        // copy that the other registered reference still verifies.
+        fs::remove_file(repo.join("src/sha256-alias")).unwrap();
+        let scanned = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "Annex Location",
+                "--path",
+                repo.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            scanned.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&scanned.stderr)
+        );
+        let summary = &json(&scanned)["summary"];
+        assert_eq!(summary["confirmed_good"], 2);
+        assert_eq!(summary["integrity_mismatches"], 1);
+        success(archive(&temp).args(["db", "rebuild"]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let scanned_state: (i64, i64, i64, i64) = database.query_row(
+            "SELECT (SELECT COUNT(*) FROM objects WHERE canonical_hash_algo = 'blake3'),
+                    (SELECT COUNT(*) FROM copy_claims WHERE state = 'present' AND last_verification_result = 'ok' AND object_id IS NOT NULL AND claim_basis = 'observed_bytes'),
+                    (SELECT COUNT(*) FROM copy_claims WHERE state = 'corrupt' AND last_verification_result = 'hash_mismatch'),
+                    (SELECT COUNT(*) FROM copy_claims WHERE state = 'missing')",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(scanned_state, (2, 2, 1, 1));
+        let shared_copy: (String, String) = database
+            .query_row(
+                "SELECT p.state, c.state FROM file_refs f
+             JOIN path_observations p ON p.file_ref_id = f.file_ref_id
+             JOIN copy_claims c ON c.external_identity_id = f.external_identity_id
+             WHERE f.logical_path_display = 'src/sha256-alias'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(shared_copy, ("missing".to_owned(), "present".to_owned()));
+        assert_eq!(fs::read(repo.join(".git/index")).unwrap(), original_index);
+        for (path, bytes) in original_content {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(!repo.join("src/missing").exists());
+        assert_eq!(
+            fs::read_link(repo.join("data/sha256")).unwrap(),
+            Path::new("../src/sha256")
+        );
+    }
+
+    #[test]
+    fn annex_inventory_only_location_import_resumes_without_hashing() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let seed = temp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            seed.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let repo = inventory_only_annex_fixture(&temp);
+        let paused = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "import-annex",
+            repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--inventory-only",
+            "--job-id",
+            "job_unchecked_resume",
+            "--max-items",
+            "5",
+        ])));
+        assert_eq!(paused["annex_import"]["status"], "running");
+        assert_eq!(paused["annex_import"]["summary"]["unchecked"], 1);
+        let resumed = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            "job_unchecked_resume",
+        ])));
+        assert_eq!(resumed["summary"]["unchecked"], 4);
+        assert_eq!(resumed["summary"]["present"], 0);
+        assert_eq!(resumed["summary"]["mismatched"], 0);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM objects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn annex_inventory_only_requires_an_annex_import_command() {
+        let temp = TempDir::new().unwrap();
+        for args in [
+            vec!["collection", "init", "--inventory-only"],
+            vec!["location", "init", "--inventory-only"],
+        ] {
+            let output = archive(&temp).args(args).output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--inventory-only"));
+        }
+    }
+
+    #[test]
+    fn annex_inventory_only_unlocked_scan_defers_missing_and_resolves_retrieved_content() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let repo = temp.path().join("unlocked-annex");
+        fs::create_dir(&repo).unwrap();
+        git_success(&repo, &["init", "-b", "main"]);
+        git_success(&repo, &["config", "user.name", "Archive Ledger Test"]);
+        git_success(&repo, &["config", "user.email", "test@example.invalid"]);
+        git_success(
+            &repo,
+            &["config", "annex.uuid", "unlocked-inventory-fixture"],
+        );
+        let entries = [
+            ("00-pointer", b"later retrieved".as_slice(), true),
+            ("10-content", b"unlocked sha256".as_slice(), false),
+            ("20-content", b"unlocked sha512".as_slice(), true),
+            ("30-missing", b"worktree absent".as_slice(), false),
+        ];
+        for (name, bytes, sha512) in &entries {
+            let (backend, digest) = if *sha512 {
+                ("SHA512E", format!("{:x}", Sha512::digest(bytes)))
+            } else {
+                ("SHA256E", format!("{:x}", Sha256::digest(bytes)))
+            };
+            let key = format!("{backend}-s{}--{digest}.txt", bytes.len());
+            fs::write(repo.join(name), format!("/annex/objects/{key}\n")).unwrap();
+        }
+        git_success(&repo, &["add", "."]);
+        git_success(&repo, &["commit", "-m", "indexed unlocked pointers"]);
+        fs::remove_file(repo.join("30-missing")).unwrap();
+        let imported = json(&success(archive(&temp).args([
+            "--json",
+            "collection",
+            "init",
+            repo.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--location-name",
+            "Unlocked Annex",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--import-annex",
+            "--inventory-only",
+        ])));
+        assert_eq!(imported["annex_import"]["summary"]["unchecked"], 4);
+
+        // All existing worktree files are pointers, so whichever is visited
+        // first stages a missing-copy candidate that must remain inert.
+        let paused = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "scan",
+            "Unlocked Annex",
+            "--path",
+            repo.to_str().unwrap(),
+            "--job-id",
+            "job_unlocked_scan",
+            "--max-items",
+            "1",
+        ])));
+        assert_eq!(paused["status"], "running");
+        assert_eq!(paused["summary"]["observed_without_verification"], 1);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM copy_claims WHERE state = 'unknown'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+        drop(database);
+
+        let scanned = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            "job_unlocked_scan",
+        ])));
+        assert_eq!(scanned["status"], "complete");
+        assert_eq!(scanned["summary"]["confirmed_good"], 0);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM copy_claims WHERE state = 'missing'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            4
+        );
+        drop(database);
+
+        for (name, bytes, _) in &entries[1..3] {
+            fs::write(repo.join(name), bytes).unwrap();
+        }
+        let scanned = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "scan",
+            "Unlocked Annex",
+            "--path",
+            repo.to_str().unwrap(),
+        ])));
+        assert_eq!(scanned["summary"]["new_paths"], 2);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let states: (i64, i64) = database.query_row(
+            "SELECT (SELECT COUNT(*) FROM copy_claims WHERE state = 'missing'),
+                    (SELECT COUNT(*) FROM copy_claims WHERE state = 'present' AND object_id IS NOT NULL AND claim_basis = 'observed_bytes' AND last_verification_result = 'ok')",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(states, (2, 2));
+        drop(database);
+
+        // Replacing the pointer with retrieved bytes must establish its
+        // identity on the ordinary scan path, without another import.
+        fs::write(repo.join(entries[0].0), entries[0].1).unwrap();
+        let scanned = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "scan",
+            "Unlocked Annex",
+            "--path",
+            repo.to_str().unwrap(),
+        ])));
+        assert_eq!(scanned["summary"]["confirmed_good"], 2);
+        assert_eq!(scanned["summary"]["new_paths"], 1);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let claims =
+            || {
+                let mut statement = database.prepare(
+                "SELECT copy_claim_id, object_id, state, claim_basis, last_verified_record_id
+                 FROM copy_claims ORDER BY copy_claim_id",
+            ).unwrap();
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    })
+                    .unwrap();
+                rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+        let verified_claims = claims();
+        success(archive(&temp).args([
+            "location",
+            "import-annex",
+            repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Unlocked Annex",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--inventory-only",
+        ]));
+        assert_eq!(
+            claims(),
+            verified_claims,
+            "metadata-only reimport must preserve observed evidence"
+        );
+        drop(database);
+        success(archive(&temp).args(["db", "rebuild"]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let retrieved: (String, String, String, String) = database
+            .query_row(
+                "SELECT f.identity_state, c.state, c.claim_basis, o.canonical_hash_hex
+             FROM file_refs f JOIN copy_claims c ON c.external_identity_id = f.external_identity_id
+             JOIN objects o ON o.object_id = c.object_id
+             WHERE f.logical_path_display = '00-pointer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retrieved,
+            (
+                "resolved".to_owned(),
+                "present".to_owned(),
+                "observed_bytes".to_owned(),
+                blake3::hash(entries[0].1).to_hex().to_string(),
+            )
+        );
+        assert!(!repo.join("30-missing").exists());
+    }
+
     #[test]
     fn annex_sha512_native_import_scan_and_verify_without_git_filters() {
         use std::os::unix::fs::symlink;

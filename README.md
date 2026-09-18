@@ -498,6 +498,25 @@ Location; readable content becomes a BLAKE3 Object and verified present copy. Ot
 including Git-tracked organizational links, are counted and explicitly reported as ignored. They
 create no File, Object, path-observation, or Copy facts.
 
+For a large repository, add `--inventory-only` to either `collection init --import-annex` or
+`location import-annex` to defer content reads. This records annex paths, keys, expected sizes,
+and checksums without checking local content availability or integrity. The summary counts these
+entries as `unchecked`; they create no verified copies or BLAKE3 Objects and provide no verified
+protection. Git enumeration and worktree metadata consistency checks still take time.
+
+After inventory-only import, establish presence and integrity with a normal scan. The positional
+argument identifies the Location; `--path` supplies its mounted directory:
+
+```bash
+archive location scan "Photos on Main computer" --path /var/lib/annex/photos
+```
+
+Annex import reports its current phase, processed and skipped entries, verified, absent and
+unchecked content, errors, and bytes read this run on stderr. Updates appear about once a second
+on a terminal and every 30 seconds when redirected, with start and finish updates. Progress covers
+metadata inspection, import, source rechecking, publication, and projection; it does not estimate
+completion time. JSON results remain on stdout.
+
 For SHA512 entries imported by an earlier version without their expected checksum metadata,
 rerun `location import-annex` on the same registered path with its existing Collection and
 Location settings, then run `verify`. Re-import preserves the Location and File identities while

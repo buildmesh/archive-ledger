@@ -1904,7 +1904,7 @@ fn project_annex_entry(
                 logical.display,
                 file_object_id,
                 external_id,
-                if file_object_id.is_some() { "resolved" } else { resolution_state },
+                if file_object_id.is_some() { "resolved" } else if resolution_state == "unsupported" { "unknown" } else { resolution_state },
                 item.get("modified_time_utc_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex modified time")).transpose()?,
                 item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex observed size")).transpose()?,
                 record_id,
@@ -1937,7 +1937,7 @@ fn project_annex_entry(
         .execute(
             "INSERT INTO external_availability(external_identity_id, source_repo_id, source_remote_id, state, location_id, observed_time_utc_ms, observed_record_id)
              VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(external_identity_id, source_repo_id, source_remote_id) DO UPDATE SET state = excluded.state, location_id = excluded.location_id, observed_time_utc_ms = excluded.observed_time_utc_ms, observed_record_id = excluded.observed_record_id",
+             ON CONFLICT(external_identity_id, source_repo_id, source_remote_id) DO UPDATE SET state = excluded.state, location_id = excluded.location_id, observed_time_utc_ms = excluded.observed_time_utc_ms, observed_record_id = excluded.observed_record_id WHERE excluded.state != 'unknown'",
             params![external_id, string(item, "source_repo_id")?, string(item, "local_availability")?, string(item, "cas_location_id")?, observed_time, record_id],
         )
         .map_err(|source| sqlite_error(database_path, source))?;
@@ -1953,12 +1953,14 @@ fn project_annex_entry(
         let copy_bytes = registry_path_bytes(&copy)
             .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
         let state = string(item, "copy_state")?;
+        // Inventory contributes only new unknown claims. Reimporting metadata must
+        // preserve prior content observations, including confirmed absence.
         transaction
             .execute(
                 "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding, relative_path_display, object_id, external_identity_id, claim_basis, state, state_origin_id, state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, last_verified_record_id, last_verified_time_utc_ms, last_verification_result, last_error_code, last_error_detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'observed_bytes', ?8, ?9, ?10, ?11, ?11, ?11, ?12, NULL, NULL, NULL, NULL, NULL, ?13)
-                 ON CONFLICT(copy_claim_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, state = excluded.state, state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_error_detail = excluded.last_error_detail",
-                params![copy_claim_id, location_id, copy_bytes, copy.encoding, copy.display, object_id, external_id, state, record.record.envelope.origin_id, sql_i64(record.record.envelope.origin_seq, "annex copy origin sequence")?, record_id, observed_time, item.get("error_detail").and_then(Value::as_str)],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?11, ?11, ?12, NULL, NULL, NULL, NULL, NULL, ?13)
+                 ON CONFLICT(copy_claim_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, state = excluded.state, state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_error_detail = excluded.last_error_detail, claim_basis = excluded.claim_basis WHERE excluded.claim_basis != 'source_metadata'",
+                params![copy_claim_id, location_id, copy_bytes, copy.encoding, copy.display, object_id, external_id, state, record.record.envelope.origin_id, sql_i64(record.record.envelope.origin_seq, "annex copy origin sequence")?, record_id, observed_time, item.get("error_detail").and_then(Value::as_str), item.get("claim_basis").and_then(Value::as_str).unwrap_or("observed_bytes")],
             )
             .map_err(|source| sqlite_error(database_path, source))?;
         if let Some(result) = item.get("verification_result").and_then(Value::as_str) {
@@ -2367,7 +2369,7 @@ fn project_content_observed(
         .execute(
             "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding, relative_path_display, object_id, external_identity_id, claim_basis, state, state_origin_id, state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, last_verified_record_id, last_verified_time_utc_ms, last_verification_result, last_error_code, last_error_detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'observed_bytes', 'present', ?8, ?9, ?10, ?10, ?10, ?11, NULL, ?10, ?11, 'ok', NULL, NULL)
-             ON CONFLICT(copy_claim_id) DO UPDATE SET state = 'present', state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_verified_record_id = excluded.last_verified_record_id, last_verified_time_utc_ms = excluded.last_verified_time_utc_ms, last_verification_result = 'ok', last_error_code = NULL, last_error_detail = NULL",
+             ON CONFLICT(copy_claim_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = COALESCE(excluded.external_identity_id, copy_claims.external_identity_id), claim_basis = 'observed_bytes', state = 'present', state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_verified_record_id = excluded.last_verified_record_id, last_verified_time_utc_ms = excluded.last_verified_time_utc_ms, last_verification_result = 'ok', last_error_code = NULL, last_error_detail = NULL",
             params![copy_claim_id, location_id, copy_bytes, copy.encoding, copy.display, object_id, external_identity_id, origin_id, origin_seq, record_id, observed_time],
         )
         .map_err(|source| sqlite_error(database_path, source))?;

@@ -623,10 +623,22 @@ pub fn add_files(
                 } else {
                     None
                 };
-                if annex
-                    .as_ref()
-                    .is_some_and(|known| known.representation == "annex_pointer_file")
+                let is_pointer = annex.as_ref().is_some_and(|known| {
+                    file.size_bytes <= 32 * 1024
+                        && is_annex_pointer_file(&absolute, &known.external_key).unwrap_or(false)
+                });
+                if is_pointer
+                    || annex
+                        .as_ref()
+                        .is_some_and(|known| known.expected_hash_hex.is_none())
                 {
+                    if is_pointer {
+                        if let Some(item) = annex.as_ref().and_then(|known| {
+                            annex_missing_copy_item(known, config, &ordinary_copy_path)
+                        }) {
+                            write_spool_item(&mut spool, &item)?;
+                        }
+                    }
                     record_seen
                         .execute(params![
                             logical_encoded.encoding.as_str(),
@@ -712,7 +724,7 @@ pub fn add_files(
                     continue;
                 }
                 let copy_encoded = encode_relative_path(&copy_path);
-                let existing: Option<String> = known
+                let existing: Option<Option<String>> = known
                     .query_row(
                         params![
                             config.collection_id,
@@ -727,7 +739,7 @@ pub fn add_files(
                         source,
                     })?;
                 let object_id = format!("blake3:{}", hashed.blake3_hex);
-                match existing.as_deref() {
+                match existing.as_ref().and_then(|value| value.as_deref()) {
                     None => summary.new_paths = summary.new_paths.saturating_add(1),
                     Some(existing) if existing != object_id => {
                         summary.changed_paths = summary.changed_paths.saturating_add(1)
@@ -866,7 +878,9 @@ pub fn add_files(
                     summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
                     continue;
                 };
-                if known.representation != "annex_locked_symlink" {
+                if known.representation != "annex_locked_symlink"
+                    || known.expected_hash_hex.is_none()
+                {
                     record_seen
                         .execute(params![
                             logical_encoded.encoding.as_str(),
@@ -889,6 +903,13 @@ pub fn add_files(
                     observed_time_utc_ms,
                 )? {
                     AnnexSymlinkObservation::Absent => {
+                        if let Some(item) = known
+                            .copy_path
+                            .as_ref()
+                            .and_then(|path| annex_missing_copy_item(&known, config, path))
+                        {
+                            write_spool_item(&mut spool, &item)?;
+                        }
                         record_seen
                             .execute(params![
                                 logical_encoded.encoding.as_str(),
@@ -1027,7 +1048,13 @@ pub fn add_files(
                            AND c.state != 'superseded' LIMIT 1)
                  FROM path_observations p
                  JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-                 WHERE p.location_id = ?1 AND f.collection_id = ?2 AND p.state = 'present'
+                 WHERE p.location_id = ?1 AND f.collection_id = ?2
+                   AND (p.state = 'present' OR EXISTS (
+                     SELECT 1 FROM copy_claims pending
+                     WHERE pending.location_id = p.location_id
+                       AND pending.external_identity_id = p.external_identity_id
+                       AND pending.state = 'unknown'
+                   ))
                    AND NOT EXISTS (
                      SELECT 1 FROM scan_local.seen s
                      WHERE s.path_encoding = p.observed_path_encoding
@@ -1246,6 +1273,7 @@ struct KnownAnnexEntry {
     representation: String,
     file_ref_id: String,
     external_identity_id: String,
+    external_key: String,
     expected_hash_hex: Option<String>,
     expected_hash_algo: Option<String>,
     expected_size: Option<u64>,
@@ -1266,7 +1294,7 @@ fn known_annex_entry(
             "SELECT p.representation, f.file_ref_id, e.external_identity_id,
                     e.expected_hash_hex, e.expected_size_bytes, e.object_id,
                     c.copy_claim_id, c.relative_path_encoding, c.relative_path_bytes,
-                    c.relative_path_display, e.expected_hash_algo
+                    c.relative_path_display, e.expected_hash_algo, e.external_key
              FROM file_refs f
              JOIN path_observations p ON p.file_ref_id = f.file_ref_id
              JOIN external_identities e ON e.external_identity_id = f.external_identity_id
@@ -1295,6 +1323,7 @@ fn known_annex_entry(
                     row.get::<_, Option<Vec<u8>>>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             },
         )
@@ -1315,6 +1344,7 @@ fn known_annex_entry(
         copy_bytes,
         copy_display,
         expected_hash_algo,
+        external_key,
     )) = row
     else {
         return Ok(None);
@@ -1340,6 +1370,7 @@ fn known_annex_entry(
         representation,
         file_ref_id,
         external_identity_id,
+        external_key,
         expected_hash_hex,
         expected_hash_algo,
         object_id,
@@ -1352,6 +1383,46 @@ fn known_annex_entry(
             .transpose()?,
         copy_claim_id,
         copy_path,
+    }))
+}
+
+fn is_annex_pointer_file(path: &Path, external_key: &str) -> std::io::Result<bool> {
+    let before = fs::metadata(path)?;
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(32 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    let after = fs::metadata(path)?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Ok(false);
+    }
+    if bytes.len() > 32 * 1024 {
+        return Ok(false);
+    }
+    let first_line = bytes.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    Ok(first_line.strip_prefix(b"/annex/objects/") == Some(external_key.as_bytes()))
+}
+
+/// These negatives remain provisional until complete scan publication. A
+/// partial scan or add may observe a pointer without withdrawing prior copies.
+fn annex_missing_copy_item(
+    known: &KnownAnnexEntry,
+    config: &V2InventoryConfig,
+    copy_path: &Path,
+) -> Option<serde_json::Value> {
+    if config.scan_mode != ScanMode::Complete {
+        return None;
+    }
+    let copy_claim_id = known.copy_claim_id.as_ref()?;
+    Some(json!({
+        "kind": "scan_missing_candidate",
+        "candidate_id": stable_id("missing", &[config.scan_id.as_bytes(), b"copy", copy_claim_id.as_bytes(), known.file_ref_id.as_bytes()]),
+        "scan_id": config.scan_id,
+        "candidate_kind": "copy",
+        "file_ref_id": known.file_ref_id,
+        "copy_claim_id": copy_claim_id,
+        "location_id": config.location_id,
+        "path": RegistryPath::from_path(copy_path),
     }))
 }
 
