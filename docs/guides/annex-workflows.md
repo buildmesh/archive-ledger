@@ -81,6 +81,31 @@ it is not counted as a verified copy. SHA256/SHA256E and SHA512/SHA512E keys sup
 expected checksum for direct verification; the catalog retains the annex key and uses BLAKE3 as
 its canonical Object identity. Ordinary organizational symlinks are ignored.
 
+To inventory a large repository first and defer hashing, append `--inventory-only` to the
+`collection init` command above. This records annex paths, keys, expected sizes, and original
+checksums, but does not check content availability or read content bytes. The summary reports
+these entries as `unchecked`, and reminds you to scan afterwards. Unchecked entries are neither
+present nor missing and do not contribute verified copies or protection. Git index enumeration
+and worktree metadata consistency checks still run, so this is not an instantaneous operation.
+
+Establish presence and integrity afterwards with:
+
+```bash
+archive-docker location scan "Media source" --path /locations/source
+```
+
+The scan reads available content, validates its original annex checksum, and establishes its
+BLAKE3 identity and verified presence. The positional argument is a Location name or ID, not a
+filesystem path; supply the mounted directory with `--path`. An incomplete scan cannot mark
+unvisited files missing.
+
+Import progress goes to stderr through metadata inspection, import, source rechecking,
+publication, and projection. It includes processed entries, skipped links and other entries,
+verified, absent and unchecked counts, errors, and bytes read this run. A terminal gets updates
+about once a second; redirected output gets updates every 30 seconds, plus start and finish
+updates. The helper above uses Compose's `-T`, so it uses the redirected cadence. Omit `-T` for
+terminal progress. JSON results stay on stdout. There is no percentage or ETA.
+
 If an earlier Archive Ledger version imported SHA512 entries as unresolved or without their
 expected checksum metadata, rerun import on the same registered path, then verify:
 
@@ -146,6 +171,8 @@ archive-docker collection status Media
 Discovery reuses known filesystem topology when possible. Supply the actual Device and Site;
 do not invent a second Device if both repositories share one disk. This import creates another
 Location, not another Collection, and records only bytes actually readable there as present.
+This command also accepts `--inventory-only`; follow it with
+`archive-docker location scan "Media replica" --path /locations/replica` when ready to check bytes.
 
 ## 6. Copy files and record verified destination presence
 

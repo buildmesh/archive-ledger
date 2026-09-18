@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use archive_ledger::annex_progress::AnnexProgressReporter;
 use archive_ledger::{
     access_plan, central_archive, create_portable_snapshot, fsck_v2_archive,
     inspect_portable_snapshot, install_portable_snapshot, introduced_files, utf8_path,
@@ -956,6 +957,9 @@ struct CollectionInitArgs {
     /// Import this directory as a git-annex repository after setup.
     #[arg(long)]
     import_annex: bool,
+    /// Inventory annex references without checking local presence or reading content.
+    #[arg(long, requires = "import_annex")]
+    inventory_only: bool,
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long, requires = "import_annex")]
@@ -1213,6 +1217,9 @@ struct LocationImportAnnexArgs {
     allow_unidentified_root: bool,
     #[arg(long)]
     non_interactive: bool,
+    /// Inventory annex references without checking local presence or reading content.
+    #[arg(long)]
+    inventory_only: bool,
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long)]
@@ -3175,6 +3182,7 @@ fn run_annex_import(
             device_id: args.device.clone(),
             archive_root_id: args.root.clone(),
             batch_entries: args.batch_entries,
+            inventory_only: false,
         },
     )?;
     let params_value = json!({
@@ -7658,6 +7666,7 @@ fn execute_v2_registry_command(
                     allow_unidentified_root: args.allow_unidentified_root,
                     non_interactive: args.non_interactive,
                     import_annex: false,
+                    inventory_only: false,
                     batch_entries: 1_000,
                     job_id: None,
                     import_id: None,
@@ -7682,6 +7691,7 @@ fn execute_v2_registry_command(
                     allow_unidentified_root: args.allow_unidentified_root,
                     non_interactive: args.non_interactive,
                     import_annex: true,
+                    inventory_only: args.inventory_only,
                     batch_entries: args.batch_entries,
                     job_id: args.job_id.clone(),
                     import_id: args.import_id.clone(),
@@ -8887,11 +8897,13 @@ fn execute_v2_job(
                     )?;
                 }
                 "annex_import" => {
+                    let progress = AnnexProgressReporter::start()?;
                     let store = V2OriginStore::open(cli.events_path())?;
                     let importer = archive_ledger::V2AnnexImporter::new(
                         &store,
                         database,
                         AnnexImportConfig {
+                            inventory_only: job.params["inventory_only"].as_bool().unwrap_or(false),
                             repo_path: job_registry_path(&job.params, "repo_path")?,
                             import_id: job.input_version.clone(),
                             job_id: job.job_id.clone(),
@@ -8909,13 +8921,19 @@ fn execute_v2_job(
                                     )
                                 })?,
                         },
-                    )?;
+                    )?
+                    .with_progress(progress.progress());
                     let result = importer.run_at_most(*max_items)?;
                     let status = if result.status == AnnexImportStatus::Complete {
                         "complete"
                     } else {
                         "running"
                     };
+                    progress.finish(if result.status == AnnexImportStatus::Complete {
+                        "Complete"
+                    } else {
+                        "Paused"
+                    });
                     if cli.json {
                         println!(
                             "{}",
@@ -8937,10 +8955,11 @@ fn execute_v2_job(
                         println!("Resume with: archive job resume {}", job.job_id);
                     } else {
                         println!(
-                            "Annex import complete: {} index entries; {} present; {} absent.",
+                            "Annex import complete: {} index entries; {} verified present; {} absent; {} unchecked.",
                             result.summary.entries_seen,
                             result.summary.present,
-                            result.summary.absent
+                            result.summary.absent,
+                            result.summary.unchecked
                         );
                     }
                 }
@@ -12484,6 +12503,7 @@ fn execute_v2_annex_setup(
         ));
     }
     let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection)?;
+    let progress = AnnexProgressReporter::start()?;
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id
@@ -12507,14 +12527,21 @@ fn execute_v2_annex_setup(
             device_id: setup.device.device_id.clone(),
             archive_root_id: setup.root.archive_root_id.clone(),
             batch_entries: args.batch_entries,
+            inventory_only: args.inventory_only,
         },
-    )?;
+    )?
+    .with_progress(progress.progress());
     let result = importer.run_at_most(args.max_items)?;
     let status = if result.status == AnnexImportStatus::Complete {
         "complete"
     } else {
         "running"
     };
+    progress.finish(if result.status == AnnexImportStatus::Complete {
+        "Complete"
+    } else {
+        "Paused"
+    });
     if cli.json {
         println!(
             "{}",
@@ -12549,12 +12576,20 @@ fn execute_v2_annex_setup(
             );
         }
         println!(
-            "  {} annex entries; {} present here; {} absent here; {} ordinary symlinks ignored",
+            "  {} index entries; {} verified present here; {} absent here; {} unchecked; {} ordinary symlinks ignored",
             result.summary.entries_seen,
             result.summary.present,
             result.summary.absent,
+            result.summary.unchecked,
             result.summary.ignored_symlinks
         );
+        if args.inventory_only {
+            println!("  Inventory only: local presence and integrity have not been checked.");
+            println!(
+                "  Next: archive location scan {:?} --path {:?}",
+                setup.location.display_name, setup.mounted.path
+            );
+        }
         if result.summary.mismatched > 0 || result.summary.read_errors > 0 {
             println!(
                 "  Integrity findings: {} mismatched; {} read errors",
@@ -13127,6 +13162,7 @@ fn execute_location(
                 allow_unidentified_root: args.allow_unidentified_root,
                 non_interactive: args.non_interactive,
                 import_annex: false,
+                inventory_only: false,
                 batch_entries: 1_000,
                 job_id: None,
                 import_id: None,
@@ -13156,6 +13192,7 @@ fn execute_location(
                 allow_unidentified_root: args.allow_unidentified_root,
                 non_interactive: args.non_interactive,
                 import_annex: true,
+                inventory_only: args.inventory_only,
                 batch_entries: args.batch_entries,
                 job_id: args.job_id.clone(),
                 import_id: args.import_id.clone(),
@@ -13928,6 +13965,11 @@ fn execute_filesystem_setup(
     collection_name: String,
     existing_collection: Option<CollectionSnapshot>,
 ) -> Result<u8, AppError> {
+    if args.inventory_only {
+        return Err(AppError::Input(
+            "inventory-only import requires a version 2 Archive".to_owned(),
+        ));
+    }
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     for (flag, value) in [
         ("--location-name", args.location_name.as_deref()),

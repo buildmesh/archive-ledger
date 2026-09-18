@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 
+use crate::annex_progress::AnnexProgress;
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
 use crate::git::managed_git_command;
@@ -110,6 +111,8 @@ pub struct AnnexImportConfig {
     pub device_id: String,
     pub archive_root_id: String,
     pub batch_entries: usize,
+    /// Catalog annex identities without reading or verifying local content.
+    pub inventory_only: bool,
 }
 
 impl AnnexImportConfig {
@@ -156,6 +159,9 @@ pub enum AnnexImportStatus {
 pub struct AnnexSummary {
     pub entries_seen: u64,
     pub present: u64,
+    /// Supported annex entries whose content checks were explicitly deferred.
+    #[serde(default)]
+    pub unchecked: u64,
     pub absent: u64,
     pub supported_unresolved: u64,
     pub unsupported: u64,
@@ -194,6 +200,7 @@ pub struct V2AnnexImporter<'a> {
     store: &'a V2OriginStore,
     projection: &'a V2ProjectionDb,
     config: AnnexImportConfig,
+    progress: Option<&'a AnnexProgress>,
 }
 
 /// Detects a git-annex worktree from its local Git configuration without
@@ -340,7 +347,25 @@ impl<'a> V2AnnexImporter<'a> {
             store,
             projection,
             config,
+            progress: None,
         })
+    }
+
+    pub fn with_progress(mut self, progress: &'a AnnexProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    fn progress_phase(&self, phase: &'static str) {
+        if let Some(progress) = self.progress {
+            progress.phase(phase);
+        }
+    }
+
+    fn progress_summary(&self, summary: &AnnexSummary) {
+        if let Some(progress) = self.progress {
+            progress.summary(summary);
+        }
     }
 
     pub fn run(&self) -> Result<AnnexImportResult> {
@@ -348,8 +373,10 @@ impl<'a> V2AnnexImporter<'a> {
     }
 
     pub fn run_at_most(&self, limit: Option<usize>) -> Result<AnnexImportResult> {
+        self.progress_phase("Preparing catalog");
         self.projection.apply(self.store)?;
-        let initial = SourceSnapshot::capture(&self.config.repo_path)?;
+        self.progress_phase("Inspecting source metadata");
+        let initial = SourceSnapshot::capture_with_progress(&self.config.repo_path, self.progress)?;
         let annex_uuid = git_text(
             &self.config.repo_path,
             "read annex UUID",
@@ -374,7 +401,7 @@ impl<'a> V2AnnexImporter<'a> {
         let spool_path = job_root.join("annex-items.jsonl");
         let summary_path = job_root.join("annex-summary.json");
         let config_path = job_root.join("annex-config.json");
-        let config_value = json!({
+        let mut config_value = json!({
             "repo_path": path_json(&encode_absolute_path(&self.config.repo_path)),
             "import_id": self.config.import_id,
             "job_id": self.config.job_id,
@@ -388,6 +415,11 @@ impl<'a> V2AnnexImporter<'a> {
             "git_head_commit": initial.head,
             "source_fingerprint": initial.fingerprint(),
         });
+        // Keep the verified-import configuration byte-compatible with resumable
+        // jobs created before inventory-only mode was introduced.
+        if self.config.inventory_only {
+            config_value["inventory_only"] = json!(true);
+        }
         let existing_config = job.read_optional("annex-config.json").map_err(|source| {
             io_error("read annex import job configuration", &config_path, source)
         })?;
@@ -467,6 +499,7 @@ impl<'a> V2AnnexImporter<'a> {
                     ))
                 })?
                 .unwrap_or_default();
+            self.progress_summary(&summary);
             job.cleanup(&[
                 "annex-items.jsonl",
                 "annex-summary.json",
@@ -546,12 +579,19 @@ impl<'a> V2AnnexImporter<'a> {
         if fresh_progress {
             save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
         }
+        self.progress_phase(if self.config.inventory_only {
+            "Inventorying references"
+        } else {
+            "Importing and hashing content"
+        });
+        self.progress_summary(&summary);
         let mut index = IndexStream::open(&self.config.repo_path)?;
         let mut cat_file = CatFile::open(&self.config.repo_path)?;
         let mut skip_entries = summary.entries_seen;
         let mut processed_this_run = 0_usize;
         let mut interrupted = false;
         while let Some(entry) = index.next_entry()? {
+            self.progress_summary(&summary);
             if entry.stage != 0 {
                 continue;
             }
@@ -592,7 +632,7 @@ impl<'a> V2AnnexImporter<'a> {
             };
             let logical = encode_relative_path(&raw_path(&entry.path)?);
             let key = AnnexKey::parse(&key_text);
-            let outcome = inspect_entry_v2(&self.config, &entry, &blob, &key)?;
+            let outcome = inspect_entry_v2(&self.config, &entry, &blob, &key, self.progress)?;
             summary.add(&outcome.category);
             write_v2_item(
                 &mut spool,
@@ -606,12 +646,15 @@ impl<'a> V2AnnexImporter<'a> {
                 save_annex_checkpoint(&job, &mut spool, &spool_path, &summary_path, &summary)?;
             }
         }
+        self.progress_summary(&summary);
         if interrupted {
             while index.next_entry()?.is_some() {}
         }
         index.finish()?;
         cat_file.finish()?;
-        let final_snapshot = SourceSnapshot::capture(&self.config.repo_path)?;
+        self.progress_phase("Rechecking source metadata");
+        let final_snapshot =
+            SourceSnapshot::capture_with_progress(&self.config.repo_path, self.progress)?;
         if initial != final_snapshot {
             return Err(AnnexImportError::SourceChanged);
         }
@@ -675,6 +718,7 @@ impl<'a> V2AnnexImporter<'a> {
             .and_then(|()| spool.get_ref().sync_all())
             .map_err(|source| io_error("sync annex import spool", &spool_path, source))?;
         drop(spool);
+        self.progress_phase("Saving catalog events");
         self.store.append_jsonl_batch(
             "annex_import",
             1,
@@ -686,6 +730,7 @@ impl<'a> V2AnnexImporter<'a> {
             json!({}),
             &spool_path,
         )?;
+        self.progress_phase("Updating catalog index");
         self.projection.apply(self.store)?;
         drop(connection);
         job.cleanup(&[
@@ -711,6 +756,11 @@ impl<'a> AnnexImporter<'a> {
         mut config: AnnexImportConfig,
     ) -> Result<Self> {
         config.validate()?;
+        if config.inventory_only {
+            return Err(AnnexImportError::InvalidConfig(
+                "inventory-only import requires a V2 Archive".to_owned(),
+            ));
+        }
         config.repo_path = fs::canonicalize(&config.repo_path).map_err(|source| {
             io_error("canonicalize annex repository", &config.repo_path, source)
         })?;
@@ -993,7 +1043,7 @@ impl<'a> AnnexImporter<'a> {
             });
         }
 
-        match hash_file(&worktree_path, &content_metadata, false) {
+        match hash_file(&worktree_path, &content_metadata, false, None) {
             Ok(content) => {
                 let size_matches = key.expected_size.is_none_or(|size| size == content.size);
                 let hash_matches = key.expected_sha256.as_deref() == Some(&content.sha256_hex);
@@ -1454,8 +1504,10 @@ fn v2_annex_entry_item(
         .as_ref()
         .filter(|_| resolved)
         .map(|content| format!("blake3:{}", content.blake3_hex));
-    let copy_location_id =
-        (outcome.content.is_some() || outcome.category == EntryCategory::ReadError).then(|| {
+    let copy_location_id = (config.inventory_only
+        || outcome.content.is_some()
+        || outcome.category == EntryCategory::ReadError)
+        .then(|| {
             if outcome.representation == "annex_locked_symlink" {
                 config.cas_location_id.clone()
             } else {
@@ -1506,7 +1558,7 @@ fn v2_annex_entry_item(
         "logical_path": path_json(logical),
         "path_state": if outcome.path_present { "present" } else { "missing" },
         "representation": outcome.representation,
-        "local_availability": if outcome.local_bytes_present { "present" } else { "missing" },
+        "local_availability": if config.inventory_only { "unknown" } else if outcome.local_bytes_present { "present" } else { "missing" },
         "object_id": object_id,
         "blake3_hex": outcome.content.as_ref().filter(|_| resolved).map(|content| &content.blake3_hex),
         "sha256_hex": outcome.content.as_ref().map(|content| &content.sha256_hex),
@@ -1517,12 +1569,13 @@ fn v2_annex_entry_item(
         "copy_location_id": copy_location_id,
         "copy_path": copy_path.map(path_json),
         "copy_claim_id": copy_claim_id,
-        "copy_state": match outcome.category {
+        "claim_basis": if config.inventory_only { "source_metadata" } else { "observed_bytes" },
+        "copy_state": if config.inventory_only { "unknown" } else { match outcome.category {
             EntryCategory::Present | EntryCategory::SupportedUnresolved => "present",
             EntryCategory::Mismatch => "corrupt",
-            EntryCategory::ReadError => "unknown",
+            EntryCategory::ReadError | EntryCategory::Unchecked => "unknown",
             EntryCategory::Absent | EntryCategory::Unsupported => "missing",
-        },
+        } },
         "verification_result": match outcome.category {
             EntryCategory::Present => Some("ok"),
             EntryCategory::Mismatch => Some("hash_mismatch"),
@@ -1538,12 +1591,61 @@ fn v2_annex_entry_item(
     })
 }
 
-fn inspect_entry_v2(
+/// Record the indexed identity and where a later scan should check its bytes.
+/// Metadata observations are about the worktree path, never target availability.
+fn inventory_entry_v2(
     config: &AnnexImportConfig,
     entry: &IndexEntry,
     index_blob: &[u8],
     key: &AnnexKey,
 ) -> Result<EntryOutcome> {
+    let path = config.repo_path.join(raw_path(&entry.path)?);
+    let path_present = match fs::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(source) => return Err(io_error("inspect annex inventory path", path, source)),
+    };
+    let (representation, copy_path) = if entry.mode == "120000" {
+        let relative = annex_object_relative(index_blob).ok_or_else(|| {
+            AnnexImportError::InvalidConfig("invalid indexed annex target".to_owned())
+        })?;
+        let relative = raw_path(relative)?;
+        let copy_path = if config.cas_location_id == config.worktree_location_id {
+            Path::new(".git/annex/objects").join(relative)
+        } else {
+            relative
+        };
+        ("annex_locked_symlink", encode_relative_path(&copy_path))
+    } else {
+        // The index supplies a pointer for both unlocked content and dropped
+        // pointer files. A later scan must inspect bytes to distinguish them.
+        ("annex_unlocked_file", encoded_worktree_path(entry)?)
+    };
+    Ok(EntryOutcome {
+        category: if key.state == KeyState::Unsupported {
+            EntryCategory::Unsupported
+        } else {
+            EntryCategory::Unchecked
+        },
+        representation,
+        content: None,
+        error: None,
+        path_present,
+        local_bytes_present: false,
+        copy_path: Some(copy_path),
+    })
+}
+
+fn inspect_entry_v2(
+    config: &AnnexImportConfig,
+    entry: &IndexEntry,
+    index_blob: &[u8],
+    key: &AnnexKey,
+    progress: Option<&AnnexProgress>,
+) -> Result<EntryOutcome> {
+    if config.inventory_only {
+        return inventory_entry_v2(config, entry, index_blob, key);
+    }
     let worktree_path = config.repo_path.join(raw_path(&entry.path)?);
     let metadata = match fs::symlink_metadata(&worktree_path) {
         Ok(metadata) => metadata,
@@ -1647,6 +1749,7 @@ fn inspect_entry_v2(
         &worktree_path,
         &content_metadata,
         key.expected_sha512.is_some(),
+        progress,
     ) {
         Ok(content) => {
             let matches = key.expected_size.is_none_or(|size| size == content.size)
@@ -1718,6 +1821,7 @@ fn parse_location_log(key: &str, blob: &[u8]) -> Result<BTreeMap<String, &'stati
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntryCategory {
     Present,
+    Unchecked,
     Absent,
     SupportedUnresolved,
     Unsupported,
@@ -1729,6 +1833,7 @@ impl EntryCategory {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Present => "present",
+            Self::Unchecked => "unchecked",
             Self::Absent => "absent",
             Self::SupportedUnresolved => "supported_unresolved",
             Self::Unsupported => "unsupported",
@@ -1742,6 +1847,7 @@ impl AnnexSummary {
     fn add(&mut self, category: &EntryCategory) {
         match category {
             EntryCategory::Present => self.present += 1,
+            EntryCategory::Unchecked => self.unchecked += 1,
             EntryCategory::Absent => self.absent += 1,
             EntryCategory::SupportedUnresolved => self.supported_unresolved += 1,
             EntryCategory::Unsupported => self.unsupported += 1,
@@ -1796,7 +1902,12 @@ struct ContentHashes {
     modified_time_utc_ms: Option<u64>,
 }
 
-fn hash_file(path: &Path, initial_metadata: &Metadata, hash_sha512: bool) -> Result<ContentHashes> {
+fn hash_file(
+    path: &Path,
+    initial_metadata: &Metadata,
+    hash_sha512: bool,
+    progress: Option<&AnnexProgress>,
+) -> Result<ContentHashes> {
     let start = std::time::Instant::now();
     let mut file =
         File::open(path).map_err(|source| io_error("open annex content", path, source))?;
@@ -1815,6 +1926,9 @@ fn hash_file(path: &Path, initial_metadata: &Metadata, hash_sha512: bool) -> Res
         size = size.checked_add(read as u64).ok_or_else(|| {
             AnnexImportError::InvalidConfig("content size exceeds u64".to_owned())
         })?;
+        if let Some(progress) = progress {
+            progress.read_bytes(read);
+        }
         blake3.update(&buffer[..read]);
         sha256.update(&buffer[..read]);
         if let Some(sha512) = &mut sha512 {
@@ -2294,6 +2408,10 @@ struct SourceSnapshot {
 
 impl SourceSnapshot {
     fn capture(repo: &Path) -> Result<Self> {
+        Self::capture_with_progress(repo, None)
+    }
+
+    fn capture_with_progress(repo: &Path, progress: Option<&AnnexProgress>) -> Result<Self> {
         Ok(Self {
             head: git_text(repo, "read HEAD", &["rev-parse", "--verify", "HEAD"])?,
             annex_branch: git_text_optional(
@@ -2306,7 +2424,7 @@ impl SourceSnapshot {
                 "inspect tracked index state",
                 &["ls-files", "--stage", "-z"],
             )?,
-            worktree_metadata_digest: worktree_metadata_digest(repo)?,
+            worktree_metadata_digest: worktree_metadata_digest(repo, progress)?,
         })
     }
 
@@ -2324,7 +2442,7 @@ impl SourceSnapshot {
 }
 
 #[cfg(unix)]
-fn worktree_metadata_digest(repo: &Path) -> Result<String> {
+fn worktree_metadata_digest(repo: &Path, progress: Option<&AnnexProgress>) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
@@ -2333,6 +2451,9 @@ fn worktree_metadata_digest(repo: &Path) -> Result<String> {
     while let Some(entry) = index.next_entry()? {
         if entry.stage != 0 {
             continue;
+        }
+        if let Some(progress) = progress {
+            progress.inspected_entry();
         }
         hasher.update(&(entry.path.len() as u64).to_le_bytes());
         hasher.update(&entry.path);
@@ -2366,7 +2487,7 @@ fn worktree_metadata_digest(repo: &Path) -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn worktree_metadata_digest(_repo: &Path) -> Result<String> {
+fn worktree_metadata_digest(_repo: &Path, _progress: Option<&AnnexProgress>) -> Result<String> {
     Err(AnnexImportError::UnsupportedPlatform)
 }
 
@@ -2683,6 +2804,85 @@ mod tests {
         assert!(annex_key_from_blob("100644", b"ordinary content").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inventory_defers_content_checks_and_retains_scan_inputs() {
+        let temp = TempDir::new().unwrap();
+        let config = AnnexImportConfig {
+            repo_path: temp.path().to_path_buf(),
+            import_id: "import_inventory".to_owned(),
+            job_id: "job_inventory".to_owned(),
+            collection_id: "collection_inventory".to_owned(),
+            worktree_location_id: "location_inventory".to_owned(),
+            cas_location_id: "location_inventory".to_owned(),
+            device_id: "device_inventory".to_owned(),
+            archive_root_id: "root_inventory".to_owned(),
+            batch_entries: 2,
+            inventory_only: true,
+        };
+        for (mode, path, key_text) in [
+            ("120000", "locked", format!("SHA256-s3--{}", "a".repeat(64))),
+            (
+                "100644",
+                "unlocked",
+                format!("SHA512-s3--{}", "b".repeat(128)),
+            ),
+            ("120000", "unsupported", "WORM-s3--name".to_owned()),
+        ] {
+            let blob = if mode == "120000" {
+                let target = format!(".git/annex/objects/aa/bb/{key_text}/{key_text}");
+                std::os::unix::fs::symlink(&target, temp.path().join(path)).unwrap();
+                target.into_bytes()
+            } else {
+                fs::write(
+                    temp.path().join(path),
+                    b"bad content, intentionally mismatched",
+                )
+                .unwrap();
+                format!("/annex/objects/{key_text}\n").into_bytes()
+            };
+            let entry = IndexEntry {
+                mode: mode.to_owned(),
+                oid: "unused".to_owned(),
+                stage: 0,
+                path: path.as_bytes().to_vec(),
+            };
+            let key = AnnexKey::parse(&key_text);
+            let outcome = inspect_entry_v2(&config, &entry, &blob, &key, None).unwrap();
+            assert!(outcome.content.is_none());
+            let item = v2_annex_entry_item(
+                &config,
+                "annex-test",
+                &encode_relative_path(Path::new(path)),
+                &key,
+                &outcome,
+            );
+            assert_eq!(item["local_availability"], "unknown");
+            assert_eq!(item["copy_state"], "unknown");
+            assert_eq!(item["claim_basis"], "source_metadata");
+            assert!(item["object_id"].is_null());
+            assert!(item["verification_result"].is_null());
+            assert_eq!(item["expected_size_bytes"], 3);
+            assert!(item["copy_path"].is_object());
+            assert_eq!(
+                outcome.category,
+                if key.state == KeyState::Unsupported {
+                    EntryCategory::Unsupported
+                } else {
+                    EntryCategory::Unchecked
+                }
+            );
+        }
+        let mut old_summary = serde_json::to_value(AnnexSummary::default()).unwrap();
+        old_summary.as_object_mut().unwrap().remove("unchecked");
+        assert_eq!(
+            serde_json::from_value::<AnnexSummary>(old_summary)
+                .unwrap()
+                .unchecked,
+            0
+        );
+    }
+
     #[test]
     fn key_parser_separates_supported_unverifiable_and_unsupported() {
         let sha = AnnexKey::parse(
@@ -2786,6 +2986,7 @@ mod tests {
             device_id: "device_fixture".to_owned(),
             archive_root_id: "root_fixture".to_owned(),
             batch_entries: 2,
+            inventory_only: false,
         };
         let importer = AnnexImporter::new(&store, &projection, config.clone()).unwrap();
         let interrupted = importer.run_at_most(Some(2)).unwrap();
@@ -2907,6 +3108,7 @@ mod tests {
                 device_id: "device_fixture_two".to_owned(),
                 archive_root_id: "root_fixture_two".to_owned(),
                 batch_entries: 3,
+                inventory_only: false,
             },
         )
         .unwrap()
@@ -2937,6 +3139,7 @@ mod tests {
             device_id: "device_fixture".to_owned(),
             archive_root_id: "root_fixture".to_owned(),
             batch_entries: 2,
+            inventory_only: false,
         };
         AnnexImporter::new(&store, &projection, changing_config.clone())
             .unwrap()
