@@ -29,6 +29,8 @@ pub type Result<T> = std::result::Result<T, AnnexImportError>;
 
 #[derive(Debug, Error)]
 pub enum AnnexImportError {
+    #[error("job {0} is running in another process")]
+    JobBusy(String),
     #[error(transparent)]
     EventStore(#[from] EventStoreError),
 
@@ -74,6 +76,7 @@ pub enum AnnexImportError {
 impl AnnexImportError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::JobBusy(_) => "job_busy",
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
             Self::V2Store(error) => error.code(),
@@ -373,6 +376,21 @@ impl<'a> V2AnnexImporter<'a> {
     }
 
     pub fn run_at_most(&self, limit: Option<usize>) -> Result<AnnexImportResult> {
+        let archive_root = self
+            .projection
+            .path()
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let job = JobDirectory::new(archive_root, &self.config.job_id)
+            .map_err(|source| io_error("prepare annex import job path", archive_root, source))?;
+        let _job_lock = job.try_lock().map_err(|source| {
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                AnnexImportError::JobBusy(self.config.job_id.clone())
+            } else {
+                io_error("lock annex import job", job.path(), source)
+            }
+        })?;
         self.progress_phase("Preparing catalog");
         self.projection.apply(self.store)?;
         self.progress_phase("Inspecting source metadata");
@@ -387,14 +405,6 @@ impl<'a> V2AnnexImporter<'a> {
                 "repository has no annex.uuid".to_owned(),
             ));
         }
-        let archive_root = self
-            .projection
-            .path()
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let job = JobDirectory::new(archive_root, &self.config.job_id)
-            .map_err(|source| io_error("prepare annex import job path", archive_root, source))?;
         job.ensure()
             .map_err(|source| io_error("create annex import job directory", job.path(), source))?;
         let job_root = job.path().to_path_buf();

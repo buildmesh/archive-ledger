@@ -73,6 +73,40 @@ impl JobDirectory {
         &self.path
     }
 
+    /// Holds a nonblocking per-job lock through publication, apply, and cleanup.
+    /// Lock files live outside removable job directories and are never unlinked:
+    /// recreating a locked pathname would let two processes lock different inodes.
+    #[cfg(unix)]
+    pub(crate) fn try_lock(&self) -> io::Result<File> {
+        let locks = self
+            .jobs_root
+            .parent()
+            .expect("jobs has a local parent")
+            .join("job-locks");
+        ensure_real_directory(&locks)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&locks)?;
+        ensure_same_directory(&directory, &locks)?;
+        let name = format!(
+            "{}.lock",
+            self.path
+                .file_name()
+                .expect("validated job ID")
+                .to_str()
+                .expect("ASCII job ID")
+        );
+        let lock = open_regular_at(&directory, &name, libc::O_RDWR | libc::O_CREAT, 0o600)?;
+        fs2::FileExt::try_lock_exclusive(&lock)?;
+        Ok(lock)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn try_lock(&self) -> io::Result<fs::File> {
+        Err(unsupported_job_files())
+    }
+
     #[cfg(unix)]
     pub(crate) fn read_optional(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         let Some(mut file) = self.open_read_optional(name)? else {
@@ -349,7 +383,11 @@ fn ensure_real_directory(path: &Path) -> io::Result<()> {
             let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
             builder.mode(0o700);
-            builder.create(path)?;
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
             require_real_directory(path)
         }
         Err(error) => Err(error),
@@ -475,6 +513,98 @@ fn unsupported_job_files() -> io::Error {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn job_lock_survives_cleanup_and_recreation() {
+        let temp = tempdir().unwrap();
+        let job = JobDirectory::new(temp.path(), "job_lock").unwrap();
+        let lock = job.try_lock().unwrap();
+        job.ensure().unwrap();
+        job.cleanup(&[]).unwrap();
+        job.ensure().unwrap();
+        assert_eq!(
+            job.try_lock().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        // Another job remains independent.
+        let other = JobDirectory::new(temp.path(), "job_other").unwrap();
+        let _other_lock = other.try_lock().unwrap();
+        drop(lock);
+        let _resumed = job.try_lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_lock_refuses_linked_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let job = JobDirectory::new(temp.path(), "job_lock").unwrap();
+        let locks = temp.path().join("local/job-locks");
+        let sentinel = temp.path().join("sentinel");
+        fs::write(&sentinel, b"preserve me").unwrap();
+        fs::create_dir(&locks).unwrap();
+        let path = locks.join("job_lock.lock");
+        symlink(&sentinel, &path).unwrap();
+        assert!(job.try_lock().is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&sentinel, &path).unwrap();
+        assert!(job.try_lock().is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&locks).unwrap();
+        symlink(temp.path(), &locks).unwrap();
+        assert!(job.try_lock().is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_lock_process_helper() {
+        let Some(root) = std::env::var_os("ARCHIVE_LEDGER_TEST_LOCK_ROOT") else {
+            return;
+        };
+        let job = JobDirectory::new(Path::new(&root), "job_lock").unwrap();
+        let _lock = job.try_lock().unwrap();
+        println!("LOCK_HELD");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_job_lock_owner_does_not_block_recovery() {
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+
+        let temp = tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "job::tests::job_lock_process_helper",
+                "--nocapture",
+            ])
+            .env("ARCHIVE_LEDGER_TEST_LOCK_ROOT", temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = false;
+        for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+            if line.unwrap().ends_with("LOCK_HELD") {
+                ready = true;
+                break;
+            }
+        }
+        let job = JobDirectory::new(temp.path(), "job_lock").unwrap();
+        let busy = job.try_lock().unwrap_err().kind();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready);
+        assert_eq!(busy, io::ErrorKind::WouldBlock);
+        let _resumed = job.try_lock().unwrap();
+    }
 
     #[test]
     fn job_ids_are_single_portable_path_components() {

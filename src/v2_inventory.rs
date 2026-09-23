@@ -29,6 +29,8 @@ pub type Result<T> = std::result::Result<T, V2InventoryError>;
 
 #[derive(Debug, Error)]
 pub enum V2InventoryError {
+    #[error("job {0} is running in another process")]
+    JobBusy(String),
     #[error(transparent)]
     Discovery(#[from] DiscoveryError),
     #[error(transparent)]
@@ -55,6 +57,7 @@ pub enum V2InventoryError {
 impl V2InventoryError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::JobBusy(_) => "job_busy",
             Self::Discovery(error) => error.code(),
             Self::Store(error) => error.code(),
             Self::Projection(error) => error.code(),
@@ -258,6 +261,22 @@ pub fn add_files(
     config: &V2InventoryConfig,
 ) -> Result<V2InventoryResult> {
     validate_config(config)?;
+    let archive_root = projection
+        .path()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let job = JobDirectory::new(archive_root, &config.job_id)
+        .map_err(|source| io_error("prepare inventory job path", archive_root, source))?;
+    // Reconcile canonical completion only while holding the job lock. The store's
+    // append lock serializes batches but does not deduplicate operation keys.
+    let _job_lock = job.try_lock().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            V2InventoryError::JobBusy(config.job_id.clone())
+        } else {
+            io_error("lock inventory job", job.path(), source)
+        }
+    })?;
     let coordination_remote =
         if config.scan_mode == ScanMode::Complete && store.coordination_required()? {
             let remote = store.coordination_remote()?;
@@ -273,13 +292,6 @@ pub fn add_files(
     } else {
         "location_scan"
     };
-    let archive_root = projection
-        .path()
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let job = JobDirectory::new(archive_root, &config.job_id)
-        .map_err(|source| io_error("prepare inventory job path", archive_root, source))?;
     let job_root = job.path().to_path_buf();
     let config_path = job_root.join("inventory-config.json");
     let spool_path = job_root.join("inventory-items.jsonl");

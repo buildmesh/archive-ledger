@@ -581,6 +581,14 @@ outcome, the writer holds the exclusive stream lock and rejects any existing
 operation key. A crash can therefore leave local progress behind canonical
 history, but cannot duplicate a canonical outcome.
 
+The current v2 inventory and annex-import writers enforce same-job exclusion
+with a nonblocking local job lock, held before canonical reconciliation through
+publication, projection, and cleanup. Contention returns `job_busy`. Empty lock
+files remain in `local/job-locks` so job-directory cleanup cannot split lock
+ownership across different files; process exit releases the lock. The store's
+append lock alone does not yet enforce the general operation-key rejection
+invariant above across all writers.
+
 The opt-in background stale-presence runner uses `job_started` and
 `job_finished` only when a recognized connected Device has eligible work or an
 existing job must be finished. Each successful targeted read emits the ordinary

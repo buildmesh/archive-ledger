@@ -102,6 +102,76 @@ mod unix {
         }
     }
 
+    fn assert_job_resume_refuses_busy_job(temp: &TempDir, job_id: &str) {
+        let status = || {
+            let output = archive(temp).args(["--json", "status"]).output().unwrap();
+            // Fixtures may intentionally have preservation findings.
+            assert!(matches!(output.status.code(), Some(0 | 10)));
+            json(&output)
+        };
+        let job_dir = root(temp).join("local/jobs").join(job_id);
+        let job_files = || {
+            fs::read_dir(&job_dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let files_before = job_files();
+        let status_before = status();
+        let job_before = json(&success(
+            archive(temp).args(["--json", "job", "show", job_id]),
+        ));
+        let lock_dir = root(temp).join("local/job-locks");
+        fs::create_dir_all(&lock_dir).unwrap();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_dir.join(format!("{job_id}.lock")))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+
+        let mut child = archive(temp)
+            .args(["--json", "job", "resume", job_id])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("resume waited for the busy job lock: {job_id}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        // Annex progress currently logs to stderr before the final JSON error.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let error: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+        assert_eq!(error["error"]["code"], "job_busy");
+        assert!(error["error"]["message"].as_str().unwrap().contains(job_id));
+        assert_eq!(job_files(), files_before, "busy resume changed job files");
+        assert_eq!(
+            json(&success(
+                archive(temp).args(["--json", "job", "show", job_id]),
+            )),
+            job_before,
+            "busy resume changed the job checkpoint"
+        );
+        let status_after = status();
+        for frontier in ["accepted_frontier_hash", "applied_frontier_hash"] {
+            assert_eq!(status_after[frontier], status_before[frontier]);
+        }
+        drop(lock);
+    }
+
     #[test]
     fn init_status_verify_and_rebuild_use_one_verified_v2_state() {
         let temp = TempDir::new().unwrap();
@@ -1093,6 +1163,7 @@ mod unix {
         ] {
             assert_job_resume_refuses_symlink(&temp, "job_inventory_resume", name);
         }
+        assert_job_resume_refuses_busy_job(&temp, "job_inventory_resume");
         let added = json(&success(archive(&temp).args([
             "--json",
             "job",
@@ -1461,6 +1532,7 @@ mod unix {
             0
         );
         drop(before_resume);
+        assert_job_resume_refuses_busy_job(&temp, "job_scan_resume");
         let scanned = json(&success(archive(&temp).args([
             "--json",
             "job",
@@ -1506,6 +1578,8 @@ mod unix {
                 .unwrap(),
             1
         );
+        drop(rebuilt);
+        success(archive(&temp).args(["fsck"]));
     }
 
     fn inventory_only_annex_fixture(temp: &TempDir) -> PathBuf {
@@ -2348,6 +2422,7 @@ mod unix {
             .unwrap()
             .write_all(b"crash-tail-that-must-be-truncated\n")
             .unwrap();
+        assert_job_resume_refuses_busy_job(&temp, "job_annex_resume");
         let imported = json(&success(archive(&temp).args([
             "--json",
             "job",
@@ -2637,6 +2712,8 @@ mod unix {
                 .unwrap(),
             1
         );
+        drop(rebuilt);
+        success(archive(&temp).args(["fsck"]));
     }
 
     #[test]
