@@ -234,6 +234,49 @@ pub fn fsck_v2_archive(
         }
     };
 
+    if let Some(verified) = &verified {
+        let publication_started = Instant::now();
+        match store.unpublished_append_paths(verified) {
+            Ok(paths) => {
+                let healthy = paths.is_empty();
+                push_check(
+                    &mut report,
+                    "publication",
+                    healthy,
+                    if healthy {
+                        "append_publication_complete"
+                    } else {
+                        "unpublished_append_artifacts"
+                    },
+                    if healthy {
+                        "No unpublished append segments or manifests were found".to_owned()
+                    } else {
+                        format!(
+                            "{} unpublished append artifact(s); accepted signed history remains valid",
+                            paths.len()
+                        )
+                    },
+                    publication_started,
+                    (!healthy).then(|| {
+                        format!(
+                            "Examples: {}. A local writer retry will attempt conservative recovery of its own unpublished append; other artifacts may require investigation. Fsck did not change these files.",
+                            paths.iter().take(8).map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    }),
+                );
+            }
+            Err(error) => push_check(
+                &mut report,
+                "publication",
+                false,
+                "unpublished_append_inspection_failed",
+                "Unpublished append artifacts could not be inspected".to_owned(),
+                publication_started,
+                Some(error.to_string()),
+            ),
+        }
+    }
+
     let sqlite_started = Instant::now();
     let connection = open_read_only(database_path)?;
     let quick = sqlite_check_findings(&connection, database_path, "PRAGMA quick_check")?;
@@ -1102,7 +1145,76 @@ fn io_error(path: &Path, source: std::io::Error) -> V2FsckError {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::v2_store::initialize_v2_archive;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn unpublished_append_is_reported_without_changing_history_or_artifacts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let archive = temp.path().join("archive");
+        let initialized =
+            initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let database_path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &database_path).unwrap();
+        let options = V2FsckOptions {
+            full: false,
+            keep_rebuild: false,
+            rebuild_dir: None,
+        };
+        assert!(
+            fsck_v2_archive(&store, &database_path, &options)
+                .unwrap()
+                .healthy
+        );
+
+        // Inspection must work for a reader without the local writer's secret key.
+        fs::remove_file(
+            archive
+                .join("local/clients")
+                .join(format!("{}.key", initialized.origin_id)),
+        )
+        .unwrap();
+        let head = store.root().join("frontiers/v2/HEAD");
+        let original_head = fs::read(&head).unwrap();
+        let accepted = store.verification_report().unwrap();
+        for relative in [
+            format!(
+                "events/v2/origins/{}/seg-000000000004.jsonl",
+                initialized.origin_id
+            ),
+            format!(
+                "manifests/v2/origins/{}/seg-000000000004.manifest.json",
+                initialized.origin_id
+            ),
+        ] {
+            let path = store.root().join(&relative);
+            let bytes = b"incomplete unpublished append fixture\n";
+            fs::write(&path, bytes).unwrap();
+            let report = fsck_v2_archive(&store, &database_path, &options).unwrap();
+            assert!(!report.healthy);
+            assert_eq!(report.exit_code(), 10);
+            let finding = report
+                .checks
+                .iter()
+                .find(|check| check.code == "unpublished_append_artifacts")
+                .unwrap();
+            assert_eq!(finding.layer, "publication");
+            assert_eq!(finding.status, "finding");
+            assert!(finding
+                .summary
+                .starts_with("1 unpublished append artifact(s)"));
+            assert!(finding.detail.as_ref().unwrap().contains(&relative));
+            assert!(report
+                .checks
+                .iter()
+                .any(|check| { check.code == "canonical_events_valid" && check.status == "pass" }));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&head).unwrap(), original_head);
+            assert_eq!(store.verification_report().unwrap(), accepted);
+            fs::remove_file(path).unwrap();
+        }
+    }
 
     #[test]
     fn timed_out_command_kills_its_helper_process() {

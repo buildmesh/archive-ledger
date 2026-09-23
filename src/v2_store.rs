@@ -40,6 +40,10 @@ const COORDINATION_LEASE_VERSION: u32 = 1;
 const PORTABLE_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_COORDINATION_LEASE_MS: u64 = 120_000;
 
+mod recovery;
+#[cfg(test)]
+mod recovery_tests;
+
 pub type Result<T> = std::result::Result<T, V2StoreError>;
 
 struct RemoveOnDrop {
@@ -67,6 +71,8 @@ impl Drop for RemoveOnDrop {
 
 #[derive(Debug, Error)]
 pub enum V2StoreError {
+    #[error("unpublished append recovery refused: {0}; preserve the files and inspect with archive fsck")]
+    AppendRecoveryRefused(String),
     #[error("version 2 event tree is invalid: {0}")]
     Invalid(String),
     #[error("{operation} failed for {path}: {source}")]
@@ -106,6 +112,7 @@ pub enum V2StoreError {
 impl V2StoreError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::AppendRecoveryRefused(_) => "v2_append_recovery_refused",
             Self::Io { .. } => "v2_store_io",
             Self::Json { .. } => "v2_store_json_invalid",
             Self::Git { .. } => "v2_store_git",
@@ -408,6 +415,9 @@ pub struct V2AppendResult {
     pub segment_manifest_hash: String,
     pub accepted_frontier_hash: String,
     pub git_commit: String,
+    /// Preserved unpublished evidence from an interrupted append, when recovered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_append: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -2207,12 +2217,11 @@ impl V2OriginStore {
         fs::create_dir_all(segment_parent).map_err(|source| {
             io_error("create origin segment directory", segment_parent, source)
         })?;
-        if segment_path.exists() {
-            return Err(V2StoreError::Invalid(format!(
-                "immutable segment already exists: {}",
-                segment_path.display()
-            )));
-        }
+        let recovered_append = self.recover_unpublished_append(
+            &origin_id,
+            first_seq,
+            &verified.accepted_frontier_hash,
+        )?;
         let segment_temp = segment_parent.join(format!(".segment-{}.tmp", lower_ulid()));
         let mut segment_temp_guard = RemoveOnDrop::new(segment_temp.clone());
         let mut segment_file = OpenOptions::new()
@@ -2486,6 +2495,7 @@ impl V2OriginStore {
             segment_manifest_hash: manifest_hash,
             accepted_frontier_hash,
             git_commit,
+            recovered_append,
         })
     }
 

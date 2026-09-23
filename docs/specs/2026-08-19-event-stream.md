@@ -120,6 +120,28 @@ The canonical Git commit binds both the pointer and referenced manifest. Git
 synchronization constructs a verified successor rather than text-merging this
 pointer.
 
+An interrupted local append can leave its next-sequence segment, manifest, or
+detached successor frontier durable before `HEAD` advances. On retry, the writer
+holds the append lock, verifies accepted history, and checks that the leftover
+files are unpublished local append evidence. It refuses ambiguous metadata,
+unsafe filesystem links, and files already staged or present in Git history
+(including reflogs), with `v2_append_recovery_refused`.
+
+Recoverable files are preserved beneath `local/append-recovery/<id>/`, with a
+`recovery.json` recording their original paths and accepted frontier. The writer
+moves the detached frontier first, then the manifest, then the segment, syncing
+the retained evidence and directory entries before proceeding. Retrying after
+interruption of recovery is safe. It does not accept the abandoned batch; the
+requested operation publishes a new batch. The append result's optional
+`recovered_append` field names the evidence directory. Evidence is retained until
+the user has investigated the interruption and explicitly removes it.
+
+Read-only `archive fsck` reports segments and manifests beyond accepted origin
+tails as `unpublished_append_artifacts`, separately from damage to accepted
+signed history. A writer retry can recover its own recognized unpublished
+append; other or ambiguous artifacts require investigation. Temporary segment
+and HEAD files are outside this recovery scope.
+
 Each batch start records its causal base frontier. Projection may process a
 batch only after that base is satisfied. Concurrent batches need no invented
 global order: additive rules commute, while contradictions are preserved as
