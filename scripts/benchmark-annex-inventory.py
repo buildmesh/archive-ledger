@@ -208,12 +208,39 @@ def database_state(path):
         connection.close()
 
 
+def assert_equivalent_databases(reference, target, *, ignore_local_state=False):
+    """Check exact logical contents, including the schema, outside timed work."""
+    expected = database_state(reference)
+    actual = database_state(target)
+    # Match v2_fsck's distinction between canonical facts and local job caches.
+    tables = [table for table in actual["counts"]
+              if not ignore_local_state or table not in ("jobs", "job_items")]
+    assert actual["counts"].keys() == expected["counts"].keys(), "Table names differ"
+    assert all(actual["counts"][table] == expected["counts"][table] for table in tables), "Table counts differ"
+    connection = connect_readonly(target)
+    try:
+        connection.execute("ATTACH DATABASE ? AS reference", (reference.as_uri() + "?mode=ro",))
+        schema = "SELECT type, name, tbl_name, sql FROM {}.sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        assert connection.execute(schema.format("main")).fetchall() == connection.execute(schema.format("reference")).fetchall(), "Schema differs"
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            where = " WHERE key NOT IN ('projection_generation', 'policy_input_generation', 'last_verified_checkpoint_id', 'last_verified_checkpoint_frontier_hash')" if table == "archive_meta" and ignore_local_state else ""
+            for left, right in [("main", "reference"), ("reference", "main")]:
+                assert connection.execute(f"SELECT * FROM {left}.{quoted}{where} EXCEPT SELECT * FROM {right}.{quoted}{where} LIMIT 1").fetchone() is None, (table, left)
+    finally:
+        connection.close()
+
+
 def fixture(stage, size, env, timeout):
     repo = stage / "annex-repo"
     repo.mkdir()
     for index, args in enumerate([["init", "-b", "main"], ["config", "user.name", "Benchmark"],
                                   ["config", "user.email", "benchmark@example.invalid"],
-                                  ["config", "annex.uuid", "benchmark-annex-fixture"]]):
+                                  ["config", "annex.uuid", "benchmark-annex-fixture"],
+                                  # Keep fixture creation from spawning background
+                                  # packing that competes with the measured CLI.
+                                  ["config", "gc.auto", "0"],
+                                  ["config", "maintenance.auto", "false"]]):
         run_command(["git", "-C", repo, *args], stage, f"git-setup-{index}", env, timeout)
     for index in range(size):
         directory = repo / f"files-{index // 1000:04}"
@@ -248,9 +275,29 @@ def benchmark(args, size):
     assert before["counts"]["external_identities"] == size, before["counts"]
     assert before["counts"]["file_refs"] == size, before["counts"]
     assert before["counts"]["objects"] == before["counts"]["verification_results"] == 0, before["counts"]
+    # A SQLite backup also handles a future WAL import without losing sidecars.
+    reference = stage / "before-rebuild.db"
+    source_connection = connect_readonly(archive / "archive.db")
+    destination = sqlite3.connect(reference)
+    try:
+        source_connection.backup(destination)
+    finally:
+        destination.close()
+        source_connection.close()
+    canonical_head = git_commit_ref(archive / "canonical")
+    baseline = None
+    if args.baseline_binary:
+        baseline_target = stage / "baseline.db"
+        baseline = run_command([args.baseline_binary, "--json", "--database", reference,
+                                "--events", archive / "canonical", "db", "rebuild", "--target", baseline_target],
+                               stage, "baseline-rebuild", env, args.timeout, stage, True)
+        assert_equivalent_databases(reference, baseline_target, ignore_local_state=True)
     rebuilt = run_command([args.binary, "--json", "db", "rebuild"], stage, "rebuild", env, args.timeout, archive, True)
     after = database_state(archive / "archive.db")
-    assert before["counts"] == after["counts"], (before["counts"], after["counts"])
+    assert_equivalent_databases(reference, archive / "archive.db", ignore_local_state=True)
+    if baseline:
+        assert_equivalent_databases(baseline_target, archive / "archive.db")
+    assert git_commit_ref(archive / "canonical") == canonical_head, "Rebuild changed canonical HEAD"
     run_command([args.binary, "--json", "fsck"], stage, "fsck", env, args.timeout)
     boundaries = imported["boundaries"]
     phases = {"preparation_and_spooling_seconds": boundaries.get("spool_ready_seconds")}
@@ -259,6 +306,13 @@ def benchmark(args, size):
         phases["projection_and_finalization_seconds"] = imported["seconds"] - boundaries["publication_done_seconds"]
     result = {"size": size, "stage": str(stage), "fixture_seconds": fixture_seconds,
               "import_seconds": imported["seconds"], "rebuild_seconds": rebuilt["seconds"], "approximate_import_phases": phases,
+              "baseline_rebuild_seconds": baseline["seconds"] if baseline else None,
+              "baseline_rebuild_peaks": baseline["root_process_peaks"] if baseline else None,
+              "all_derived_rows_and_schema_equal": True,
+              "ignored_live_tables": ["jobs", "job_items"],
+              "ignored_live_metadata_keys": ["projection_generation", "policy_input_generation",
+                                             "last_verified_checkpoint_id", "last_verified_checkpoint_frontier_hash"],
+              "baseline_all_rows_equal": True if baseline else None, "canonical_head_unchanged": True,
               "measurement_notes": ["Phase boundaries are observed at 100 ms intervals, include scheduling delay, and may be missed.",
                                     "Spool-ready observes complete final JSONL, before fsync completion; frontier-written precedes final verification and Git commit.",
                                     "Publication-done observes the canonical Git commit ref advance; Git command finalization may overlap the next phase estimate.",
@@ -351,6 +405,8 @@ def compare_cache(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True, help="Absolute path to a built archive CLI")
+    parser.add_argument("--baseline-binary", type=Path,
+                        help="Optional original CLI to time rebuilding the same canonical history")
     parser.add_argument("--work-dir", type=Path, required=True, help="Existing, task-owned disposable staging directory")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--sizes", type=int, nargs="+", default=[5000, 10000, 25000, 50000])
@@ -360,6 +416,8 @@ def main():
     args = parser.parse_args()
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must be an absolute path to an existing executable")
+    if args.baseline_binary and (not args.baseline_binary.is_absolute() or not args.baseline_binary.is_file()):
+        parser.error("--baseline-binary must be an absolute path to an existing executable")
     args.work_dir = args.work_dir.resolve(strict=True)
     if not args.work_dir.is_dir() or args.timeout <= 0 or any(size <= 0 for size in args.sizes):
         parser.error("work directory must exist, and sizes/timeout must be positive")

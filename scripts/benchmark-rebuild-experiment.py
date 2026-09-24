@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare isolated rebuild prototypes against a completed annex benchmark fixture.
 
-Use only disposable fixtures and a binary built with the accompanying experiment
-patch; ARCHIVE_REBUILD_EXPERIMENT is not a product configuration interface.
+Use only disposable fixtures. Nondefault variants require a binary built with
+the accompanying experiment patch; ARCHIVE_REBUILD_EXPERIMENT is not a product
+configuration interface. Default variants also measure the production binary.
 See docs/benchmarks/2026-09-24-rebuild-batching.md for reproduction instructions.
 """
 import argparse
@@ -47,17 +48,7 @@ for index, variant in enumerate(a.variants):
     assert state['settings_on_observer_connection']['journal_mode'] == 'delete'
     assert not Path(str(target)+'-wal').exists()
     assert not Path(str(target)+'-shm').exists()
-    connection = bench.connect_readonly(target)
-    try:
-        connection.execute('ATTACH DATABASE ? AS reference', (reference.as_uri()+'?mode=ro',))
-        schema = "SELECT type, name, tbl_name, sql FROM {}.sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-        assert connection.execute(schema.format('main')).fetchall() == connection.execute(schema.format('reference')).fetchall(), 'Schema differs'
-        for table in state['counts']:
-            quoted = '"'+table.replace('"','""')+'"'
-            for left, right in [('main', 'reference'), ('reference','main')]:
-                assert connection.execute(f'SELECT * FROM {left}.{quoted} EXCEPT SELECT * FROM {right}.{quoted} LIMIT 1').fetchone() is None, (variant, table, left)
-    finally:
-        connection.close()
+    bench.assert_equivalent_databases(reference, target)
     assert bench.git_commit_ref(events) == head
     result = dict(variant=variant, seconds=measured['seconds'], peaks=measured['root_process_peaks'],
                   database_bytes=state['bytes'], integrity=True, schema_equal=True, all_rows_equal=True)

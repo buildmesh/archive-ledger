@@ -513,6 +513,20 @@ streams canonical history in bounded sequential passes, verifies the final
 cursor, and atomically installs the replacement. It does not delete the only
 usable database before the replacement succeeds.
 
+New-database reconstruction streams up to 64 canonical records per transaction
+with a 64 MiB SQLite page-cache target and reusable statements on the annex
+projection path. The cache target is not a process-memory limit. Primary-key,
+uniqueness, and replay lookup indexes remain active; selected reporting indexes
+are built after replay, before integrity and foreign-key validation. Normal
+rollback journaling and synchronization remain enabled. These are rebuild
+defaults, not user configuration flags; incremental apply retains its bounded
+per-record transactions.
+
+An unfinished database keeps SQLite's `user_version` at zero. The supported
+schema version is written only after reconstruction, index creation, and final
+validation succeed, so normal open cannot accept a partial construction as a
+finished projection.
+
 Local-operational job progress and caches may be rebuilt or discarded. Derived archive facts must reproduce the same logical state.
 
 ### Normal reads

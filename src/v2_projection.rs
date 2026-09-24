@@ -512,7 +512,6 @@ CREATE TABLE annex_remotes (
     last_observed_record_id TEXT NOT NULL,
     PRIMARY KEY (source_annex_uuid, remote_annex_uuid)
 ) STRICT;
-PRAGMA user_version = 6;
 "#;
 
 pub type Result<T> = std::result::Result<T, V2ProjectionError>;
@@ -588,6 +587,71 @@ pub struct V2ApplyStats {
     pub applied_frontier_hash: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayMode {
+    Incremental,
+    Rebuild,
+}
+
+impl ReplayMode {
+    fn configure(self, connection: &Connection, path: &Path) -> Result<()> {
+        if self == Self::Rebuild {
+            // Bound SQLite's page-cache target rather than retaining event rows.
+            connection
+                .execute_batch("PRAGMA cache_size = -65536;")
+                .map_err(|source| sqlite_error(path, source))?;
+            connection.set_prepared_statement_cache_capacity(32);
+        }
+        Ok(())
+    }
+}
+
+// Retain all PK/UNIQUE indexes and the five complete-scan replay lookups.
+// These report indexes are rebuilt in bulk before the replacement is validated.
+const DEFERRED_REBUILD_INDEXES: &[&str] = &[
+    "records_kind_time",
+    "records_batch_dot",
+    "sites_status_name",
+    "policies_status_name",
+    "collections_status_name",
+    "devices_status_name",
+    "archive_roots_status_name",
+    "locations_status_name",
+    "locations_device",
+    "locations_site",
+    "locations_root",
+    "device_mounts_root_time",
+    "device_mounts_device_time",
+    "risk_domains_status_name",
+    "object_hashes_lookup",
+    "file_refs_object",
+    "file_refs_external_identity",
+    "copy_claims_object_state",
+    "copy_claims_external_state",
+    "copy_claims_verification_age",
+    "copy_claims_risk_eligible",
+    "scan_runs_location_finished",
+    "scan_runs_status",
+    "scan_candidates_copy_claim",
+    "job_items_job_status",
+    "annex_imports_location",
+];
+
+fn defer_rebuild_indexes(connection: &Connection, path: &Path) -> Result<Vec<String>> {
+    let mut definitions = Vec::with_capacity(DEFERRED_REBUILD_INDEXES.len());
+    for name in DEFERRED_REBUILD_INDEXES {
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND sql LIKE 'CREATE INDEX %'",
+            [name], |row| row.get(0),
+        ).map_err(|source| sqlite_error(path, source))?;
+        connection
+            .execute_batch(&format!("DROP INDEX {name};"))
+            .map_err(|source| sqlite_error(path, source))?;
+        definitions.push(sql);
+    }
+    Ok(definitions)
+}
+
 #[derive(Debug)]
 pub struct V2ProjectionDb {
     path: PathBuf,
@@ -616,9 +680,11 @@ impl V2ProjectionDb {
             .open(path)
             .map_err(|source| io_error(path, source))?;
         let mut connection = Connection::open(path).map_err(|source| sqlite_error(path, source))?;
+        ReplayMode::Rebuild.configure(&connection, path)?;
         connection
             .execute_batch(SCHEMA_V6)
             .map_err(|source| sqlite_error(path, source))?;
+        let deferred_indexes = defer_rebuild_indexes(&connection, path)?;
         let bootstrap_hash = verified
             .frontiers
             .iter()
@@ -709,9 +775,26 @@ impl V2ProjectionDb {
             .commit()
             .map_err(|source| sqlite_error(path, source))?;
         drop(connection);
-        let database = Self::open_existing(path)?;
-        let applied = database.apply(store)?;
-        let connection = database.open()?;
+        // The unpublished database keeps user_version = 0 until every index
+        // and validation is complete. Public open_existing must reject partial
+        // constructor output, including a file left behind by an error/crash.
+        let database = Self {
+            path: path.to_path_buf(),
+        };
+        let applied = database.apply_with_mode(store, ReplayMode::Rebuild)?;
+        let mut connection = database.open()?;
+        ReplayMode::Rebuild.configure(&connection, path)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(path, source))?;
+        for definition in deferred_indexes {
+            transaction
+                .execute_batch(&definition)
+                .map_err(|source| sqlite_error(path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(path, source))?;
         connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
             .map_err(|source| sqlite_error(path, source))?;
@@ -723,16 +806,34 @@ impl V2ProjectionDb {
                 "SQLite integrity_check failed: {integrity}"
             )));
         }
+        let foreign_key_violation = connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|source| sqlite_error(path, source))?
+            .query_row([], |_| Ok(()))
+            .optional()
+            .map_err(|source| sqlite_error(path, source))?;
+        if foreign_key_violation.is_some() {
+            return Err(V2ProjectionError::Invalid(
+                "SQLite foreign_key_check failed".to_owned(),
+            ));
+        }
         drop(connection);
         database.validate_against_verified(&verified)?;
-        Ok(V2RebuildStats {
+        let stats = V2RebuildStats {
             version: 2,
             archive_id: verified.genesis.body.archive_id,
             records_applied: applied.records_applied,
             origins_applied: u64::try_from(verified.accepted_frontier.origins.len())
                 .map_err(|_| V2ProjectionError::Invalid("origin count overflow".to_owned()))?,
             applied_frontier_hash: verified.accepted_frontier_hash,
-        })
+        };
+        // Set the completion marker with the ordinary durable connection only
+        // after successful replay, index creation, and integrity verification.
+        database
+            .open()?
+            .pragma_update(None, "user_version", V2_SCHEMA_VERSION)
+            .map_err(|source| sqlite_error(path, source))?;
+        Ok(stats)
     }
 
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
@@ -801,7 +902,12 @@ impl V2ProjectionDb {
     /// Transactions are intentionally bounded to one control/chunk record so a
     /// crash can resume without replaying already projected chunks.
     pub fn apply(&self, store: &V2OriginStore) -> Result<V2ApplyStats> {
+        self.apply_with_mode(store, ReplayMode::Incremental)
+    }
+
+    fn apply_with_mode(&self, store: &V2OriginStore, mode: ReplayMode) -> Result<V2ApplyStats> {
         let mut connection = self.open()?;
+        mode.configure(&connection, &self.path)?;
         let applied_frontier_hash = meta(&connection, &self.path, "applied_frontier_hash")?;
         let stored_cursors = connection
             .prepare("SELECT origin_id, applied_seq, applied_record_hash, applied_segment_manifest_hash FROM projection_origins ORDER BY origin_id")
@@ -895,6 +1001,9 @@ impl V2ProjectionDb {
         let mut records_applied = 0_u64;
         let mut advanced_origins = BTreeMap::<String, ()>::new();
         let mut validated_context = false;
+        let records_per_transaction = if mode == ReplayMode::Rebuild { 64 } else { 1 };
+        let mut pending_transaction: Option<Transaction<'_>> = None;
+        let mut pending_records = 0;
         let verified = store.visit_verified_since_with_clients::<V2ProjectionError, _>(
             &applied_frontier_hash,
             &verification_cursors,
@@ -941,20 +1050,23 @@ impl V2ProjectionDb {
                     "canonical origin {origin_id} has a gap after SQLite sequence {cursor}"
                 )));
             }
-            let transaction = connection
-                .transaction()
-                .map_err(|source| sqlite_error(&self.path, source))?;
-            let inserted = insert_record(&transaction, record, &self.path)?;
+            if pending_transaction.is_none() {
+                pending_transaction = Some(connection
+                    .unchecked_transaction()
+                    .map_err(|source| sqlite_error(&self.path, source))?);
+            }
+            let transaction = pending_transaction.as_ref().expect("started transaction");
+            let inserted = insert_record(transaction, record, &self.path)?;
             if inserted {
                 match record.record.envelope.record_kind {
                     V2RecordKind::BatchStart => {
-                        project_batch_start(&transaction, record, &self.path)?
+                        project_batch_start(transaction, record, &self.path)?
                     }
                     V2RecordKind::BatchChunk => {
-                        project_batch_chunk(&transaction, record, context, &self.path)?
+                        project_batch_chunk(transaction, record, context, &self.path, mode == ReplayMode::Rebuild)?
                     }
                     V2RecordKind::BatchComplete => {
-                        project_batch_complete(&transaction, record, &self.path)?
+                        project_batch_complete(transaction, record, &self.path)?
                     }
                 }
             }
@@ -974,9 +1086,13 @@ impl V2ProjectionDb {
                 cursors.insert(origin_id.clone(), sequence);
                 advanced_origins.insert(origin_id.clone(), ());
             }
-            transaction
-                .commit()
-                .map_err(|source| sqlite_error(&self.path, source))?;
+            pending_records += 1;
+            if pending_records == records_per_transaction {
+                pending_transaction.take().expect("pending transaction")
+                    .commit()
+                    .map_err(|source| sqlite_error(&self.path, source))?;
+                pending_records = 0;
+            }
             next_sequences.insert(origin_id.clone(), sequence);
             records_applied = records_applied.checked_add(1).ok_or_else(|| {
                 V2ProjectionError::Invalid("applied record count overflow".to_owned())
@@ -984,6 +1100,13 @@ impl V2ProjectionDb {
             Ok(())
         },
         )?;
+        // Records remain streamed; on error RAII rolls back the pending group.
+        if let Some(transaction) = pending_transaction.take() {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&self.path, source))?;
+        }
+        drop(pending_transaction);
         if !validated_context {
             if meta(&connection, &self.path, "archive_id")? != verified.genesis.body.archive_id
                 || meta(&connection, &self.path, "genesis_hash")? != verified.genesis_hash
@@ -1284,6 +1407,7 @@ fn project_batch_chunk(
     record: &VerifiedV2Record,
     verified: &V2VerificationContext,
     path: &Path,
+    prepared: bool,
 ) -> Result<()> {
     let payload = object(&record.record.envelope.payload, "batch_chunk payload")?;
     let first = number(payload, "first_item_index")?;
@@ -1403,7 +1527,7 @@ fn project_batch_chunk(
                 project_annex_import_started(transaction, item, record, path)?
             }
             "annex_entry_observed" => {
-                project_annex_entry(transaction, item, record, item_index, path)?;
+                project_annex_entry(transaction, item, record, item_index, path, prepared)?;
             }
             "annex_import_completed" => {
                 project_annex_import_completed(transaction, item, record, path)?
@@ -1416,7 +1540,7 @@ fn project_batch_chunk(
                 )))
             }
         }
-        project_operation_outcome(transaction, item, record, item_index, path)?;
+        project_operation_outcome(transaction, item, record, item_index, path, prepared)?;
     }
     let next = sql_u64(current, "batch item count")?
         .checked_add(
@@ -1734,27 +1858,42 @@ fn project_job_finished(
     Ok(())
 }
 
+fn execute_projected<P: rusqlite::Params>(
+    transaction: &Transaction<'_>,
+    prepared: bool,
+    sql: &str,
+    parameters: P,
+) -> rusqlite::Result<usize> {
+    if prepared {
+        transaction.prepare_cached(sql)?.execute(parameters)
+    } else {
+        transaction.execute(sql, parameters)
+    }
+}
+
 fn project_operation_outcome(
     transaction: &Transaction<'_>,
     item: &serde_json::Map<String, Value>,
     record: &VerifiedV2Record,
     item_index: u64,
     database_path: &Path,
+    prepared: bool,
 ) -> Result<()> {
     let Some(operation_key) = item.get("operation_key").and_then(Value::as_str) else {
         return Ok(());
     };
-    transaction
-        .execute(
-            "INSERT INTO operation_outcomes(operation_key, record_id, item_index)
+    execute_projected(
+        transaction,
+        prepared,
+        "INSERT INTO operation_outcomes(operation_key, record_id, item_index)
              VALUES (?1, ?2, ?3)",
-            params![
-                operation_key,
-                record.record.envelope.record_id,
-                sql_i64(item_index, "operation item index")?,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
+        params![
+            operation_key,
+            record.record.envelope.record_id,
+            sql_i64(item_index, "operation item index")?,
+        ],
+    )
+    .map_err(|source| sqlite_error(database_path, source))?;
     Ok(())
 }
 
@@ -1800,6 +1939,7 @@ fn project_annex_entry(
     record: &VerifiedV2Record,
     item_index: u64,
     database_path: &Path,
+    prepared: bool,
 ) -> Result<()> {
     let record_id = &record.record.envelope.record_id;
     let observed_time = sql_i64(record.record.envelope.time_utc_ms, "annex observation time")?;
@@ -1810,8 +1950,7 @@ fn project_annex_entry(
         .and_then(Value::as_u64)
         .map(|value| sql_i64(value, "annex expected size"))
         .transpose()?;
-    transaction
-        .execute(
+    execute_projected(transaction, prepared,
             "INSERT INTO external_identities(external_identity_id, namespace, external_key, expected_hash_algo, expected_hash_hex, expected_size_bytes, object_id, resolution_state, source_detail_json, first_seen_record_id, resolved_record_id)
              VALUES (?1, 'git-annex', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL)
              ON CONFLICT(external_identity_id) DO UPDATE SET expected_hash_algo = excluded.expected_hash_algo, expected_hash_hex = excluded.expected_hash_hex, expected_size_bytes = excluded.expected_size_bytes",
@@ -1846,8 +1985,7 @@ fn project_annex_entry(
             .ok_or_else(|| {
                 V2ProjectionError::Invalid("resolved annex entry lacks size".to_owned())
             })?;
-        transaction
-            .execute(
+        execute_projected(transaction, prepared,
                 "INSERT OR IGNORE INTO objects(object_id, canonical_hash_algo, canonical_hash_hex, size_bytes, media_type, extension_hint, first_seen_record_id, first_seen_time_utc_ms)
                  VALUES (?1, 'blake3', ?2, ?3, NULL, NULL, ?4, ?5)",
                 params![object_id, hash, sql_i64(size, "annex object size")?, record_id, observed_time],
@@ -1858,16 +1996,14 @@ fn project_annex_entry(
                 .get(&format!("{algorithm}_hex"))
                 .and_then(Value::as_str)
             {
-                transaction
-                    .execute(
+                execute_projected(transaction, prepared,
                         "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, ?2, ?3, 'annex_import', ?4)",
                         params![object_id, algorithm, hash, record_id],
                     )
                     .map_err(|source| sqlite_error(database_path, source))?;
             }
         }
-        transaction
-            .execute(
+        execute_projected(transaction, prepared,
                 "UPDATE external_identities SET object_id = ?2, resolution_state = 'resolved', resolved_record_id = ?3 WHERE external_identity_id = ?1 AND resolution_state != 'conflict'",
                 params![external_id, object_id, record_id],
             )
@@ -1883,16 +2019,17 @@ fn project_annex_entry(
     // A git-annex key identifies the same content across partial repositories.
     // Importing a repository where that key is absent must not regress a File
     // that another repository already resolved.
-    let resolved_object_id: Option<String> = transaction
-        .query_row(
-            "SELECT object_id FROM external_identities WHERE external_identity_id = ?1",
-            [external_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
+    let sql = "SELECT object_id FROM external_identities WHERE external_identity_id = ?1";
+    let resolved_object_id: Option<String> = if prepared {
+        transaction
+            .prepare_cached(sql)
+            .and_then(|mut statement| statement.query_row([external_id], |row| row.get(0)))
+    } else {
+        transaction.query_row(sql, [external_id], |row| row.get(0))
+    }
+    .map_err(|source| sqlite_error(database_path, source))?;
     let file_object_id = object_id.or(resolved_object_id.as_deref());
-    transaction
-        .execute(
+    execute_projected(transaction, prepared,
             "INSERT INTO file_refs(file_ref_id, collection_id, logical_path_bytes, logical_path_encoding, logical_path_display, object_id, external_identity_id, identity_state, path_state, created_time_utc_ms, modified_time_utc_ms, observed_size_bytes, first_seen_record_id, last_seen_record_id, removed_record_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', NULL, ?9, ?10, ?11, ?11, NULL)
              ON CONFLICT(file_ref_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, identity_state = excluded.identity_state, path_state = 'active', modified_time_utc_ms = excluded.modified_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes, last_seen_record_id = excluded.last_seen_record_id",
@@ -1911,8 +2048,7 @@ fn project_annex_entry(
             ],
         )
         .map_err(|source| sqlite_error(database_path, source))?;
-    transaction
-        .execute(
+    execute_projected(transaction, prepared,
             "INSERT INTO path_observations(file_ref_id, location_id, observed_path_bytes, observed_path_encoding, observed_path_display, representation, object_id, external_identity_id, state, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, observed_size_bytes, modified_time_utc_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, NULL, ?12, ?13)
              ON CONFLICT(file_ref_id, location_id, observed_path_encoding, observed_path_bytes) DO UPDATE SET representation = excluded.representation, object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, state = excluded.state, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes, modified_time_utc_ms = excluded.modified_time_utc_ms",
@@ -1933,8 +2069,7 @@ fn project_annex_entry(
             ],
         )
         .map_err(|source| sqlite_error(database_path, source))?;
-    transaction
-        .execute(
+    execute_projected(transaction, prepared,
             "INSERT INTO external_availability(external_identity_id, source_repo_id, source_remote_id, state, location_id, observed_time_utc_ms, observed_record_id)
              VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(external_identity_id, source_repo_id, source_remote_id) DO UPDATE SET state = excluded.state, location_id = excluded.location_id, observed_time_utc_ms = excluded.observed_time_utc_ms, observed_record_id = excluded.observed_record_id WHERE excluded.state != 'unknown'",
@@ -1955,8 +2090,7 @@ fn project_annex_entry(
         let state = string(item, "copy_state")?;
         // Inventory contributes only new unknown claims. Reimporting metadata must
         // preserve prior content observations, including confirmed absence.
-        transaction
-            .execute(
+        execute_projected(transaction, prepared,
                 "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding, relative_path_display, object_id, external_identity_id, claim_basis, state, state_origin_id, state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, last_verified_record_id, last_verified_time_utc_ms, last_verification_result, last_error_code, last_error_detail)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?11, ?11, ?12, NULL, NULL, NULL, NULL, NULL, ?13)
                  ON CONFLICT(copy_claim_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, state = excluded.state, state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_error_detail = excluded.last_error_detail, claim_basis = excluded.claim_basis WHERE excluded.claim_basis != 'source_metadata'",
@@ -1965,15 +2099,13 @@ fn project_annex_entry(
             .map_err(|source| sqlite_error(database_path, source))?;
         if let Some(result) = item.get("verification_result").and_then(Value::as_str) {
             let verification_id = format!("verify_{}_{item_index}", record_id);
-            transaction
-                .execute(
+            execute_projected(transaction, prepared,
                     "INSERT INTO verification_results(verification_id, record_id, item_index, job_id, copy_claim_id, object_id, location_id, result, expected_hash_algo, expected_hash_hex, observed_hash_hex, size_bytes, bytes_read, duration_ms, verified_time_utc_ms, path_observed_bytes, path_observed_encoding, path_observed_display, device_fingerprint_status, error_code, error_detail)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'not_checked', ?19, ?20)",
                     params![verification_id, record_id, sql_i64(item_index, "annex item index")?, string(item, "job_id")?, copy_claim_id, object_id, location_id, result, item.get("expected_hash_algo").and_then(Value::as_str), item.get("expected_hash_hex").and_then(Value::as_str), item.get("expected_hash_algo").and_then(Value::as_str).and_then(|algo| item.get(&format!("{algo}_hex"))).and_then(Value::as_str), expected_size, item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex bytes read")).transpose()?, item.get("duration_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex duration")).transpose()?, observed_time, copy_bytes, copy.encoding, copy.display, (result != "ok").then_some("annex_content_error"), item.get("error_detail").and_then(Value::as_str)],
                 )
                 .map_err(|source| sqlite_error(database_path, source))?;
-            transaction
-                .execute(
+            execute_projected(transaction, prepared,
                     "UPDATE copy_claims SET last_verified_record_id = ?2, last_verified_time_utc_ms = ?3, last_verification_result = ?4, last_error_code = ?5 WHERE copy_claim_id = ?1",
                     params![copy_claim_id, record_id, observed_time, result, (result != "ok").then_some("annex_content_error")],
                 )
@@ -3194,6 +3326,325 @@ mod tests {
         assert_eq!(initial, rebuilt);
     }
 
+    fn projection_rows(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let filter = if table == "archive_meta" {
+            " WHERE key NOT IN ('projection_generation', 'policy_input_generation')"
+        } else {
+            ""
+        };
+        let query = format!("SELECT * FROM {table}{filter}");
+        let columns = connection.prepare(&query).unwrap().column_count();
+        let order = (1..=columns)
+            .map(|column| column.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        connection
+            .prepare(&format!("{query} ORDER BY {order}"))
+            .unwrap()
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn append_projection_items(store: &V2OriginStore, items: Vec<Value>) {
+        store
+            .append_batch("projection_test", 1, json!({}), json!({}), items)
+            .unwrap();
+    }
+
+    #[test]
+    fn rebuild_matches_incremental_annex_reimports_and_complete_scan_across_groups() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("archive");
+        initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let live_path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &live_path).unwrap();
+        let live = V2ProjectionDb::open_existing(&live_path).unwrap();
+        let registry = V2Registry::new(&store, &live);
+        registry
+            .record(
+                RegistryChange::Site(
+                    RegistryAction::Register,
+                    SiteSnapshot {
+                        site_id: "site_home".to_owned(),
+                        display_name: "Home".to_owned(),
+                        site_kind: "home".to_owned(),
+                        description: None,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "desktop",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::Collection(
+                    RegistryAction::Register,
+                    CollectionSnapshot {
+                        collection_id: "collection_files".to_owned(),
+                        display_name: "Files".to_owned(),
+                        description: None,
+                        home_site_id: Some("site_home".to_owned()),
+                        policy_id: None,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "desktop",
+            )
+            .unwrap();
+        registry
+            .record(
+                RegistryChange::Location(
+                    RegistryAction::Register,
+                    LocationSnapshot {
+                        location_id: "location_main".to_owned(),
+                        display_name: "Main".to_owned(),
+                        kind: "service".to_owned(),
+                        archive_root_id: None,
+                        relative_path: None,
+                        device_id: None,
+                        site_id: Some("site_home".to_owned()),
+                        encryption_state: Some("unknown".to_owned()),
+                        trust_level: Some("trusted".to_owned()),
+                        expected_availability: "online".to_owned(),
+                        is_writable: true,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "desktop",
+            )
+            .unwrap();
+
+        let entry = |index: usize, operation: &str| {
+            json!({
+                "kind": "annex_entry_observed", "operation_key": operation,
+                "external_identity_id": format!("external_{index}"), "external_key": format!("key_{index}"),
+                "backend": "SHA256E", "expected_hash_algo": "sha256", "expected_hash_hex": "abc",
+                "expected_size_bytes": 4, "resolution_state": "unresolved", "source_repo_id": "repo_main",
+                "file_ref_id": format!("file_{index}"), "collection_id": "collection_files",
+                "logical_path": RegistryPath::utf8(format!("file-{index}")),
+                "worktree_location_id": "location_main", "cas_location_id": "location_main",
+                "representation": "annex_locked_symlink", "path_state": "present",
+                "local_availability": "unknown", "observed_size_bytes": 4,
+                "copy_claim_id": format!("copy_{index}"), "copy_location_id": "location_main",
+                "copy_path": RegistryPath::utf8(format!("file-{index}")), "copy_state": "unknown",
+                "claim_basis": "source_metadata", "job_id": "job_import",
+            })
+        };
+        // More than 64 canonical records, while keeping the fixture tiny.
+        for index in 0..22 {
+            append_projection_items(&store, vec![entry(index, &format!("first_{index}"))]);
+        }
+        let hash = "b".repeat(64);
+        let mut resolved = entry(0, "resolved_0");
+        resolved["object_id"] = json!(format!("blake3:{hash}"));
+        resolved["blake3_hex"] = json!(hash);
+        resolved["sha256_hex"] = json!("c".repeat(64));
+        resolved["sha512_hex"] = json!("d".repeat(128));
+        resolved["resolution_state"] = json!("resolved");
+        resolved["claim_basis"] = json!("observed_bytes");
+        resolved["copy_state"] = json!("present");
+        resolved["local_availability"] = json!("present");
+        resolved["verification_result"] = json!("ok");
+        append_projection_items(&store, vec![resolved]);
+        // Repeated metadata must retain resolved identity and verification facts.
+        append_projection_items(&store, vec![entry(0, "reimport_0")]);
+        append_projection_items(
+            &store,
+            vec![
+                json!({"kind":"scan_started", "scan_id":"scan_full", "job_id":"job_scan",
+                "location_id":"location_main", "collection_id":"collection_files",
+                "scan_mode":"complete", "started_time_utc_ms":1_782_000_000_001_u64,
+                "scope":{}, "exclusions":[]}),
+                json!({"kind":"scan_missing_candidate", "candidate_id":"candidate_one",
+                "scan_id":"scan_full", "candidate_kind":"path", "file_ref_id":"file_1",
+                "copy_claim_id":"copy_1", "location_id":"location_main",
+                "path":RegistryPath::utf8("file-1")}),
+                json!({"kind":"scan_completed", "scan_id":"scan_full", "status":"complete",
+                "finished_time_utc_ms":1_782_000_000_002_u64,
+                "summary":{"missing_paths":1,"files_observed":21,"bytes_observed":84,
+                    "new_paths":0,"changed_paths":0,"confirmed_good":1,
+                    "read_errors":0,"concurrent_changes":0,"traversal_errors":0}}),
+            ],
+        );
+        assert!(live.apply(&store).unwrap().records_applied > 64);
+        let rebuilt_path = archive.join("rebuilt.db");
+        V2ProjectionDb::rebuild(&store, &rebuilt_path).unwrap();
+        let connection = live.open().unwrap();
+        let rebuilt = Connection::open(rebuilt_path).unwrap();
+        let schema = |db: &Connection| {
+            db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+                .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)))
+                .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap()
+        };
+        let expected_schema = schema(&connection);
+        assert_eq!(expected_schema, schema(&rebuilt));
+        for (kind, name, _, _) in expected_schema {
+            if kind == "table" {
+                assert_eq!(
+                    projection_rows(&connection, &name),
+                    projection_rows(&rebuilt, &name),
+                    "table {name}"
+                );
+            }
+        }
+        let state: (String, String, String) = rebuilt.query_row(
+            "SELECT p.state, c.state, p.last_complete_scan_id FROM path_observations p JOIN copy_claims c ON c.copy_claim_id = 'copy_1' WHERE p.file_ref_id = 'file_1'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            state,
+            (
+                "missing".to_owned(),
+                "missing".to_owned(),
+                "scan_full".to_owned()
+            )
+        );
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT identity_state FROM file_refs WHERE file_ref_id='file_0'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "resolved"
+        );
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT last_verification_result FROM copy_claims WHERE copy_claim_id='copy_0'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            rebuilt
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            rebuilt
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_rebuild_group_rolls_back_and_preserves_installed_database() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("archive");
+        initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let installed = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &installed).unwrap();
+        let grouped_path = archive.join("grouped.db");
+        let incremental_path = archive.join("incremental.db");
+        fs::copy(&installed, &grouped_path).unwrap();
+        fs::copy(&installed, &incremental_path).unwrap();
+        for index in 0..23 {
+            append_projection_items(
+                &store,
+                vec![json!({
+                    "kind":"archive_updated", "archive_id":"arc_test",
+                    "archive_display_name":format!("Batch {index}"),
+                    "operation_key":format!("operation_{}", index.min(21)),
+                })],
+            );
+        }
+        let grouped = V2ProjectionDb::open_existing(grouped_path).unwrap();
+        assert!(grouped
+            .apply_with_mode(&store, ReplayMode::Rebuild)
+            .unwrap_err()
+            .to_string()
+            .contains("operation_outcomes.operation_key"));
+        let connection = grouped.open().unwrap();
+        // The first group ends with batch 21's start, at origin sequence 67.
+        // Its chunk and the failing batch are in the rolled-back second group.
+        assert_eq!(
+            count(&connection, grouped.path(), "records", None).unwrap(),
+            67
+        );
+        assert_eq!(
+            meta(&connection, grouped.path(), "archive_display_name").unwrap(),
+            "Batch 20"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT applied_seq FROM projection_origins", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            66
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_outcomes WHERE operation_key='operation_21'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        // The public path still commits each record separately.
+        let incremental = V2ProjectionDb::open_existing(incremental_path).unwrap();
+        assert!(incremental.apply(&store).is_err());
+        let connection = incremental.open().unwrap();
+        assert_eq!(
+            count(&connection, incremental.path(), "records", None).unwrap(),
+            70
+        );
+        assert_eq!(
+            meta(&connection, incremental.path(), "archive_display_name").unwrap(),
+            "Batch 21"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT applied_seq FROM projection_origins", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            69
+        );
+        drop(connection);
+        // Direct construction may retain its failed output, but that file
+        // must never become a usable projection with indexes still deferred.
+        let unfinished_path = archive.join("unfinished.db");
+        assert!(V2ProjectionDb::create_from_store(&store, &unfinished_path).is_err());
+        let unfinished = Connection::open(&unfinished_path).unwrap();
+        assert_eq!(
+            unfinished
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        drop(unfinished);
+        assert!(V2ProjectionDb::open_existing(&unfinished_path)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported SQLite schema 0"));
+        let before = fs::read(&installed).unwrap();
+        assert!(V2ProjectionDb::rebuild(&store, &installed).is_err());
+        assert_eq!(fs::read(&installed).unwrap(), before);
+        assert!(!fs::read_dir(&archive).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".archive-ledger-rebuild-")));
+    }
+
     #[test]
     fn rejects_old_schema() {
         let temp = TempDir::new().unwrap();
@@ -3294,10 +3745,14 @@ mod tests {
                 V2RecordKind::BatchStart => {
                     project_batch_start(&transaction, record, &database_path).unwrap()
                 }
-                V2RecordKind::BatchChunk => {
-                    project_batch_chunk(&transaction, record, &verification_context, &database_path)
-                        .unwrap()
-                }
+                V2RecordKind::BatchChunk => project_batch_chunk(
+                    &transaction,
+                    record,
+                    &verification_context,
+                    &database_path,
+                    false,
+                )
+                .unwrap(),
                 V2RecordKind::BatchComplete => unreachable!(),
             }
             transaction.commit().unwrap();
