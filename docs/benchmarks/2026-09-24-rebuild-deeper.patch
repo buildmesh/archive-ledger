@@ -1,0 +1,391 @@
+--- a/src/v2_projection.rs
++++ b/src/v2_projection.rs
+@@ -590,0 +591,144 @@
++// PRIVATE DISPOSABLE PROTOTYPE: flags affect newly constructed databases only.
++// This is an experiment, not a supported product configuration interface.
++#[derive(Clone, Copy, Default)]
++struct RebuildExperiment {
++    cache64: bool,
++    cache256: bool,
++    group16: bool,
++    group64: bool,
++    prepared: bool,
++    defer: bool,
++    wal: bool,
++    scratch: bool,
++    scratchsync: bool,
++}
++
++impl RebuildExperiment {
++    fn from_environment() -> Result<Self> {
++        let mut options = Self::default();
++        for flag in std::env::var("ARCHIVE_REBUILD_EXPERIMENT")
++            .unwrap_or_default()
++            .split(',')
++            .filter(|flag| !flag.is_empty())
++        {
++            match flag {
++                "cache64" => options.cache64 = true,
++                "cache256" => options.cache256 = true,
++                "group16" => options.group16 = true,
++                "group64" => options.group64 = true,
++                "prepared" => options.prepared = true,
++                "defer" => options.defer = true,
++                "wal" => options.wal = true,
++                "scratch" => options.scratch = true,
++                "scratchsync" => options.scratchsync = true,
++                _ => {
++                    return Err(V2ProjectionError::Invalid(format!(
++                        "unknown private rebuild experiment flag: {flag}"
++                    )))
++                }
++            }
++        }
++        if (options.scratch && options.wal)
++            || (options.scratchsync && options.wal)
++            || (options.scratchsync && options.scratch)
++        {
++            return Err(V2ProjectionError::Invalid(
++                "conflicting private rebuild journal flags: use only one of scratch, scratchsync, wal".to_owned(),
++            ));
++        }
++        if options.cache64 && options.cache256 {
++            return Err(V2ProjectionError::Invalid(
++                "conflicting private rebuild cache flags: cache64 and cache256".to_owned(),
++            ));
++        }
++        if options.group16 && options.group64 {
++            return Err(V2ProjectionError::Invalid(
++                "conflicting private rebuild transaction flags: group16 and group64".to_owned(),
++            ));
++        }
++        Ok(options)
++    }
++
++    // Explicit candidates only: keep every UNIQUE/PK index and the five
++    // nonunique indexes needed by complete-scan replay. Other mixed-history
++    // effects (including FK parent updates) still require benchmarking.
++    fn defer_indexes(self, connection: &Connection, path: &Path) -> Result<Vec<String>> {
++        if !self.defer {
++            return Ok(Vec::new());
++        }
++        let names = [
++            "records_kind_time",
++            "records_batch_dot",
++            "sites_status_name",
++            "policies_status_name",
++            "collections_status_name",
++            "devices_status_name",
++            "archive_roots_status_name",
++            "locations_status_name",
++            "locations_device",
++            "locations_site",
++            "locations_root",
++            "device_mounts_root_time",
++            "device_mounts_device_time",
++            "risk_domains_status_name",
++            "object_hashes_lookup",
++            "file_refs_object",
++            "file_refs_external_identity",
++            "copy_claims_object_state",
++            "copy_claims_external_state",
++            "copy_claims_verification_age",
++            "copy_claims_risk_eligible",
++            "scan_runs_location_finished",
++            "scan_runs_status",
++            "scan_candidates_copy_claim",
++            "job_items_job_status",
++            "annex_imports_location",
++        ];
++        let mut definitions = Vec::with_capacity(names.len());
++        for name in names {
++            let sql: String = connection.query_row(
++                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND sql LIKE 'CREATE INDEX %'",
++                [name], |row| row.get(0),
++            ).map_err(|source| sqlite_error(path, source))?;
++            connection
++                .execute_batch(&format!("DROP INDEX {name};"))
++                .map_err(|source| sqlite_error(path, source))?;
++            definitions.push(sql);
++        }
++        Ok(definitions)
++    }
++
++    fn configure(self, connection: &Connection, path: &Path) -> Result<()> {
++        // Unpublished disposable output only: any replay failure abandons this
++        // database. Never used by public apply or on the installed projection.
++        if self.scratch {
++            connection
++                .execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")
++                .map_err(|source| sqlite_error(path, source))?;
++        }
++        if self.scratchsync {
++            connection
++                .execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = OFF;")
++                .map_err(|source| sqlite_error(path, source))?;
++        }
++        if self.wal {
++            connection
++                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
++                .map_err(|source| sqlite_error(path, source))?;
++        }
++        if self.cache64 || self.cache256 {
++            connection
++                .execute_batch(if self.cache256 {
++                    "PRAGMA cache_size = -262144;"
++                } else {
++                    "PRAGMA cache_size = -65536;"
++                })
++                .map_err(|source| sqlite_error(path, source))?;
++        }
++        if self.prepared {
++            connection.set_prepared_statement_cache_capacity(32);
++        }
++        Ok(())
++    }
++}
++
+@@ -601,0 +746 @@
++        let experiment = RebuildExperiment::from_environment()?;
+@@ -618,0 +764 @@
++        experiment.configure(&connection, path)?;
+@@ -621,0 +768 @@
++        let deferred_indexes = experiment.defer_indexes(&connection, path)?;
+@@ -713,2 +860,16 @@
+-        let applied = database.apply(store)?;
+-        let connection = database.open()?;
++        let applied = database.apply_with_experiment(store, experiment)?;
++        let mut connection = database.open()?;
++        experiment.configure(&connection, path)?;
++        if !deferred_indexes.is_empty() {
++            let transaction = connection
++                .transaction()
++                .map_err(|source| sqlite_error(path, source))?;
++            for definition in deferred_indexes {
++                transaction
++                    .execute_batch(&definition)
++                    .map_err(|source| sqlite_error(path, source))?;
++            }
++            transaction
++                .commit()
++                .map_err(|source| sqlite_error(path, source))?;
++        }
+@@ -716 +877,7 @@
+-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
++            .execute_batch(if experiment.scratch || experiment.scratchsync {
++                "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA optimize;"
++            } else if experiment.wal {
++                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE; PRAGMA optimize;"
++            } else {
++                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;"
++            })
+@@ -717,0 +885,24 @@
++        if experiment.scratch || experiment.scratchsync {
++            let journal_mode: String = connection
++                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
++                .map_err(|source| sqlite_error(path, source))?;
++            let synchronous: i64 = connection
++                .query_row("PRAGMA synchronous", [], |row| row.get(0))
++                .map_err(|source| sqlite_error(path, source))?;
++            if journal_mode != "delete" || synchronous != 2 {
++                return Err(V2ProjectionError::Invalid(format!(
++                    "private rebuild failed to restore durable settings: journal_mode={journal_mode}, synchronous={synchronous}"
++                )));
++            }
++            let foreign_key_violation = connection
++                .prepare("PRAGMA foreign_key_check")
++                .map_err(|source| sqlite_error(path, source))?
++                .query_row([], |_| Ok(()))
++                .optional()
++                .map_err(|source| sqlite_error(path, source))?;
++            if foreign_key_violation.is_some() {
++                return Err(V2ProjectionError::Invalid(
++                    "private rebuild foreign_key_check failed".to_owned(),
++                ));
++            }
++        }
+@@ -727,0 +919,7 @@
++        if experiment.scratch || experiment.scratchsync {
++            // All validation connections are closed before sealing the file.
++            // The outer rebuild additionally syncs before replacing its target.
++            File::open(path)
++                .and_then(|file| file.sync_all())
++                .map_err(|source| io_error(path, source))?;
++        }
+@@ -803,0 +1002,8 @@
++        self.apply_with_experiment(store, RebuildExperiment::default())
++    }
++
++    fn apply_with_experiment(
++        &self,
++        store: &V2OriginStore,
++        experiment: RebuildExperiment,
++    ) -> Result<V2ApplyStats> {
+@@ -804,0 +1011 @@
++        experiment.configure(&connection, &self.path)?;
+@@ -897,0 +1105,9 @@
++        let records_per_transaction = if experiment.group64 {
++            64
++        } else if experiment.group16 {
++            16
++        } else {
++            1
++        };
++        let mut pending_transaction: Option<Transaction<'_>> = None;
++        let mut pending_records = 0;
+@@ -944,4 +1160,7 @@
+-            let transaction = connection
+-                .transaction()
+-                .map_err(|source| sqlite_error(&self.path, source))?;
+-            let inserted = insert_record(&transaction, record, &self.path)?;
++            if pending_transaction.is_none() {
++                pending_transaction = Some(connection
++                    .unchecked_transaction()
++                    .map_err(|source| sqlite_error(&self.path, source))?);
++            }
++            let transaction = pending_transaction.as_ref().expect("started transaction");
++            let inserted = insert_record(transaction, record, &self.path)?;
+@@ -954 +1173 @@
+-                        project_batch_chunk(&transaction, record, context, &self.path)?
++                        project_batch_chunk(&transaction, record, context, &self.path, experiment.prepared)?
+@@ -977,3 +1196,7 @@
+-            transaction
+-                .commit()
+-                .map_err(|source| sqlite_error(&self.path, source))?;
++            pending_records += 1;
++            if pending_records == records_per_transaction {
++                pending_transaction.take().expect("pending transaction")
++                    .commit()
++                    .map_err(|source| sqlite_error(&self.path, source))?;
++                pending_records = 0;
++            }
+@@ -986,0 +1210,9 @@
++        // The visitor streams one record at a time. On visitor error the
++        // transaction is dropped. Durable modes roll back the current group;
++        // scratch mode instead abandons the entire unpublished database.
++        if let Some(transaction) = pending_transaction.take() {
++            transaction
++                .commit()
++                .map_err(|source| sqlite_error(&self.path, source))?;
++        }
++        drop(pending_transaction);
+@@ -1286,0 +1519 @@
++    prepared: bool,
+@@ -1406 +1639 @@
+-                project_annex_entry(transaction, item, record, item_index, path)?;
++                project_annex_entry(transaction, item, record, item_index, path, prepared)?;
+@@ -1419 +1652 @@
+-        project_operation_outcome(transaction, item, record, item_index, path)?;
++        project_operation_outcome(transaction, item, record, item_index, path, prepared)?;
+@@ -1736,0 +1970,14 @@
++// Private experiment helper: identical SQL and parameter bindings in both paths.
++fn execute_projected<P: rusqlite::Params>(
++    transaction: &Transaction<'_>,
++    prepared: bool,
++    sql: &str,
++    parameters: P,
++) -> rusqlite::Result<usize> {
++    if prepared {
++        transaction.prepare_cached(sql)?.execute(parameters)
++    } else {
++        transaction.execute(sql, parameters)
++    }
++}
++
+@@ -1742,0 +1990 @@
++    prepared: bool,
+@@ -1747,3 +1995,4 @@
+-    transaction
+-        .execute(
+-            "INSERT INTO operation_outcomes(operation_key, record_id, item_index)
++    execute_projected(
++        transaction,
++        prepared,
++        "INSERT INTO operation_outcomes(operation_key, record_id, item_index)
+@@ -1751,7 +2000,7 @@
+-            params![
+-                operation_key,
+-                record.record.envelope.record_id,
+-                sql_i64(item_index, "operation item index")?,
+-            ],
+-        )
+-        .map_err(|source| sqlite_error(database_path, source))?;
++        params![
++            operation_key,
++            record.record.envelope.record_id,
++            sql_i64(item_index, "operation item index")?,
++        ],
++    )
++    .map_err(|source| sqlite_error(database_path, source))?;
+@@ -1802,0 +2052 @@
++    prepared: bool,
+@@ -1813,2 +2063 @@
+-    transaction
+-        .execute(
++    execute_projected(transaction, prepared,
+@@ -1849,2 +2098 @@
+-        transaction
+-            .execute(
++        execute_projected(transaction, prepared,
+@@ -1861,2 +2109 @@
+-                transaction
+-                    .execute(
++                execute_projected(transaction, prepared,
+@@ -1869,2 +2116 @@
+-        transaction
+-            .execute(
++        execute_projected(transaction, prepared,
+@@ -1886,7 +2132,9 @@
+-    let resolved_object_id: Option<String> = transaction
+-        .query_row(
+-            "SELECT object_id FROM external_identities WHERE external_identity_id = ?1",
+-            [external_id],
+-            |row| row.get(0),
+-        )
+-        .map_err(|source| sqlite_error(database_path, source))?;
++    let sql = "SELECT object_id FROM external_identities WHERE external_identity_id = ?1";
++    let resolved_object_id: Option<String> = if prepared {
++        transaction
++            .prepare_cached(sql)
++            .and_then(|mut statement| statement.query_row([external_id], |row| row.get(0)))
++    } else {
++        transaction.query_row(sql, [external_id], |row| row.get(0))
++    }
++    .map_err(|source| sqlite_error(database_path, source))?;
+@@ -1894,2 +2142 @@
+-    transaction
+-        .execute(
++    execute_projected(transaction, prepared,
+@@ -1914,2 +2161 @@
+-    transaction
+-        .execute(
++    execute_projected(transaction, prepared,
+@@ -1936,2 +2182 @@
+-    transaction
+-        .execute(
++    execute_projected(transaction, prepared,
+@@ -1958,2 +2203 @@
+-        transaction
+-            .execute(
++        execute_projected(transaction, prepared,
+@@ -1968,2 +2212 @@
+-            transaction
+-                .execute(
++            execute_projected(transaction, prepared,
+@@ -1975,2 +2218 @@
+-            transaction
+-                .execute(
++            execute_projected(transaction, prepared,
+@@ -3297,4 +3539,8 @@
+-                V2RecordKind::BatchChunk => {
+-                    project_batch_chunk(&transaction, record, &verification_context, &database_path)
+-                        .unwrap()
+-                }
++                V2RecordKind::BatchChunk => project_batch_chunk(
++                    &transaction,
++                    record,
++                    &verification_context,
++                    &database_path,
++                    false,
++                )
++                .unwrap(),
