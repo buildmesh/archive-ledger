@@ -25,6 +25,9 @@ use crate::v2_store::{V2AppendResult, V2OriginStore, V2StoreError};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+mod recovery_tests;
+
 pub type Result<T> = std::result::Result<T, V2InventoryError>;
 
 #[derive(Debug, Error)]
@@ -80,6 +83,7 @@ pub struct V2InventoryConfig {
     pub job_id: String,
     pub scan_id: String,
     pub scan_mode: ScanMode,
+    pub batch_entries: usize,
     pub max_items: Option<usize>,
 }
 
@@ -294,9 +298,7 @@ pub fn add_files(
     };
     let job_root = job.path().to_path_buf();
     let config_path = job_root.join("inventory-config.json");
-    let spool_path = job_root.join("inventory-items.jsonl");
     let seen_path = job_root.join("inventory-seen.sqlite3");
-    let summary_path = job_root.join("inventory-summary.json");
     let config_value = json!({
         "root_path": RegistryPath::from_path(&config.root_path),
         "location_prefix": config.location_prefix.as_deref().map(RegistryPath::from_path),
@@ -307,6 +309,7 @@ pub fn add_files(
         "device_fingerprint_status": config.device_fingerprint_status,
         "scan_id": config.scan_id,
         "scan_mode": config.scan_mode.as_str(),
+        "batch_entries": config.batch_entries,
     });
     let connection =
         Connection::open(projection.path()).map_err(|source| V2InventoryError::Sqlite {
@@ -363,11 +366,13 @@ pub fn add_files(
     let existing_config = job
         .read_optional("inventory-config.json")
         .map_err(|source| io_error("read inventory job configuration", &config_path, source))?;
-    let new_job = existing_config.is_none();
+    job.verify_safe_entries(&["inventory-summary.json", "inventory-summary.json.tmp"])
+        .map_err(|source| io_error("verify legacy inventory summary", &job_root, source))?;
     if let Some(bytes) = existing_config {
-        let existing: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut existing: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             V2InventoryError::Invalid(format!("inventory job configuration is invalid: {error}"))
         })?;
+        default_inventory_batch_entries(&mut existing);
         if existing != config_value {
             return Err(V2InventoryError::Invalid(format!(
                 "job {} belongs to different immutable inputs",
@@ -414,19 +419,15 @@ pub fn add_files(
             path: projection.path().to_path_buf(),
             source,
         })?;
-    if actual.0 != job_type || actual.1 != config.scan_id || actual.2 != params_text {
+    let mut actual_params: serde_json::Value = serde_json::from_str(&actual.2)
+        .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
+    default_inventory_batch_entries(&mut actual_params);
+    if actual.0 != job_type || actual.1 != config.scan_id || actual_params != config_value {
         return Err(V2InventoryError::Invalid(format!(
             "job {} belongs to different immutable inputs",
             config.job_id
         )));
     }
-    let spool_file = job
-        .open_append("inventory-items.jsonl")
-        .map_err(|source| io_error("open inventory spool", &spool_path, source))?;
-    let mut spool = SpoolGuard {
-        path: spool_path.clone(),
-        writer: Some(BufWriter::new(spool_file)),
-    };
     let seen_names = [
         "inventory-seen.sqlite3",
         "inventory-seen.sqlite3-wal",
@@ -451,12 +452,11 @@ pub fn add_files(
              path_bytes BLOB NOT NULL,
              PRIMARY KEY(path_encoding, path_bytes)
          ) WITHOUT ROWID;
-         CREATE TABLE IF NOT EXISTS ignored_entries(
-             entry_kind TEXT NOT NULL,
-             path_encoding TEXT NOT NULL,
-             path_bytes BLOB NOT NULL,
-             PRIMARY KEY(entry_kind, path_encoding, path_bytes)
-         ) WITHOUT ROWID;",
+         CREATE TABLE IF NOT EXISTS inventory_checkpoint(
+             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+             spool_bytes INTEGER NOT NULL CHECK(spool_bytes >= 0),
+             summary_json TEXT NOT NULL
+         );",
     )
     .map_err(|source| V2InventoryError::Sqlite {
         path: seen_path.clone(),
@@ -464,7 +464,14 @@ pub fn add_files(
     })?;
     job.verify_safe_entries(&seen_names)
         .map_err(|source| io_error("verify inventory job database", &seen_path, source))?;
-    recover_seen_from_spool(&job, &spool_path, &seen, &seen_path)?;
+    let (mut summary, new_job, mut spool) = recover_inventory_checkpoint(&job, &seen, &seen_path)?;
+    // Persist the spool/database entries and the local/jobs/<id> directory
+    // chain, including jobs created for the first time on this installation.
+    for directory in job_root.ancestors().take(4) {
+        File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| io_error("sync inventory job directory", directory, source))?;
+    }
     seen.execute_batch("BEGIN IMMEDIATE")
         .map_err(|source| V2InventoryError::Sqlite {
             path: seen_path.clone(),
@@ -573,29 +580,24 @@ pub fn add_files(
             path: seen_path.clone(),
             source,
         })?;
-    let mut record_ignored = seen
-        .prepare(
-            "INSERT OR IGNORE INTO ignored_entries(entry_kind, path_encoding, path_bytes)
-             VALUES (?1, ?2, ?3)",
-        )
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.clone(),
-            source,
-        })?;
-    let mut summary: V2InventorySummary = job
-        .read_optional("inventory-summary.json")
-        .map_err(|source| io_error("read inventory job summary", &summary_path, source))?
-        .map(|bytes| {
-            serde_json::from_slice(&bytes).map_err(|error| {
-                V2InventoryError::Invalid(format!("inventory job summary is invalid: {error}"))
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
+    // These counters belong to this traversal, not to checkpointed file decisions.
+    let mut walk_summary = V2InventorySummary::default();
     let mut processed_this_run = 0_usize;
+    let mut checkpointed_items = 0_usize;
     let mut interrupted = false;
+    checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
+    seen.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
     let discovery = FileDiscovery::with_exclusions(&config.root_path, config.exclusions.clone())?;
     for discovered in discovery {
+        // Check at the next iteration so every branch (including nonspooled
+        // outcomes and early continues) checkpoints its complete decision.
+        if processed_this_run - checkpointed_items >= config.batch_entries {
+            checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
+            seen.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+            checkpointed_items = processed_this_run;
+        }
         match discovered {
             DiscoveryItem::File(file) => {
                 let relative = raw_relative_path(&file.relative_path)?;
@@ -835,19 +837,7 @@ pub fn add_files(
                 let logical_path = prefixed_path(config.logical_prefix.as_deref(), &relative);
                 let logical_encoded = encode_relative_path(&logical_path);
                 if !annex_imported {
-                    let inserted = record_ignored
-                        .execute(params![
-                            "symlink",
-                            logical_encoded.encoding.as_str(),
-                            logical_encoded.bytes,
-                        ])
-                        .map_err(|source| V2InventoryError::Sqlite {
-                            path: seen_path.clone(),
-                            source,
-                        })?;
-                    if inserted > 0 {
-                        summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
-                    }
+                    walk_summary.ignored_symlinks = walk_summary.ignored_symlinks.saturating_add(1);
                     continue;
                 }
                 let was_seen: bool = already_seen
@@ -982,41 +972,39 @@ pub fn add_files(
                 }
             }
             DiscoveryItem::Special(_) => {
-                summary.ignored_special_files = summary.ignored_special_files.saturating_add(1)
+                walk_summary.ignored_special_files =
+                    walk_summary.ignored_special_files.saturating_add(1)
             }
             DiscoveryItem::Excluded(_) => {
-                summary.excluded_subtrees = summary.excluded_subtrees.saturating_add(1)
+                walk_summary.excluded_subtrees = walk_summary.excluded_subtrees.saturating_add(1)
             }
             DiscoveryItem::FilesystemBoundary(_) => {
-                summary.filesystem_boundaries = summary.filesystem_boundaries.saturating_add(1)
+                walk_summary.filesystem_boundaries =
+                    walk_summary.filesystem_boundaries.saturating_add(1)
             }
             DiscoveryItem::ConcurrentChange(_) => {
-                summary.concurrent_changes = summary.concurrent_changes.saturating_add(1)
+                walk_summary.concurrent_changes = walk_summary.concurrent_changes.saturating_add(1)
             }
             DiscoveryItem::Error { .. } => {
-                summary.traversal_errors = summary.traversal_errors.saturating_add(1)
+                walk_summary.traversal_errors = walk_summary.traversal_errors.saturating_add(1)
             }
         }
     }
     drop(known);
     drop(record_seen);
     drop(already_seen);
-    drop(record_ignored);
-    spool.sync()?;
-    seen.execute_batch("COMMIT")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.clone(),
-            source,
-        })?;
+    checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
+    summary.ignored_symlinks = summary
+        .ignored_symlinks
+        .saturating_add(walk_summary.ignored_symlinks);
+    summary.ignored_special_files = walk_summary.ignored_special_files;
+    summary.excluded_subtrees = walk_summary.excluded_subtrees;
+    summary.filesystem_boundaries = walk_summary.filesystem_boundaries;
+    summary.concurrent_changes = summary
+        .concurrent_changes
+        .saturating_add(walk_summary.concurrent_changes);
+    summary.traversal_errors = walk_summary.traversal_errors;
     if interrupted {
-        let summary_bytes = serde_json::to_vec(&summary)
-            .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
-        job.replace(
-            "inventory-summary.json",
-            "inventory-summary.json.tmp",
-            &summary_bytes,
-        )
-        .map_err(|source| io_error("write inventory job summary", &summary_path, source))?;
         connection
             .execute(
                 "UPDATE jobs SET progress_json = ?2 WHERE job_id = ?1",
@@ -1229,7 +1217,18 @@ pub fn add_files(
     })
 }
 
+fn default_inventory_batch_entries(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.entry("batch_entries").or_insert(json!(1_000));
+    }
+}
+
 fn validate_config(config: &V2InventoryConfig) -> Result<()> {
+    if config.batch_entries == 0 {
+        return Err(V2InventoryError::Invalid(
+            "batch_entries must be positive".to_owned(),
+        ));
+    }
     if config.collection_id.is_empty()
         || config.location_id.is_empty()
         || config.scan_id.is_empty()
@@ -1763,72 +1762,132 @@ fn now_utc_ms() -> Result<u64> {
         .map_err(|_| V2InventoryError::Invalid("system time exceeds u64 milliseconds".to_owned()))
 }
 
-fn recover_seen_from_spool(
-    job: &JobDirectory,
-    spool_path: &Path,
+fn inventory_sqlite_error(path: &Path, source: rusqlite::Error) -> V2InventoryError {
+    V2InventoryError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// The index, including decisions with no canonical outcome, and its summary
+/// share one SQLite commit. The spool must be durable before that commit.
+fn checkpoint_inventory(
+    spool: &mut SpoolGuard,
     seen: &Connection,
     seen_path: &Path,
+    summary: &V2InventorySummary,
 ) -> Result<()> {
-    let Some(spool) = job
-        .open_read_optional("inventory-items.jsonl")
-        .map_err(|source| io_error("open inventory spool for recovery", spool_path, source))?
-    else {
-        return Ok(());
-    };
-    let reader = BufReader::new(spool);
-    seen.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.to_path_buf(),
-            source,
+    spool.sync()?;
+    let spool_bytes = spool
+        .writer_mut()?
+        .get_ref()
+        .metadata()
+        .map_err(|source| io_error("measure inventory spool", &spool.path, source))?
+        .len();
+    let summary_json = serde_json::to_string(summary)
+        .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
+    let spool_bytes = i64::try_from(spool_bytes).map_err(|_| {
+        V2InventoryError::Invalid("inventory spool exceeds SQLite size range".to_owned())
+    })?;
+    seen.execute(
+        "INSERT INTO inventory_checkpoint(singleton, spool_bytes, summary_json) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET spool_bytes = excluded.spool_bytes,
+             summary_json = excluded.summary_json",
+        params![spool_bytes, summary_json],
+    )
+    .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    seen.execute_batch("COMMIT")
+        .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    Ok(())
+}
+
+fn recover_inventory_checkpoint(
+    job: &JobDirectory,
+    seen: &Connection,
+    seen_path: &Path,
+) -> Result<(V2InventorySummary, bool, SpoolGuard)> {
+    let checkpoint: Option<(i64, String)> = seen
+        .query_row(
+            "SELECT spool_bytes, summary_json FROM inventory_checkpoint WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    let spool_path = job.path().join("inventory-items.jsonl");
+    let new_job = checkpoint.is_none();
+    let (spool_bytes, summary) = if let Some((spool_bytes, summary_json)) = checkpoint {
+        let spool_bytes = u64::try_from(spool_bytes).map_err(|_| {
+            V2InventoryError::Invalid("inventory checkpoint has a negative spool size".to_owned())
         })?;
-    let mut insert = seen
-        .prepare("INSERT OR IGNORE INTO seen(path_encoding, path_bytes) VALUES (?1, ?2)")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.to_path_buf(),
-            source,
+        let summary = serde_json::from_str(&summary_json).map_err(|error| {
+            V2InventoryError::Invalid(format!("inventory checkpoint summary is invalid: {error}"))
         })?;
-    for line in reader.lines() {
-        let line = line
-            .map_err(|source| io_error("read inventory spool for recovery", spool_path, source))?;
-        if line.trim().is_empty() {
-            continue;
+        let file = job
+            .open_read_optional("inventory-items.jsonl")
+            .map_err(|source| io_error("open inventory spool for recovery", &spool_path, source))?
+            .ok_or_else(|| {
+                V2InventoryError::Invalid("checkpointed inventory spool is missing".to_owned())
+            })?;
+        if file
+            .metadata()
+            .map_err(|source| io_error("measure inventory spool", &spool_path, source))?
+            .len()
+            < spool_bytes
+        {
+            return Err(V2InventoryError::Invalid(
+                "inventory spool is shorter than its checkpoint".to_owned(),
+            ));
         }
-        let item: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
-            V2InventoryError::Invalid(format!(
-                "inventory recovery spool contains invalid JSON: {error}"
-            ))
-        })?;
-        if !matches!(
-            item.get("kind").and_then(serde_json::Value::as_str),
-            Some("content_observed" | "copy_verification_failed")
-        ) {
-            continue;
-        }
-        let path: RegistryPath =
-            serde_json::from_value(item.get("logical_path").cloned().ok_or_else(|| {
-                V2InventoryError::Invalid("content observation lacks a logical path".to_owned())
-            })?)
-            .map_err(|error| {
+        // Validate only the committed prefix before modifying anything. Even a
+        // syntactically valid tail is uncommitted and must be discarded.
+        let mut reader = BufReader::new(file.take(spool_bytes));
+        let mut line = Vec::new();
+        while reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| io_error("read inventory spool for recovery", &spool_path, source))?
+            > 0
+        {
+            if line.last() != Some(&b'\n') {
+                return Err(V2InventoryError::Invalid(
+                    "inventory checkpoint ends inside a spool record".to_owned(),
+                ));
+            }
+            serde_json::from_slice::<serde_json::Value>(&line).map_err(|error| {
                 V2InventoryError::Invalid(format!(
-                    "content observation logical path is invalid: {error}"
+                    "inventory checkpoint spool contains invalid JSON: {error}"
                 ))
             })?;
-        let bytes = crate::registry::registry_path_bytes(&path)
-            .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
-        insert
-            .execute(params![path.encoding, bytes])
-            .map_err(|source| V2InventoryError::Sqlite {
-                path: seen_path.to_path_buf(),
-                source,
-            })?;
-    }
-    drop(insert);
-    seen.execute_batch("COMMIT")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.to_path_buf(),
+            line.clear();
+        }
+        (spool_bytes, summary)
+    } else {
+        // Before the first checkpoint (or upgrading a legacy unpublished job),
+        // there is no consistent durable progress to adopt. Re-enumerate it.
+        (0, V2InventorySummary::default())
+    };
+    let file = job
+        .open_append("inventory-items.jsonl")
+        .map_err(|source| io_error("open inventory spool", &spool_path, source))?;
+    file.set_len(spool_bytes).map_err(|source| {
+        io_error(
+            "truncate uncheckpointed inventory spool",
+            &spool_path,
             source,
-        })?;
-    Ok(())
+        )
+    })?;
+    if new_job {
+        seen.execute("DELETE FROM seen", [])
+            .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    }
+    Ok((
+        summary,
+        new_job,
+        SpoolGuard {
+            path: spool_path,
+            writer: Some(BufWriter::new(file)),
+        },
+    ))
 }
 
 struct SpoolGuard {

@@ -1024,6 +1024,7 @@ struct CollectionAddArgs {
     job_id: Option<String>,
     #[arg(long)]
     scan_id: Option<String>,
+    /// Checkpoint local progress after this many processed entries.
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long, hide = true)]
@@ -1046,6 +1047,7 @@ struct LocationScanArgs {
     job_id: Option<String>,
     #[arg(long)]
     scan_id: Option<String>,
+    /// Checkpoint local progress after this many processed entries.
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long, hide = true)]
@@ -8875,7 +8877,7 @@ fn execute_v2_job(
                             exclusions: job_registry_paths(&job.params, "exclusions")?,
                             job_id: Some(job.job_id),
                             scan_id: Some(job.input_version),
-                            batch_entries: 1_000,
+                            batch_entries: inventory_job_batch_entries(&job.params)?,
                             max_items: *max_items,
                         },
                     )?;
@@ -8891,7 +8893,7 @@ fn execute_v2_job(
                             exclusions: job_registry_paths(&job.params, "exclusions")?,
                             job_id: Some(job.job_id),
                             scan_id: Some(job.input_version),
-                            batch_entries: 1_000,
+                            batch_entries: inventory_job_batch_entries(&job.params)?,
                             max_items: *max_items,
                         },
                     )?;
@@ -9871,6 +9873,17 @@ fn job_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> 
     .map_err(AppError::Json)
 }
 
+fn inventory_job_batch_entries(params: &serde_json::Value) -> Result<usize, AppError> {
+    match params.get("batch_entries") {
+        None => Ok(1_000), // Jobs created before scan checkpoints.
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| AppError::Input("inventory job has invalid batch_entries".to_owned())),
+    }
+}
+
 fn job_registry_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> {
     let path: RegistryPath = serde_json::from_value(
         params
@@ -10351,6 +10364,7 @@ fn execute_v2_collection_add(
                 .clone()
                 .unwrap_or_else(|| format!("scan_{suffix}")),
             scan_mode: ScanMode::Add,
+            batch_entries: args.batch_entries,
             max_items: args.max_items,
         },
     )?;
@@ -10524,6 +10538,7 @@ fn execute_v2_location_scan(
                 .clone()
                 .unwrap_or_else(|| format!("scan_{suffix}")),
             scan_mode: ScanMode::Complete,
+            batch_entries: args.batch_entries,
             max_items: args.max_items,
         },
     )?;

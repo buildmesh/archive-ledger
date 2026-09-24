@@ -530,6 +530,17 @@ not separate physical event envelopes.
 
 ### Scans
 
+The current scanner spools outcomes locally until final publication. Its local
+SQLite seen index also stores the committed spool byte length and file-outcome
+summary. Each checkpoint first flushes and syncs the spool, then commits the
+index and checkpoint together in one SQLite transaction. This includes processed
+entries that emitted no canonical item, such as unreadable files. Resume
+validates the committed JSONL prefix and truncates everything after its boundary;
+SQLite recovery restores the matching seen index and counters. Walk-only counts
+are recomputed during enumeration. A finalization interrupted before canonical
+publication regenerates missing candidates and completion items from that
+checkpoint; canonical completion is reconciled before local recovery.
+
 - `scan_started` records the collection, location, optional logical-path prefix,
   resolved root/device identity, filesystem-boundary rule, traversal version,
   normalized exclusion rules and fingerprint, and mode `add` or `complete`. At

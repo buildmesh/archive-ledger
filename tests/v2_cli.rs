@@ -1096,6 +1096,315 @@ mod unix {
         assert_eq!(events["segments"], 9);
     }
 
+    fn inventory_checkpoint_fixture() -> (TempDir, PathBuf) {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let content = temp.path().join("content/files");
+        fs::create_dir_all(content.join("excluded/nested")).unwrap();
+        fs::write(content.join("excluded/nested/hidden.txt"), b"excluded").unwrap();
+        symlink("first.txt", content.join("alias.txt")).unwrap();
+        // A socket is a special file that discovery must count without reading.
+        let socket = UnixListener::bind(content.join("special.sock")).unwrap();
+        drop(socket);
+        fs::write(content.join("first.txt"), b"first\n").unwrap();
+        fs::create_dir(content.join("nested")).unwrap();
+        fs::write(content.join("nested/second.txt"), b"second\n").unwrap();
+        fs::write(content.join("third.txt"), b"third\n").unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            content.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        (temp, content)
+    }
+
+    fn inventory_checkpoint_scan(temp: &TempDir, content: &Path, pause: bool) -> Value {
+        let mut command = archive(temp);
+        command.args([
+            "--json",
+            "location",
+            "scan",
+            "--path",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--exclude",
+            "excluded",
+            "--job-id",
+            "job_inventory_checkpoint",
+            "--scan-id",
+            "scan_inventory_checkpoint",
+            "--batch-entries",
+            "2",
+        ]);
+        if pause {
+            command.args(["--max-items", "1"]);
+        }
+        json(&success(&mut command))
+    }
+
+    fn inventory_checkpoint(job_root: &Path) -> (i64, String) {
+        let connection =
+            rusqlite::Connection::open(job_root.join("inventory-seen.sqlite3")).unwrap();
+        connection
+            .query_row(
+                "SELECT spool_bytes, summary_json FROM inventory_checkpoint WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn inventory_checkpoint_discards_uncommitted_tail_and_preserves_scan_summary() {
+        let (baseline_temp, baseline_content) = inventory_checkpoint_fixture();
+        let uninterrupted = inventory_checkpoint_scan(&baseline_temp, &baseline_content, false);
+        assert_eq!(uninterrupted["status"], "complete");
+        assert_eq!(uninterrupted["summary"]["files_observed"], 3);
+        assert_eq!(uninterrupted["summary"]["ignored_symlinks"], 1);
+        assert_eq!(uninterrupted["summary"]["ignored_special_files"], 1);
+        assert!(
+            uninterrupted["summary"]["excluded_subtrees"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+
+        let (temp, content) = inventory_checkpoint_fixture();
+        let paused = inventory_checkpoint_scan(&temp, &content, true);
+        assert_eq!(paused["status"], "running");
+        assert_eq!(paused["summary"]["files_observed"], 1);
+        let job_root = root(&temp).join("local/jobs/job_inventory_checkpoint");
+        let spool_path = job_root.join("inventory-items.jsonl");
+        let committed_spool = fs::read(&spool_path).unwrap();
+        let checkpoint = inventory_checkpoint(&job_root);
+        assert_eq!(checkpoint.0 as u64, committed_spool.len() as u64);
+        assert!(checkpoint.0 > 0);
+        assert!(serde_json::from_str::<Value>(&checkpoint.1)
+            .unwrap()
+            .is_object());
+        let config: Value =
+            serde_json::from_slice(&fs::read(job_root.join("inventory-config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["batch_entries"], 2);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let params: String = database
+            .query_row(
+                "SELECT params_json FROM jobs WHERE job_id = 'job_inventory_checkpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&params).unwrap()["batch_entries"],
+            2
+        );
+        drop(database);
+
+        let mut spool = fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
+        // Both a whole uncommitted record and a torn final record must disappear.
+        // Keeping the first line would make canonical publication invalid.
+        spool
+            .write_all(b"{\"kind\":\"must_not_be_published\"}\n{\"kind\":")
+            .unwrap();
+        spool.sync_all().unwrap();
+        drop(spool);
+        let resumed = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            "job_inventory_checkpoint",
+        ])));
+        assert_eq!(resumed["status"], "complete");
+        assert_eq!(resumed["summary"], uninterrupted["summary"]);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let file_count: i64 = database
+            .query_row("SELECT COUNT(*) FROM file_refs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(file_count, 3);
+        drop(database);
+        success(archive(&temp).args(["db", "rebuild"]));
+        success(archive(&temp).args(["fsck"]));
+    }
+
+    #[test]
+    fn inventory_checkpoint_upgrades_legacy_paused_job_by_reenumerating_unpublished_work() {
+        let (baseline_temp, baseline_content) = inventory_checkpoint_fixture();
+        let uninterrupted = inventory_checkpoint_scan(&baseline_temp, &baseline_content, false);
+        let (temp, content) = inventory_checkpoint_fixture();
+        let paused = inventory_checkpoint_scan(&temp, &content, true);
+        assert_eq!(paused["status"], "running");
+        let job_root = root(&temp).join("local/jobs/job_inventory_checkpoint");
+        let seen = rusqlite::Connection::open(job_root.join("inventory-seen.sqlite3")).unwrap();
+        let seen_count: i64 = seen
+            .query_row("SELECT COUNT(*) FROM seen", [], |row| row.get(0))
+            .unwrap();
+        assert!(seen_count > 0);
+        seen.execute_batch("DROP TABLE inventory_checkpoint")
+            .unwrap();
+        drop(seen);
+        let config_path = job_root.join("inventory-config.json");
+        let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config.as_object_mut().unwrap().remove("batch_entries");
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let params: String = database
+            .query_row(
+                "SELECT params_json FROM jobs WHERE job_id = 'job_inventory_checkpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut params: Value = serde_json::from_str(&params).unwrap();
+        params.as_object_mut().unwrap().remove("batch_entries");
+        database
+            .execute(
+                "UPDATE jobs SET params_json = ?1 WHERE job_id = 'job_inventory_checkpoint'",
+                [serde_json::to_string(&params).unwrap()],
+            )
+            .unwrap();
+        drop(database);
+        fs::write(
+            job_root.join("inventory-summary.json"),
+            serde_json::to_vec(&paused["summary"]).unwrap(),
+        )
+        .unwrap();
+        let mut spool = fs::OpenOptions::new()
+            .append(true)
+            .open(job_root.join("inventory-items.jsonl"))
+            .unwrap();
+        spool.write_all(b"{\"kind\":").unwrap();
+        spool.sync_all().unwrap();
+        drop(spool);
+
+        let resumed = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            "job_inventory_checkpoint",
+        ])));
+        assert_eq!(resumed["status"], "complete");
+        assert_eq!(resumed["summary"], uninterrupted["summary"]);
+        // Rebuild reads the replacement job_started item, including the default
+        // interval used when the legacy job had no persisted batch setting.
+        success(archive(&temp).args(["db", "rebuild"]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let file_count: i64 = database
+            .query_row("SELECT COUNT(*) FROM file_refs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(file_count, 3);
+        let params: String = database
+            .query_row(
+                "SELECT params_json FROM jobs WHERE job_id = 'job_inventory_checkpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&params).unwrap()["batch_entries"],
+            1_000
+        );
+    }
+
+    #[test]
+    fn inventory_checkpoint_refuses_corrupt_missing_or_truncated_committed_spool() {
+        for damage in ["invalid_json", "missing_newline", "missing", "truncated"] {
+            let (temp, content) = inventory_checkpoint_fixture();
+            let paused = inventory_checkpoint_scan(&temp, &content, true);
+            assert_eq!(paused["status"], "running");
+            let job_root = root(&temp).join("local/jobs/job_inventory_checkpoint");
+            let spool_path = job_root.join("inventory-items.jsonl");
+            let original = fs::read(&spool_path).unwrap();
+            let checkpoint_before = inventory_checkpoint(&job_root);
+            assert_eq!(checkpoint_before.0 as usize, original.len());
+            assert!(!original.is_empty());
+            let mut damaged = original.clone();
+            match damage {
+                "invalid_json" => damaged[0] = b'!',
+                "missing_newline" => *damaged.last_mut().unwrap() = b' ',
+                "missing" => fs::remove_file(&spool_path).unwrap(),
+                "truncated" => damaged.truncate(original.len() / 2),
+                _ => unreachable!(),
+            }
+            if damage != "missing" {
+                fs::write(&spool_path, &damaged).unwrap();
+            }
+            let head_path = root(&temp).join("canonical/frontiers/v2/HEAD");
+            let head_before = fs::read(&head_path).unwrap();
+            let projection_frontiers = || {
+                let connection =
+                    rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+                connection
+                    .query_row(
+                        "SELECT (SELECT value FROM archive_meta WHERE key = 'accepted_frontier_hash'),
+                                (SELECT value FROM archive_meta WHERE key = 'applied_frontier_hash')",
+                        [],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .unwrap()
+            };
+            let projection_before = projection_frontiers();
+            let events_before = json(&success(
+                archive(&temp).args(["--json", "events", "verify"]),
+            ));
+            let output = archive(&temp)
+                .args(["--json", "job", "resume", "job_inventory_checkpoint"])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "accepted {damage} committed spool"
+            );
+            assert_eq!(fs::read(&head_path).unwrap(), head_before, "{damage}");
+            assert_eq!(projection_frontiers(), projection_before, "{damage}");
+            assert_eq!(
+                inventory_checkpoint(&job_root),
+                checkpoint_before,
+                "{damage}"
+            );
+            if damage == "missing" {
+                assert!(!spool_path.exists(), "recreated missing committed spool");
+            } else {
+                assert_eq!(fs::read(&spool_path).unwrap(), damaged, "{damage}");
+            }
+            let events_after = json(&success(
+                archive(&temp).args(["--json", "events", "verify"]),
+            ));
+            assert_eq!(events_after, events_before, "{damage}");
+
+            // Restoring the exact checkpoint bytes makes the same job resumable.
+            fs::write(&spool_path, &original).unwrap();
+            let resumed = json(&success(archive(&temp).args([
+                "--json",
+                "job",
+                "resume",
+                "job_inventory_checkpoint",
+            ])));
+            assert_eq!(resumed["status"], "complete");
+            assert_eq!(resumed["summary"]["files_observed"], 3);
+        }
+    }
+
     #[test]
     fn collection_add_hashes_regular_files_ignores_symlinks_and_rebuilds() {
         use std::os::unix::fs::symlink;
@@ -1159,7 +1468,6 @@ mod unix {
             "inventory-items.jsonl",
             "inventory-seen.sqlite3",
             "inventory-seen.sqlite3-wal",
-            "inventory-summary.json",
         ] {
             assert_job_resume_refuses_symlink(&temp, "job_inventory_resume", name);
         }
