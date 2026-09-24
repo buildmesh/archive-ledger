@@ -1,0 +1,179 @@
+--- a/src/v2_projection.rs
++++ b/src/v2_projection.rs
+@@ -590,0 +591,97 @@
++// PRIVATE DISPOSABLE PROTOTYPE: flags affect newly constructed databases only.
++// This is an experiment, not a supported product configuration interface.
++#[derive(Clone, Copy, Default)]
++struct RebuildExperiment {
++    cache64: bool,
++    group16: bool,
++    defer: bool,
++    wal: bool,
++}
++
++impl RebuildExperiment {
++    fn from_environment() -> Result<Self> {
++        let mut options = Self::default();
++        for flag in std::env::var("ARCHIVE_REBUILD_EXPERIMENT")
++            .unwrap_or_default()
++            .split(',')
++            .filter(|flag| !flag.is_empty())
++        {
++            match flag {
++                "cache64" => options.cache64 = true,
++                "group16" => options.group16 = true,
++                "defer" => options.defer = true,
++                "wal" => options.wal = true,
++                _ => {
++                    return Err(V2ProjectionError::Invalid(format!(
++                        "unknown private rebuild experiment flag: {flag}"
++                    )))
++                }
++            }
++        }
++        Ok(options)
++    }
++
++    // Explicit candidates only: keep every UNIQUE/PK index and the five
++    // nonunique indexes needed by complete-scan replay. Other mixed-history
++    // effects (including FK parent updates) still require benchmarking.
++    fn defer_indexes(self, connection: &Connection, path: &Path) -> Result<Vec<String>> {
++        if !self.defer {
++            return Ok(Vec::new());
++        }
++        let names = [
++            "records_kind_time",
++            "records_batch_dot",
++            "sites_status_name",
++            "policies_status_name",
++            "collections_status_name",
++            "devices_status_name",
++            "archive_roots_status_name",
++            "locations_status_name",
++            "locations_device",
++            "locations_site",
++            "locations_root",
++            "device_mounts_root_time",
++            "device_mounts_device_time",
++            "risk_domains_status_name",
++            "object_hashes_lookup",
++            "file_refs_object",
++            "file_refs_external_identity",
++            "copy_claims_object_state",
++            "copy_claims_external_state",
++            "copy_claims_verification_age",
++            "copy_claims_risk_eligible",
++            "scan_runs_location_finished",
++            "scan_runs_status",
++            "scan_candidates_copy_claim",
++            "job_items_job_status",
++            "annex_imports_location",
++        ];
++        let mut definitions = Vec::with_capacity(names.len());
++        for name in names {
++            let sql: String = connection.query_row(
++                "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND sql LIKE 'CREATE INDEX %'",
++                [name], |row| row.get(0),
++            ).map_err(|source| sqlite_error(path, source))?;
++            connection
++                .execute_batch(&format!("DROP INDEX {name};"))
++                .map_err(|source| sqlite_error(path, source))?;
++            definitions.push(sql);
++        }
++        Ok(definitions)
++    }
++
++    fn configure(self, connection: &Connection, path: &Path) -> Result<()> {
++        if self.wal {
++            connection
++                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;")
++                .map_err(|source| sqlite_error(path, source))?;
++        }
++        if self.cache64 {
++            connection
++                .execute_batch("PRAGMA cache_size = -65536;")
++                .map_err(|source| sqlite_error(path, source))?;
++        }
++        Ok(())
++    }
++}
++
+@@ -601,0 +699 @@
++        let experiment = RebuildExperiment::from_environment()?;
+@@ -618,0 +717 @@
++        experiment.configure(&connection, path)?;
+@@ -621,0 +721 @@
++        let deferred_indexes = experiment.defer_indexes(&connection, path)?;
+@@ -713,2 +813,16 @@
+-        let applied = database.apply(store)?;
+-        let connection = database.open()?;
++        let applied = database.apply_with_experiment(store, experiment)?;
++        let mut connection = database.open()?;
++        experiment.configure(&connection, path)?;
++        if !deferred_indexes.is_empty() {
++            let transaction = connection
++                .transaction()
++                .map_err(|source| sqlite_error(path, source))?;
++            for definition in deferred_indexes {
++                transaction
++                    .execute_batch(&definition)
++                    .map_err(|source| sqlite_error(path, source))?;
++            }
++            transaction
++                .commit()
++                .map_err(|source| sqlite_error(path, source))?;
++        }
+@@ -716 +830,5 @@
+-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
++            .execute_batch(if experiment.wal {
++                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE; PRAGMA optimize;"
++            } else {
++                "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;"
++            })
+@@ -803,0 +922,8 @@
++        self.apply_with_experiment(store, RebuildExperiment::default())
++    }
++
++    fn apply_with_experiment(
++        &self,
++        store: &V2OriginStore,
++        experiment: RebuildExperiment,
++    ) -> Result<V2ApplyStats> {
+@@ -804,0 +931 @@
++        experiment.configure(&connection, &self.path)?;
+@@ -897,0 +1025,3 @@
++        let records_per_transaction = if experiment.group16 { 16 } else { 1 };
++        let mut pending_transaction: Option<Transaction<'_>> = None;
++        let mut pending_records = 0;
+@@ -944,4 +1074,7 @@
+-            let transaction = connection
+-                .transaction()
+-                .map_err(|source| sqlite_error(&self.path, source))?;
+-            let inserted = insert_record(&transaction, record, &self.path)?;
++            if pending_transaction.is_none() {
++                pending_transaction = Some(connection
++                    .unchecked_transaction()
++                    .map_err(|source| sqlite_error(&self.path, source))?);
++            }
++            let transaction = pending_transaction.as_ref().expect("started transaction");
++            let inserted = insert_record(transaction, record, &self.path)?;
+@@ -977,3 +1110,7 @@
+-            transaction
+-                .commit()
+-                .map_err(|source| sqlite_error(&self.path, source))?;
++            pending_records += 1;
++            if pending_records == records_per_transaction {
++                pending_transaction.take().expect("pending transaction")
++                    .commit()
++                    .map_err(|source| sqlite_error(&self.path, source))?;
++                pending_records = 0;
++            }
+@@ -986,0 +1124,8 @@
++        // The visitor streams one record at a time. Dropping this pending
++        // transaction on any visitor error rolls back the entire current group.
++        if let Some(transaction) = pending_transaction.take() {
++            transaction
++                .commit()
++                .map_err(|source| sqlite_error(&self.path, source))?;
++        }
++        drop(pending_transaction);

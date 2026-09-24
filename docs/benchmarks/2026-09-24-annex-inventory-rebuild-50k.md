@@ -3,8 +3,9 @@
 Tracked by **al-j5k**. Baseline: `4b5f04d75a1441cd8f3b11f84b29cfd8caba8273`.
 
 The user reported approximately 20 hours after enumeration when importing an
-approximately 800,000-file annex repository on an older desktop. The exact phase,
-storage, build, and timings are unknown. These smaller experiments confirm
+approximately 800,000-file annex repository on an older desktop. The user later
+confirmed that everything, including SQLite, was on a spinning hard drive.
+The exact phase, build, and timings are unknown. These smaller experiments confirm
 declining projection throughput, but do not reproduce or explain the entire
 reported duration. No 100k or 800k workload was run.
 
