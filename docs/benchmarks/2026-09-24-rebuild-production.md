@@ -164,7 +164,8 @@ observations (about 2,400 versus 2,340 entries/second). This is encouraging near
 linear scaling through 50k, but two differently loaded observations do not prove
 scaling at larger sizes or on HDD. The larger case was considered and deferred:
 repeated memory-pressure stops and exhausted shared swap make 100k inappropriate
-on this runner today. No 100k or 800k result is claimed. The optional synthetic
+on this runner at that checkpoint. The subsequent authorized 100k run is
+reported below; no 800k result is claimed. The optional synthetic
 canonical-growth helper was drafted but never compiled or run and is not part
 of the product or retained benchmark tooling.
 
@@ -206,3 +207,112 @@ and compares all rows without exclusions.
 Raw fixtures, build outputs, watchdog logs, and the unrun helper were task-owned
 scratch artifacts. Their relevant evidence is recorded here; they are removed
 at completion rather than retained as product files.
+
+
+## Subsequent guarded 100,000-entry run
+
+After host pressure settled, the user authorized a 100k attempt. The production
+source was unchanged at `1d258b9`. Initial sampling showed approximately
+1.33 GiB available RAM, zero memory PSI, 56 MiB free swap, and 6.78 GiB free disk.
+The rebuilt release binary's SHA-256 was
+`647bcc0da5bac0d052449ee2e2fc28796e47df690a8cbe04dbf98aabb56e1975`.
+It used the same locked release build settings, one build job, and one-core
+affinity. No production settings or durability behavior were changed.
+
+This fixture contains 100,000 distinct deterministic annex keys and locked
+symlinks created by the retained benchmark helper. It is actual filesystem/Git
+inventory through the CLI, not a cloned or synthetically duplicated event batch.
+It represents metadata-only references, not the contents of 100,000 media files.
+
+Each phase ran in a separate 896 MiB hard / 768 MiB soft / zero-swap scope with
+the same 832 MiB early stop, 384 MiB host reserve, memory-PSI thresholds, disk
+reserve, CPU affinity, and reduced priorities. Preflight required 1,200 MiB
+available RAM and memory PSI some/full avg10 below 2%/1%. The watchdog was active
+through setup, import, reconstruction, and validation.
+
+The following stops and recoveries are material to interpreting the result:
+
+- The clean build stopped on memory PSI after 307.22 seconds. Dependencies were
+  preserved; the remaining application build succeeded in a fresh scope in
+  50.08 seconds. Neither attempt recorded an OOM or hard-limit event.
+- Fixture creation stopped after 54.71 seconds during the final Git command.
+  The commit already existed; a separate guarded check verified 100,000 entries
+  in both its tree and index and confirmed they matched. No regeneration or
+  replacement fixture was used. The stopped command is not a fixture timing.
+- The import stopped during projection after 406.29 seconds for its scope,
+  including archive initialization. Canonical history and committed SQLite
+  progress survived. Normal incremental `db apply` completed the projection
+  in a separate 80.65-second scope. The reference then contained exactly
+  100,000 identities, file references, copy claims, availability rows, and path
+  observations, with zero objects or verification results. A SQLite backup
+  preserved that completed reference. These interrupted stages are not an
+  uninterrupted import timing.
+- The first full rebuild stopped on memory PSI after 48.25 seconds. Its scope
+  peaked at 577.1 MiB, with no soft-limit events, while host available RAM stayed
+  above 1,115.5 MiB. Pressure was not simply exhaustion of this scope's allowance.
+  Its unfinished database still had schema version zero and was removed. A
+  fresh full rebuild succeeded after pressure settled, with unchanged limits.
+
+### Successful reconstruction
+
+| Entries | Rebuild seconds | CPU seconds | CLI peak RSS, MiB | CLI swap, MiB | Recorded writes, MB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 50,000, earlier production observation | 21.36 | 17.90 | 81.3 | 0 | 208.40 |
+| 100,000 | 45.11 | 34.31 | 84.8 | 0 | 679.85 |
+
+The successful 100k command includes replay, deferred index construction,
+validation, and installation. Its enclosing watchdog scope took 45.44 seconds,
+peaked at 478.8 MiB actual charge including filesystem cache and 116.5 MiB summed
+process RSS, and retained at least 1,246.8 MiB available host RAM. Memory PSI
+some/full avg10 each stayed at or below 0.20%. Scope soft-limit, hard-limit, OOM,
+and OOM-kill counters all remained zero. CLI RAM is sampled RSS, not a guaranteed
+upper bound or the scope's cache-inclusive memory footprint.
+
+Doubling entries took 2.11 times as long and 1.92 times the CPU, with only
+3.5 MiB more CLI RSS. This supports approximately linear elapsed scaling through
+100k in these observations. Recorded writes increased 3.26 times, however;
+write traffic is already growing faster than entry count. These are sequential
+warm-cache observations on a shared virtual-NVMe host with different scope
+conditions, not statistical scaling proof or an HDD timing estimate. A larger
+cache was not tested in this run, and this result does not justify an 800k
+extrapolation without further measurement.
+
+The phase wrapper reuses the retained fixture, command measurement, SQLite
+backup, integrity, and exact comparison helpers. Separating the phases and
+resuming incremental projection were task-local orchestration choices; no new
+product command or runtime flag was added. On a sufficiently provisioned runner,
+the reproduction command above accepts `--sizes 100000`; omit the optional
+baseline binary to measure only production. This run did not time the original
+100k rebuild.
+
+### Final verification and limits
+
+The rebuilt database was 333,348,864 bytes. The comparison checked every derived
+table and the full schema against the preserved incremental reference, excluding
+only the local tables and metadata keys documented above. SQLite integrity and
+foreign-key checks passed, and canonical Git HEAD remained
+`a637631a7c25345210f09586818c3f2fc6ad228e`.
+
+The comparison scope reached `fsck` only after those assertions passed; it then
+stopped on PSI at 135.37 seconds, with 768.2 MiB peak scope charge and 434
+soft-limit events. The remaining routine `fsck` ran in a separate scope and
+passed in 21.65 CLI seconds (21.82 seconds for the scope), with 201.9 MiB peak
+scope charge and no soft-limit events. It reported healthy/current projection,
+valid Git objects, 212 valid signed records in nine segments, matching cursors,
+and no unpublished append artifacts. `fsck --full` was not additionally run;
+the independent exact row/schema comparison already checked reconstruction
+against the reference. No unit tests were rerun because production source did
+not change; this follow-up changes only the benchmark report.
+
+Across every setup, recovery, rebuild, and validation scope, hard-limit, OOM,
+and OOM-kill counters remained zero. Sampled global OOM-kill counts also remained
+zero. This was a successful guarded experiment with several pressure stops and
+recoveries, not evidence that the shared server can run unrestricted 100k jobs.
+The successful recovery timing is 45.11 seconds; fixture creation, the original
+import, pauses, and external comparison are not included in it.
+
+Task-owned staging `/home/ubuntu/tmp/archive-ledger-al-j5k-100k-5bek2zu8` held the
+fixtures, binary, phase wrappers, and raw telemetry. Their evidence is captured
+above and they are removed after verification. The initial-import bottleneck,
+faster-than-linear write growth, larger histories, and representative HDD
+measurements remain tracked by al-j5k.
