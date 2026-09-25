@@ -328,8 +328,8 @@ cd /srv/archive/documents
 archive location scan
 ```
 
-On a terminal the scan shows live progress on stderr. It first prints its job ID; if the scan
-is interrupted, continue it with `archive job resume <job-id>`.
+On a terminal, `location scan` and `collection add` show live progress on stderr. Each first
+prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
 
 Only a successfully completed scan can mark prior paths missing. Traversal errors, permission
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.

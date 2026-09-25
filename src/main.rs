@@ -10570,7 +10570,19 @@ fn execute_v2_collection_add(
         }
     }
     let store = V2OriginStore::open(cli.events_path())?;
-    let result = archive_ledger::v2_add_files(&store, database, &config, None)?;
+    let progress = start_v2_inventory_progress(
+        cli,
+        ProgressKind::CollectionAdd,
+        "Collection add",
+        &config.job_id,
+    )?;
+    let result = archive_ledger::v2_add_files(
+        &store,
+        database,
+        &config,
+        progress.as_ref().map(ProgressReporter::progress),
+    )?;
+    finish_v2_inventory_progress(progress, &result.status);
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -10633,6 +10645,34 @@ fn execute_v2_collection_add(
             EXIT_OK
         },
     )
+}
+
+/// Human mode only: announce the job before any long work so an interrupted
+/// scan can be resumed, and show live progress only on an interactive terminal.
+fn start_v2_inventory_progress(
+    cli: &Cli,
+    kind: ProgressKind,
+    label: &str,
+    job_id: &str,
+) -> Result<Option<ProgressReporter>, AppError> {
+    if cli.json {
+        return Ok(None);
+    }
+    eprintln!("{label} job {job_id}. If interrupted, resume with: archive job resume {job_id}");
+    Ok(std::io::stderr()
+        .is_terminal()
+        .then(|| ProgressReporter::start(kind))
+        .transpose()?)
+}
+
+fn finish_v2_inventory_progress(progress: Option<ProgressReporter>, status: &str) {
+    if let Some(progress) = progress {
+        progress.finish(match status {
+            "running" => "Paused",
+            "partial" => "Partial",
+            _ => "Complete",
+        });
+    }
 }
 
 fn execute_v2_location_scan(
@@ -10729,19 +10769,8 @@ fn execute_v2_location_scan(
         .clone()
         .unwrap_or_else(|| format!("job_{suffix}"));
     let store = V2OriginStore::open(cli.events_path())?;
-    // Human mode only: announce the job before any long work so an interrupted
-    // scan can be resumed, and show live progress only on an interactive terminal.
-    let progress = if cli.json {
-        None
-    } else {
-        eprintln!(
-            "Location scan job {job_id}. If interrupted, resume with: archive job resume {job_id}"
-        );
-        std::io::stderr()
-            .is_terminal()
-            .then(|| ProgressReporter::start(ProgressKind::LocationScan))
-            .transpose()?
-    };
+    let progress =
+        start_v2_inventory_progress(cli, ProgressKind::LocationScan, "Location scan", &job_id)?;
     let result = archive_ledger::v2_add_files(
         &store,
         database,
@@ -10765,13 +10794,7 @@ fn execute_v2_location_scan(
         },
         progress.as_ref().map(ProgressReporter::progress),
     )?;
-    if let Some(progress) = progress {
-        progress.finish(match result.status.as_str() {
-            "running" => "Paused",
-            "partial" => "Partial",
-            _ => "Complete",
-        });
-    }
+    finish_v2_inventory_progress(progress, &result.status);
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);

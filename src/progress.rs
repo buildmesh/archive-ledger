@@ -15,6 +15,7 @@ use crate::v2_store::V2AppendProgress;
 pub enum ProgressKind {
     AnnexImport,
     LocationScan,
+    CollectionAdd,
 }
 
 #[derive(Clone)]
@@ -24,6 +25,7 @@ pub struct Progress {
 
 #[derive(Clone)]
 struct ProgressState {
+    title: &'static str,
     phase: &'static str,
     inspected: u64,
     count: Option<(&'static str, u64, u64)>,
@@ -39,12 +41,21 @@ enum Counters {
 
 impl Progress {
     fn new(kind: ProgressKind) -> Self {
-        let counters = match kind {
-            ProgressKind::AnnexImport => Counters::Annex(AnnexSummary::default()),
-            ProgressKind::LocationScan => Counters::Scan(V2InventorySummary::default()),
+        // Location scan and collection add share one scan engine and its counters.
+        let (title, counters) = match kind {
+            ProgressKind::AnnexImport => ("Annex import", Counters::Annex(AnnexSummary::default())),
+            ProgressKind::LocationScan => (
+                "Location scan",
+                Counters::Scan(V2InventorySummary::default()),
+            ),
+            ProgressKind::CollectionAdd => (
+                "Collection add",
+                Counters::Scan(V2InventorySummary::default()),
+            ),
         };
         Self {
             state: Arc::new(Mutex::new(ProgressState {
+                title,
                 phase: "",
                 inspected: 0,
                 count: None,
@@ -134,58 +145,52 @@ impl Progress {
             None if state.inspected > 0 => format!("{} inspected", state.inspected),
             None => String::new(),
         };
-        let (title, counters) = match &state.counters {
-            Counters::Annex(summary) => (
-                "Annex import",
-                [
-                    vec![
-                        format!("{} entries", summary.entries_seen),
-                        format!("{} verified", summary.present),
-                        format!("{} absent", summary.absent),
-                    ],
-                    vec![
-                        format!("{} unchecked", summary.unchecked),
-                        format!(
-                            "{} skipped links + {} other",
-                            summary.ignored_symlinks,
-                            summary
-                                .ignored_non_annex
-                                .saturating_sub(summary.ignored_symlinks)
-                        ),
-                        format!("{} errors", summary.mismatched + summary.read_errors),
-                    ],
-                    vec![format!("{} read this run", gib(state.bytes_read))],
+        let counters = match &state.counters {
+            Counters::Annex(summary) => [
+                vec![
+                    format!("{} entries", summary.entries_seen),
+                    format!("{} verified", summary.present),
+                    format!("{} absent", summary.absent),
                 ],
-            ),
+                vec![
+                    format!("{} unchecked", summary.unchecked),
+                    format!(
+                        "{} skipped links + {} other",
+                        summary.ignored_symlinks,
+                        summary
+                            .ignored_non_annex
+                            .saturating_sub(summary.ignored_symlinks)
+                    ),
+                    format!("{} errors", summary.mismatched + summary.read_errors),
+                ],
+                vec![format!("{} read this run", gib(state.bytes_read))],
+            ],
             // No total is known during a walk, so show counts and elapsed time
             // rather than a percentage. Counts include work resumed from a checkpoint.
-            Counters::Scan(summary) => (
-                "Location scan",
-                [
-                    vec![
-                        format!("{} files", summary.files_observed),
-                        format!("{} observed", gib(summary.bytes_observed)),
-                        // Moves during a long single-file hash, when file counts cannot.
-                        format!("{} read this run", gib(state.bytes_read)),
-                    ],
-                    vec![
-                        format!("{} new", summary.new_paths),
-                        format!("{} changed", summary.changed_paths),
-                        format!("{} confirmed good", summary.confirmed_good),
-                    ],
-                    vec![
-                        format!("{} integrity mismatches", summary.integrity_mismatches),
-                        format!(
-                            "{} read errors",
-                            summary.read_errors + summary.concurrent_changes
-                        ),
-                    ],
+            Counters::Scan(summary) => [
+                vec![
+                    format!("{} files", summary.files_observed),
+                    format!("{} observed", gib(summary.bytes_observed)),
+                    // Moves during a long single-file hash, when file counts cannot.
+                    format!("{} read this run", gib(state.bytes_read)),
                 ],
-            ),
+                vec![
+                    format!("{} new", summary.new_paths),
+                    format!("{} changed", summary.changed_paths),
+                    format!("{} confirmed good", summary.confirmed_good),
+                ],
+                vec![
+                    format!("{} integrity mismatches", summary.integrity_mismatches),
+                    format!(
+                        "{} read errors",
+                        summary.read_errors + summary.concurrent_changes
+                    ),
+                ],
+            ],
         };
         let [first, second, third] = counters;
         Snapshot {
-            heading: format!("{title}: {}", state.phase),
+            heading: format!("{}: {}", state.title, state.phase),
             elapsed: format!("{}s", elapsed.as_secs()),
             rows: [vec![count], first, second, third],
         }
@@ -455,6 +460,12 @@ mod tests {
         );
         assert!(rows.iter().all(|row| row.len() <= 80));
         assert!(!text.contains('%'));
+
+        let add = Progress::new(ProgressKind::CollectionAdd);
+        add.phase("Scanning files");
+        let snapshot = add.snapshot(Duration::ZERO);
+        assert_eq!(snapshot.heading, "Collection add: Scanning files");
+        assert_eq!(snapshot.rows[1][0], "0 files");
 
         progress.append_progress(V2AppendProgress::ReadingSpool {
             bytes_read: 10,

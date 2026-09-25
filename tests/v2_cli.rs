@@ -1271,7 +1271,7 @@ mod unix {
     }
 
     #[test]
-    fn location_scan_announces_resumable_job_only_in_human_mode() {
+    fn scan_engine_commands_announce_resumable_job_only_in_human_mode() {
         let (temp, content) = immutable_files_fixture();
         let scan = |extra: &[&str]| {
             let mut command = archive(&temp);
@@ -1303,6 +1303,33 @@ mod unix {
         let resumed = success(archive(&temp).args(["--json", "job", "resume", "job_scan_json"]));
         assert!(resumed.stderr.is_empty());
         assert_eq!(json(&resumed)["status"], "complete");
+
+        for name in ["d.txt", "e.txt"] {
+            fs::write(content.join(name), name).unwrap();
+        }
+        let add = |extra: &[&str], job_id: &str| {
+            let mut command = archive(&temp);
+            command.args(extra).args([
+                "collection",
+                "add",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--max-items",
+                "1",
+                "--job-id",
+                job_id,
+            ]);
+            command
+        };
+        let human = success(&mut add(&[], "job_add_hint"));
+        assert_eq!(
+            String::from_utf8(human.stderr).unwrap(),
+            "Collection add job job_add_hint. If interrupted, resume with: archive job resume job_add_hint\n"
+        );
+        let machine = success(&mut add(&["--json"], "job_add_json"));
+        assert!(machine.stderr.is_empty());
+        assert_eq!(json(&machine)["status"], "running");
     }
 
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
