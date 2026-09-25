@@ -1020,6 +1020,18 @@ struct CollectionAddArgs {
     collection: Option<String>,
     #[arg(long = "exclude")]
     exclusions: Vec<PathBuf>,
+    /// Accept intentional edits to this exact ordinary file, relative to the inventory directory.
+    /// Repeat for multiple files; only these files are processed.
+    #[arg(long, value_name = "FILE")]
+    accept_changes: Vec<PathBuf>,
+    /// Hash the selected files and preview acceptance without recording changes.
+    #[arg(long, requires = "accept_changes")]
+    dry_run: bool,
+    /// Confirm acceptance of the explicitly selected files.
+    #[arg(long, requires = "accept_changes")]
+    yes: bool,
+    #[arg(long, requires = "accept_changes")]
+    non_interactive: bool,
     #[arg(long)]
     job_id: Option<String>,
     #[arg(long)]
@@ -8867,7 +8879,7 @@ fn execute_v2_job(
             }
             match job.job_type.as_str() {
                 "inventory_add" => {
-                    execute_v2_collection_add(
+                    return execute_v2_collection_add(
                         cli,
                         database,
                         &CollectionAddArgs {
@@ -8875,15 +8887,23 @@ fn execute_v2_job(
                             location: Some(json_string(&job.params, "location_id")?),
                             collection: Some(json_string(&job.params, "collection_id")?),
                             exclusions: job_registry_paths(&job.params, "exclusions")?,
+                            accept_changes: if job.params.get("accept_changes").is_some() {
+                                job_registry_paths(&job.params, "accept_changes")?
+                            } else {
+                                Vec::new()
+                            },
+                            dry_run: false,
+                            yes: true,
+                            non_interactive: true,
                             job_id: Some(job.job_id),
                             scan_id: Some(job.input_version),
                             batch_entries: inventory_job_batch_entries(&job.params)?,
                             max_items: *max_items,
                         },
-                    )?;
+                    );
                 }
                 "location_scan" => {
-                    execute_v2_location_scan(
+                    return execute_v2_location_scan(
                         cli,
                         database,
                         &LocationScanArgs {
@@ -8896,7 +8916,7 @@ fn execute_v2_job(
                             batch_entries: inventory_job_batch_entries(&job.params)?,
                             max_items: *max_items,
                         },
-                    )?;
+                    );
                 }
                 "annex_import" => {
                     let progress = AnnexProgressReporter::start()?;
@@ -10277,6 +10297,28 @@ fn v2_path_has_completed_annex_import(
     Ok(false)
 }
 
+fn print_v2_inventory_findings(summary: &archive_ledger::V2InventorySummary) {
+    if summary.integrity_mismatches == 0 {
+        return;
+    }
+    println!(
+        "  {} files: content differs from catalog",
+        summary.integrity_mismatches
+    );
+    for path in &summary.integrity_findings {
+        println!("    {}", path.display);
+    }
+    let remaining = summary
+        .integrity_mismatches
+        .saturating_sub(summary.integrity_findings.len() as u64);
+    if remaining > 0 {
+        println!("    ... and {remaining} more; see archive report integrity");
+    }
+    println!("Restore good bytes and rescan. For intentional ordinary-file edits, preview with:");
+    println!("  archive collection add ROOT --accept-changes FILE --dry-run");
+    println!("FILE is relative to ROOT. Replace --dry-run with --yes to accept; annex identities cannot be accepted this way.");
+}
+
 fn execute_v2_collection_add(
     cli: &Cli,
     database: &V2ProjectionDb,
@@ -10343,31 +10385,78 @@ fn execute_v2_collection_add(
         .to_path_buf();
     let prefix = (!relative_prefix.as_os_str().is_empty()).then_some(relative_prefix);
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let config = archive_ledger::V2InventoryConfig {
+        root_path: scan_path,
+        location_prefix: prefix.clone(),
+        logical_prefix: prefix,
+        exclusions: args.exclusions.clone(),
+        accept_changes: args.accept_changes.clone(),
+        collection_id: collection.collection_id.clone(),
+        location_id: location.location_id.clone(),
+        device_fingerprint_status: fingerprint_status,
+        job_id: args
+            .job_id
+            .clone()
+            .unwrap_or_else(|| format!("job_{suffix}")),
+        scan_id: args
+            .scan_id
+            .clone()
+            .unwrap_or_else(|| format!("scan_{suffix}")),
+        scan_mode: ScanMode::Add,
+        batch_entries: args.batch_entries,
+        max_items: args.max_items,
+    };
+    if !args.accept_changes.is_empty() {
+        if args.dry_run {
+            let preview = archive_ledger::v2_preview_changes(database, &config)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "version": 2,
+                        "status": "planned",
+                        "collection_id": collection.collection_id,
+                        "location_id": location.location_id,
+                        "items": preview,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Intentional content changes in Collection \"{}\":",
+                    collection.display_name
+                );
+                for item in &preview {
+                    println!(
+                        "  {}: {} -> {}{}",
+                        item.path.display,
+                        item.expected_object_id,
+                        item.observed_object_id,
+                        if item.changed { "" } else { " (unchanged)" }
+                    );
+                }
+                println!("Dry run: no changes recorded. Use --yes to accept the selected files.");
+            }
+            return Ok(EXIT_OK);
+        }
+        if !args.yes {
+            if args.non_interactive || !std::io::stdin().is_terminal() {
+                return Err(AppError::Input(
+                    "accepting content changes requires --yes; preview with --dry-run first"
+                        .to_owned(),
+                ));
+            }
+            for path in &args.accept_changes {
+                println!("  {}", path.display());
+            }
+            if !prompt_confirmation(
+                "Accept the current bytes of these files as their cataloged content?",
+            )? {
+                return Err(AppError::Input("acceptance cancelled".to_owned()));
+            }
+        }
+    }
     let store = V2OriginStore::open(cli.events_path())?;
-    let result = archive_ledger::v2_add_files(
-        &store,
-        database,
-        &archive_ledger::V2InventoryConfig {
-            root_path: scan_path,
-            location_prefix: prefix.clone(),
-            logical_prefix: prefix,
-            exclusions: args.exclusions.clone(),
-            collection_id: collection.collection_id.clone(),
-            location_id: location.location_id.clone(),
-            device_fingerprint_status: fingerprint_status,
-            job_id: args
-                .job_id
-                .clone()
-                .unwrap_or_else(|| format!("job_{suffix}")),
-            scan_id: args
-                .scan_id
-                .clone()
-                .unwrap_or_else(|| format!("scan_{suffix}")),
-            scan_mode: ScanMode::Add,
-            batch_entries: args.batch_entries,
-            max_items: args.max_items,
-        },
-    )?;
+    let result = archive_ledger::v2_add_files(&store, database, &config)?;
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -10377,22 +10466,22 @@ fn execute_v2_collection_add(
                 result.summary.files_observed,
                 format_bytes(result.summary.bytes_observed)
             );
+            print_v2_inventory_findings(&result.summary);
             println!("Resume with: archive job resume {}", result.job_id);
         }
-        return Ok(EXIT_OK);
+        return Ok(if result.summary.integrity_mismatches > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        });
     }
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!("Added files to Collection \"{}\".", collection.display_name);
         println!(
-            "  {} files observed; {} new to the Collection; {} newly placed at this Location",
-            result.summary.files_observed,
-            result.summary.new_paths,
-            result
-                .summary
-                .new_paths
-                .saturating_add(result.summary.changed_paths)
+            "  {} files observed; {} new paths; {} intentional content changes accepted",
+            result.summary.files_observed, result.summary.new_paths, result.summary.changed_paths
         );
         println!(
             "  {} files confirmed good; {} bytes verified",
@@ -10416,10 +10505,14 @@ fn execute_v2_collection_add(
             );
         }
     }
+    if !cli.json {
+        print_v2_inventory_findings(&result.summary);
+    }
     Ok(
         if result.summary.read_errors > 0
             || result.summary.concurrent_changes > 0
             || result.summary.traversal_errors > 0
+            || result.summary.integrity_mismatches > 0
         {
             EXIT_FINDINGS
         } else {
@@ -10526,6 +10619,7 @@ fn execute_v2_location_scan(
             location_prefix: None,
             logical_prefix: None,
             exclusions: args.exclusions.clone(),
+            accept_changes: Vec::new(),
             collection_id: collection.collection_id.clone(),
             location_id: location.location_id,
             device_fingerprint_status: fingerprint_status,
@@ -10551,9 +10645,14 @@ fn execute_v2_location_scan(
                 result.summary.files_observed,
                 format_bytes(result.summary.bytes_observed)
             );
+            print_v2_inventory_findings(&result.summary);
             println!("Resume with: archive job resume {}", result.job_id);
         }
-        return Ok(EXIT_OK);
+        return Ok(if result.summary.integrity_mismatches > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        });
     }
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -10575,6 +10674,9 @@ fn execute_v2_location_scan(
                 result.summary.ignored_symlinks
             );
         }
+    }
+    if !cli.json {
+        print_v2_inventory_findings(&result.summary);
     }
     Ok(
         if result.summary.read_errors > 0

@@ -592,7 +592,25 @@ hashing, event, and resume implementations.
 Namespace coverage and byte integrity are separate. An enumerated regular file
 whose content cannot be read remains a present unknown/non-qualifying fact with
 a verification failure; that error alone does not hide names or make coverage
-partial. New or metadata-changed content is hashed to establish identity.
+partial. New content is hashed to establish identity. Known content is hashed
+against its expected identity: a mismatch emits `copy_verification_failed`, keeps
+the File's expected Object, and makes the observed Copy corrupt/non-qualifying.
+It never silently emits a replacement `content_observed` for differing bytes.
+Matching bytes, including after restoration of a corrupt copy or a metadata-only
+change, emit successful observation/verification and clear the Copy's failure.
+Explicit acceptance via named ordinary files in `collection add --accept-changes`
+may publish a new `content_observed` identity after confirmation. The selected
+paths are immutable resume inputs, and the positive-only acceptance job does not
+enumerate or reconcile other paths. Annex expected identities are not replaceable
+through this option. Historical content observations retain their replay semantics.
+Explicit acceptance adds `accepted_change: true` to `content_observed` as audit
+context; it does not reinterpret older observations. Ordinary mismatch items add
+`collection_id` and `file_ref_id` to `copy_verification_failed`, with the expected
+BLAKE3 Object/hash and the logical and copy paths. These fields let replay attach
+a corrupt claim at a newly observed Location without inventing a successful
+verification or replacing the File's identity. The projector validates the
+scoped File, expected Object/hash, and any existing Copy identity. Namespace
+reappearance can reactivate the File path while retaining its expected Object.
 Unchanged known content is not rehashed by default; routine rehashing belongs to
 `archive verify`. Traversal or directory-stat errors that may hide entries make
 the scan partial.

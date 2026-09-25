@@ -2622,6 +2622,101 @@ fn project_copy_verification_failed(
         .get("verified_time_utc_ms")
         .and_then(Value::as_u64)
         .unwrap_or(record.record.envelope.time_utc_ms);
+    // Ordinary inventory may find bad bytes at a Location with no prior Copy.
+    // These optional fields attach failure evidence to the already cataloged File;
+    // they never replace its expected identity or create an observed good Object.
+    if let Some(file_ref_id) = item.get("file_ref_id").and_then(Value::as_str) {
+        let collection_id = string(item, "collection_id")?;
+        let object_id = string(item, "object_id")?;
+        let logical: crate::registry::RegistryPath =
+            serde_json::from_value(required(item, "logical_path")?.clone()).map_err(|error| {
+                V2ProjectionError::Invalid(format!("verification logical path is invalid: {error}"))
+            })?;
+        let logical_bytes = registry_path_bytes(&logical)
+            .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
+        let valid: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_refs f WHERE f.file_ref_id = ?1
+                AND f.collection_id = ?2 AND f.logical_path_encoding = ?3 AND f.logical_path_bytes = ?4)
+             AND EXISTS(SELECT 1 FROM objects o WHERE o.object_id = ?5
+                AND o.canonical_hash_algo = 'blake3' AND o.canonical_hash_hex = ?6)",
+            params![file_ref_id, collection_id, logical.encoding, logical_bytes, object_id,
+                string(item, "expected_hash_hex")?],
+            |row| row.get(0),
+        ).map_err(|source| sqlite_error(database_path, source))?;
+        if !valid || result != "hash_mismatch" || string(item, "expected_hash_algo")? != "blake3" {
+            return Err(V2ProjectionError::Invalid(
+                "ordinary verification failure has invalid expected File/Object".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE file_refs SET path_state = 'active', removed_record_id = NULL WHERE file_ref_id = ?1",
+            [file_ref_id],
+        ).map_err(|source| sqlite_error(database_path, source))?;
+        let record_id = &record.record.envelope.record_id;
+        let origin_id = &record.record.envelope.origin_id;
+        let origin_seq = sql_i64(
+            record.record.envelope.origin_seq,
+            "verification origin sequence",
+        )?;
+        let time = sql_i64(verified_time, "verification time")?;
+        let existing_claim: Option<(String, String, Vec<u8>, Option<String>)> = transaction.query_row(
+            "SELECT location_id, relative_path_encoding, relative_path_bytes, object_id FROM copy_claims WHERE copy_claim_id = ?1",
+            [copy_claim_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|source| sqlite_error(database_path, source))?;
+        if existing_claim
+            .as_ref()
+            .is_some_and(|(location, encoding, bytes, object)| {
+                location != location_id
+                    || encoding != &path.encoding
+                    || bytes != &path_bytes
+                    || object.as_deref() != Some(object_id)
+            })
+        {
+            return Err(V2ProjectionError::Invalid(
+                "verification failure changes Copy identity".to_owned(),
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE copy_claims SET state = 'superseded', state_origin_id = ?5,
+                state_origin_seq = ?6, state_record_id = ?7, last_seen_record_id = ?7,
+                last_seen_time_utc_ms = ?8
+             WHERE location_id = ?1 AND relative_path_encoding = ?2 AND relative_path_bytes = ?3
+                AND state != 'superseded' AND copy_claim_id != ?4",
+                params![
+                    location_id,
+                    path.encoding,
+                    path_bytes,
+                    copy_claim_id,
+                    origin_id,
+                    origin_seq,
+                    record_id,
+                    time
+                ],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        transaction.execute(
+            "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding,
+                relative_path_display, object_id, claim_basis, state, state_origin_id,
+                state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'observed_bytes', 'corrupt', ?7, ?8, ?9, ?9, ?9, ?10)
+             ON CONFLICT(copy_claim_id) DO NOTHING",
+            params![copy_claim_id, location_id, path_bytes, path.encoding, path.display,
+                object_id, origin_id, origin_seq, record_id, time],
+        ).map_err(|source| sqlite_error(database_path, source))?;
+        transaction.execute(
+            "INSERT INTO path_observations(file_ref_id, location_id, observed_path_bytes, observed_path_encoding,
+                observed_path_display, representation, object_id, state, first_seen_record_id,
+                last_seen_record_id, last_seen_time_utc_ms, observed_size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'ordinary_file', ?6, 'present', ?7, ?7, ?8, ?9)
+             ON CONFLICT(file_ref_id, location_id, observed_path_encoding, observed_path_bytes) DO UPDATE SET
+                state = 'present', object_id = excluded.object_id, last_seen_record_id = excluded.last_seen_record_id,
+                last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes",
+            params![file_ref_id, location_id, logical_bytes, logical.encoding, logical.display,
+                object_id, record_id, time, item.get("size_bytes").and_then(Value::as_u64)
+                    .map(|value| sql_i64(value, "verification size")).transpose()?],
+        ).map_err(|source| sqlite_error(database_path, source))?;
+    }
     let state = if result == "hash_mismatch" {
         "corrupt"
     } else {

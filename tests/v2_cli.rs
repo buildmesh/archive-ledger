@@ -1096,6 +1096,624 @@ mod unix {
         assert_eq!(events["segments"], 9);
     }
 
+    fn immutable_files_fixture() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let content = temp.path().join("files");
+        fs::create_dir(&content).unwrap();
+        for (name, bytes) in [
+            ("a.txt", "original a"),
+            ("b.txt", "original b"),
+            ("c.txt", "original c"),
+        ] {
+            fs::write(content.join(name), bytes).unwrap();
+        }
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            content.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        (temp, content)
+    }
+
+    fn immutable_file_object(temp: &TempDir, name: &str) -> String {
+        rusqlite::Connection::open(root(temp).join("archive.db"))
+            .unwrap()
+            .query_row(
+                "SELECT object_id FROM file_refs WHERE logical_path_display = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn immutable_projection_state(temp: &TempDir) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let database = rusqlite::Connection::open(root(temp).join("archive.db")).unwrap();
+        [
+            "file_refs",
+            "path_observations",
+            "copy_claims",
+            "verification_results",
+            "objects",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut statement = database
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2, 3"))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    fn regular_file_tree(path: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        if path.exists() {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    for (name, bytes) in regular_file_tree(&entry.path()) {
+                        files.insert(PathBuf::from(entry.file_name()).join(name), bytes);
+                    }
+                } else if entry.file_type().unwrap().is_file() {
+                    files.insert(
+                        PathBuf::from(entry.file_name()),
+                        fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn immutable_scan_reports_corruption_preserves_identity_and_recovers_restored_bytes() {
+        let (temp, content) = immutable_files_fixture();
+        let expected = immutable_file_object(&temp, "a.txt");
+        fs::write(content.join("a.txt"), b"different and longer contents").unwrap();
+        // A metadata-only change must still confirm the same content identity.
+        fs::File::options()
+            .write(true)
+            .open(content.join("b.txt"))
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(123456)),
+            )
+            .unwrap();
+        let output = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary = json(&output)["summary"].clone();
+        assert_eq!(summary["integrity_mismatches"], 1);
+        assert_eq!(summary["changed_paths"], 0);
+        assert_eq!(summary["confirmed_good"], 2);
+        assert_eq!(immutable_file_object(&temp, "a.txt"), expected);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let corrupt: (String, String, String, Option<String>) = database.query_row(
+            "SELECT object_id, state, last_verification_result, last_error_code FROM copy_claims WHERE relative_path_display = 'a.txt' AND state != 'superseded'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            (&corrupt.0, corrupt.1.as_str(), corrupt.2.as_str()),
+            (&expected, "corrupt", "hash_mismatch")
+        );
+        assert!(corrupt.3.is_some());
+        assert_eq!(database.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE result = 'hash_mismatch' AND object_id = ?1 AND expected_hash_algo = 'blake3' AND expected_hash_hex != observed_hash_hex",
+            [&expected], |row| row.get::<_, i64>(0),
+        ).unwrap(), 1);
+        drop(database);
+        let before = immutable_projection_state(&temp);
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_eq!(immutable_projection_state(&temp), before);
+
+        // The additive command follows the same immutable default.
+        let output = archive(&temp)
+            .args([
+                "collection",
+                "add",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(10));
+        let findings = String::from_utf8_lossy(&output.stdout);
+        assert!(findings.contains("content differs from catalog"));
+        assert!(findings.contains("a.txt"));
+        assert!(findings.contains("--accept-changes FILE --dry-run"));
+        assert_eq!(immutable_file_object(&temp, "a.txt"), expected);
+
+        fs::write(content.join("a.txt"), b"original a").unwrap();
+        let restored = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "scan",
+            "--path",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ])));
+        assert_eq!(restored["summary"]["integrity_mismatches"], 0);
+        assert_eq!(restored["summary"]["confirmed_good"], 3);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let restored: (String, String, String, Option<String>, Option<String>) = database.query_row(
+            "SELECT object_id, state, last_verification_result, last_error_code, last_error_detail FROM copy_claims WHERE relative_path_display = 'a.txt' AND state != 'superseded'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(
+            restored,
+            (expected.clone(), "present".into(), "ok".into(), None, None)
+        );
+        drop(database);
+        // Disappearance does not grant permission to redefine the same path
+        // when it later reappears with different bytes.
+        fs::remove_file(content.join("a.txt")).unwrap();
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        fs::write(
+            content.join("a.txt"),
+            b"unexpected replacement after disappearance",
+        )
+        .unwrap();
+        let reappeared = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(reappeared.status.code(), Some(10));
+        assert_eq!(json(&reappeared)["summary"]["integrity_mismatches"], 1);
+        assert_eq!(immutable_file_object(&temp, "a.txt"), expected);
+        let before = immutable_projection_state(&temp);
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_eq!(immutable_projection_state(&temp), before);
+        success(archive(&temp).args(["fsck"]));
+    }
+
+    #[test]
+    fn immutable_acceptance_is_explicit_read_only_when_planned_and_scoped_when_resumed() {
+        let (temp, content) = immutable_files_fixture();
+        let original_objects: Vec<_> = ["a.txt", "b.txt", "c.txt"]
+            .map(|name| immutable_file_object(&temp, name))
+            .into();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(
+                content.join(name),
+                format!("intentional new contents of {name}"),
+            )
+            .unwrap();
+        }
+        let canonical = regular_file_tree(&root(&temp).join("canonical"));
+        let jobs = regular_file_tree(&root(&temp).join("local/jobs"));
+        let database = fs::read(root(&temp).join("archive.db")).unwrap();
+        for controls in [
+            &["--dry-run", "--non-interactive"][..],
+            &["--non-interactive"][..],
+        ] {
+            let output = archive(&temp)
+                .args([
+                    "--json",
+                    "collection",
+                    "add",
+                    content.to_str().unwrap(),
+                    "--collection",
+                    "Files",
+                    "--accept-changes",
+                    "a.txt",
+                    "--accept-changes",
+                    "b.txt",
+                ])
+                .args(controls)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if controls.contains(&"--dry-run") {
+                    0
+                } else {
+                    2
+                }),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if controls.contains(&"--dry-run") {
+                let preview = json(&output);
+                assert_eq!(preview["status"], "planned");
+                let items = preview["items"].as_array().unwrap();
+                assert_eq!(items.len(), 2);
+                for item in items {
+                    assert_eq!(item["changed"], true);
+                    assert_ne!(item["expected_object_id"], item["observed_object_id"]);
+                    assert!(original_objects[..2]
+                        .iter()
+                        .any(|expected| item["expected_object_id"] == *expected));
+                }
+            }
+            assert_eq!(regular_file_tree(&root(&temp).join("canonical")), canonical);
+            assert_eq!(regular_file_tree(&root(&temp).join("local/jobs")), jobs);
+            assert_eq!(fs::read(root(&temp).join("archive.db")).unwrap(), database);
+        }
+        let paused = json(&success(archive(&temp).args([
+            "--json",
+            "collection",
+            "add",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--accept-changes",
+            "a.txt",
+            "--accept-changes",
+            "b.txt",
+            "--yes",
+            "--non-interactive",
+            "--max-items",
+            "1",
+            "--job-id",
+            "job_accept_selected",
+        ])));
+        assert_eq!(paused["status"], "running");
+        let resumed = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            "job_accept_selected",
+        ])));
+        assert_eq!(resumed["status"], "complete");
+        assert_eq!(resumed["summary"]["files_observed"], 2);
+        assert_eq!(resumed["summary"]["changed_paths"], 2);
+        assert_eq!(resumed["summary"]["integrity_mismatches"], 0);
+        for (index, name) in ["a.txt", "b.txt"].into_iter().enumerate() {
+            assert_ne!(immutable_file_object(&temp, name), original_objects[index]);
+        }
+        assert_eq!(immutable_file_object(&temp, "c.txt"), original_objects[2]);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(database.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE path_observed_display = 'c.txt'", [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 1, "unselected changed file was hashed during acceptance");
+        drop(database);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            assert_eq!(
+                fs::read_to_string(content.join(name)).unwrap(),
+                format!("intentional new contents of {name}")
+            );
+        }
+        let before = immutable_projection_state(&temp);
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_eq!(immutable_projection_state(&temp), before);
+    }
+
+    #[test]
+    fn immutable_mismatch_at_a_new_location_rebuilds_and_resume_keeps_finding_exit_status() {
+        let (temp, _) = immutable_files_fixture();
+        let expected = immutable_file_object(&temp, "a.txt");
+        let backup = temp.path().join("backup");
+        fs::create_dir(&backup).unwrap();
+        fs::write(
+            backup.join("a.txt"),
+            b"wrong first copy at another location",
+        )
+        .unwrap();
+        fs::write(backup.join("b.txt"), b"original b").unwrap();
+        success(archive(&temp).args([
+            "location",
+            "init",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Backup",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let paused = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                backup.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--max-items",
+                "1",
+                "--job-id",
+                "job_mismatch_resume",
+            ])
+            .output()
+            .unwrap();
+        assert!(matches!(paused.status.code(), Some(0 | 10)));
+        assert_eq!(json(&paused)["status"], "running");
+        let resumed = archive(&temp)
+            .args(["--json", "job", "resume", "job_mismatch_resume"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            resumed.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(json(&resumed)["summary"]["integrity_mismatches"], 1);
+        assert_eq!(immutable_file_object(&temp, "a.txt"), expected);
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let copies = database.prepare(
+            "SELECT l.display_name, c.object_id, c.state FROM copy_claims c JOIN locations l USING (location_id) WHERE c.relative_path_display = 'a.txt' ORDER BY l.display_name"
+        ).unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            copies,
+            vec![
+                ("Backup".into(), expected.clone(), "corrupt".into()),
+                ("Files on Test Device".into(), expected, "present".into())
+            ]
+        );
+        drop(database);
+        let before = immutable_projection_state(&temp);
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_eq!(immutable_projection_state(&temp), before);
+        success(archive(&temp).args(["fsck"]));
+    }
+
+    #[test]
+    fn immutable_acceptance_rejects_nonfiles_untracked_paths_and_path_escapes_without_changes() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, content) = immutable_files_fixture();
+        fs::create_dir(content.join("subdir")).unwrap();
+        fs::create_dir(content.join(".git")).unwrap();
+        fs::write(content.join(".git/config"), b"not collection content").unwrap();
+        fs::write(
+            content.join("untracked.txt"),
+            b"new file requires normal add",
+        )
+        .unwrap();
+        symlink("a.txt", content.join("alias.txt")).unwrap();
+        symlink(&content, content.join("subdir/link")).unwrap();
+        let canonical = regular_file_tree(&root(&temp).join("canonical"));
+        let database = fs::read(root(&temp).join("archive.db")).unwrap();
+        let jobs = regular_file_tree(&root(&temp).join("local/jobs"));
+        for selected in [
+            "../files/a.txt",
+            "subdir",
+            "alias.txt",
+            "subdir/link/a.txt",
+            "untracked.txt",
+            ".git/config",
+            "absent.txt",
+        ] {
+            let output = archive(&temp)
+                .args([
+                    "collection",
+                    "add",
+                    content.to_str().unwrap(),
+                    "--collection",
+                    "Files",
+                    "--accept-changes",
+                    "a.txt",
+                    "--accept-changes",
+                    selected,
+                    "--yes",
+                    "--non-interactive",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "unexpectedly accepted {selected}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(regular_file_tree(&root(&temp).join("canonical")), canonical);
+            assert_eq!(fs::read(root(&temp).join("archive.db")).unwrap(), database);
+            assert_eq!(regular_file_tree(&root(&temp).join("local/jobs")), jobs);
+        }
+    }
+
+    #[test]
+    fn immutable_acceptance_cannot_redefine_an_imported_annex_identity() {
+        let (temp, _) = immutable_files_fixture();
+        let repo = inventory_only_annex_fixture(&temp);
+        success(archive(&temp).args([
+            "location",
+            "import-annex",
+            repo.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Annex",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--inventory-only",
+        ]));
+        // Make the tracked annex path an ordinary unlocked file so the refusal
+        // exercises its canonical identity, rather than generic symlink checks.
+        fs::remove_file(repo.join("src/sha256")).unwrap();
+        fs::write(
+            repo.join("src/sha256"),
+            b"an intentional edit cannot redefine an annex key",
+        )
+        .unwrap();
+        let canonical = regular_file_tree(&root(&temp).join("canonical"));
+        let database = fs::read(root(&temp).join("archive.db")).unwrap();
+        let jobs = regular_file_tree(&root(&temp).join("local/jobs"));
+        let refused = archive(&temp)
+            .args([
+                "collection",
+                "add",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--accept-changes",
+                "src/sha256",
+                "--yes",
+                "--non-interactive",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("annex"));
+        assert_eq!(regular_file_tree(&root(&temp).join("canonical")), canonical);
+        assert_eq!(fs::read(root(&temp).join("archive.db")).unwrap(), database);
+        assert_eq!(regular_file_tree(&root(&temp).join("local/jobs")), jobs);
+
+        // Resolving an annex-origin File does not prevent ordinary backups
+        // from establishing copies against its unchanged canonical identity.
+        fs::write(repo.join("src/sha256"), b"available sha256").unwrap();
+        let scanned = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        // The fixture deliberately includes a separate corrupt annex object.
+        assert_eq!(scanned.status.code(), Some(10));
+        assert_eq!(json(&scanned)["summary"]["integrity_mismatches"], 1);
+        let identity = || {
+            rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap().query_row(
+                "SELECT object_id, external_identity_id FROM file_refs WHERE logical_path_display = 'src/sha256'",
+                [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+        };
+        let expected_identity = identity();
+        let backup = temp.path().join("ordinary-annex-backup");
+        fs::create_dir_all(backup.join("src")).unwrap();
+        fs::write(backup.join("src/sha256"), b"available sha256").unwrap();
+        success(archive(&temp).args([
+            "location",
+            "init",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Ordinary Backup",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        assert_eq!(identity(), expected_identity);
+        fs::write(backup.join("src/sha256"), b"damaged ordinary backup").unwrap();
+        let corrupt = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                backup.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(corrupt.status.code(), Some(10));
+        assert_eq!(json(&corrupt)["summary"]["integrity_mismatches"], 1);
+        assert_eq!(identity(), expected_identity);
+        let connection = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        let copy: (String, String, String) = connection.query_row(
+            "SELECT c.object_id, c.state, c.last_verification_result FROM copy_claims c JOIN locations l USING (location_id) WHERE l.display_name = 'Ordinary Backup' AND c.relative_path_display = 'src/sha256' AND c.state != 'superseded'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            copy,
+            (
+                expected_identity.0,
+                "corrupt".into(),
+                "hash_mismatch".into()
+            )
+        );
+        drop(connection);
+        let before = immutable_projection_state(&temp);
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_eq!(immutable_projection_state(&temp), before);
+    }
+
     fn inventory_checkpoint_fixture() -> (TempDir, PathBuf) {
         use std::os::unix::fs::symlink;
         use std::os::unix::net::UnixListener;

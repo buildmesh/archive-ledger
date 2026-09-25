@@ -309,7 +309,7 @@ archive collection add . --collection "Documents"
 ```
 
 `collection add` infers the current Location and is positive-only. It streams traversal, computes
-BLAKE3 for new or changed regular files, records successful reads as verification and presence at
+BLAKE3 for regular files, records matching reads as verification and presence at
 that Location, and never marks an unvisited file missing. Git metadata named `.git` is always
 excluded. It can safely target a subtree:
 
@@ -332,12 +332,28 @@ Only a successfully completed scan can mark prior paths missing. Traversal error
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.
 Partial runs retain positives but cannot publish missing facts or fresh complete-coverage evidence.
 
-The human scan summary separates what was learned: files first added to this Location, files that
-were already known there, missing files, and files whose content was actually hashed and
-integrity-verified during this scan. A known path whose catalog observation needed refreshing is
-not described as a changed file. The versioned JSON retains the legacy `changed_paths` field for
-compatibility; it means an existing path observation was updated, not necessarily that its bytes
-changed. `integrity_verified_paths` is the explicit byte-verification count.
+Cataloged content is immutable by default. If a known file's bytes differ, add and scan report
+“content differs from catalog,” mark that copy corrupt, and return exit code 10. The File keeps
+its expected content identity. Restoring the original bytes and rescanning makes the copy good
+again. Merely changing modification time without changing bytes is not an integrity failure.
+
+To accept an intentional edit, name the exact ordinary file relative to the inventory directory:
+
+```bash
+archive collection add . --accept-changes notes.txt --dry-run
+archive collection add . --accept-changes notes.txt --yes
+```
+
+Repeat `--accept-changes FILE` for multiple files. Only those files are processed; directories,
+unknown paths, and annex-managed files cannot be accepted this way. Preview hashes current bytes
+without recording changes. Acceptance hashes them again, updates the catalog, and leaves file
+contents untouched. Without `--yes`, an interactive confirmation is required; scripts can use
+`--non-interactive --yes`. Paused acceptance jobs retain their exact selection for `job resume`.
+
+The v2 JSON summary reports `new_paths`, `confirmed_good`, `missing_paths`, and
+`integrity_mismatches`. `changed_paths` counts explicitly accepted changes to known content;
+ordinary add and scan never increment it for unexpected edits. `integrity_findings` provides up
+to 20 example paths; the mismatch count includes all findings.
 
 ## Check an unfamiliar directory before deleting its original
 

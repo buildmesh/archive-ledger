@@ -25,6 +25,10 @@ use crate::v2_store::{V2AppendResult, V2OriginStore, V2StoreError};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
+mod acceptance;
+pub use acceptance::{preview_changes, V2ChangePreview};
+use acceptance::{selected_files, validate_selected_path};
+
 #[cfg(test)]
 mod recovery_tests;
 
@@ -84,6 +88,7 @@ pub struct V2InventoryConfig {
     pub scan_id: String,
     pub scan_mode: ScanMode,
     pub batch_entries: usize,
+    pub accept_changes: Vec<PathBuf>,
     pub max_items: Option<usize>,
 }
 
@@ -96,6 +101,8 @@ pub struct V2InventorySummary {
     pub confirmed_good: u64,
     pub observed_without_verification: u64,
     pub integrity_mismatches: u64,
+    #[serde(default)]
+    pub integrity_findings: Vec<RegistryPath>,
     pub missing_paths: u64,
     pub ignored_symlinks: u64,
     pub ignored_special_files: u64,
@@ -310,6 +317,7 @@ pub fn add_files(
         "scan_id": config.scan_id,
         "scan_mode": config.scan_mode.as_str(),
         "batch_entries": config.batch_entries,
+        "accept_changes": config.accept_changes.iter().map(|path| RegistryPath::from_path(path)).collect::<Vec<_>>(),
     });
     let connection =
         Connection::open(projection.path()).map_err(|source| V2InventoryError::Sqlite {
@@ -360,6 +368,9 @@ pub fn add_files(
             append: None,
             apply: Some(initial_apply),
         });
+    }
+    if !config.accept_changes.is_empty() {
+        selected_files(&connection, projection.path(), config)?;
     }
     job.ensure()
         .map_err(|source| io_error("create inventory job directory", &job_root, source))?;
@@ -562,7 +573,7 @@ pub fn add_files(
     }
     let mut known = connection
         .prepare(
-            "SELECT object_id FROM file_refs WHERE collection_id = ?1 AND logical_path_encoding = ?2 AND logical_path_bytes = ?3 AND path_state = 'active'",
+            "SELECT object_id, file_ref_id, identity_state FROM file_refs WHERE collection_id = ?1 AND logical_path_encoding = ?2 AND logical_path_bytes = ?3 ORDER BY (path_state = 'active') DESC LIMIT 1",
         )
         .map_err(|source| V2InventoryError::Sqlite {
             path: projection.path().to_path_buf(),
@@ -588,7 +599,18 @@ pub fn add_files(
     checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
     seen.execute_batch("BEGIN IMMEDIATE")
         .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
-    let discovery = FileDiscovery::with_exclusions(&config.root_path, config.exclusions.clone())?;
+    let discovery: Box<dyn Iterator<Item = DiscoveryItem>> = if config.accept_changes.is_empty() {
+        Box::new(FileDiscovery::with_exclusions(
+            &config.root_path,
+            config.exclusions.clone(),
+        )?)
+    } else {
+        Box::new(
+            selected_files(&connection, projection.path(), config)?
+                .into_iter()
+                .map(DiscoveryItem::File),
+        )
+    };
     for discovered in discovery {
         // Check at the next iteration so every branch (including nonspooled
         // outcomes and early continues) checkpoints its complete decision.
@@ -667,6 +689,9 @@ pub fn add_files(
                         summary.observed_without_verification.saturating_add(1);
                     continue;
                 }
+                if !config.accept_changes.is_empty() {
+                    validate_selected_path(config, &relative)?;
+                }
                 let hashed = match hash_file_stable(
                     &absolute,
                     &file,
@@ -702,6 +727,9 @@ pub fn add_files(
                         continue;
                     }
                 };
+                if !config.accept_changes.is_empty() {
+                    validate_selected_path(config, &relative)?;
+                }
                 let copy_path = annex
                     .as_ref()
                     .and_then(|known| known.copy_path.clone())
@@ -738,14 +766,14 @@ pub fn add_files(
                     continue;
                 }
                 let copy_encoded = encode_relative_path(&copy_path);
-                let existing: Option<Option<String>> = known
+                let existing: Option<(Option<String>, String, String)> = known
                     .query_row(
                         params![
                             config.collection_id,
                             logical_encoded.encoding.as_str(),
                             logical_encoded.bytes,
                         ],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()
                     .map_err(|source| V2InventoryError::Sqlite {
@@ -753,21 +781,66 @@ pub fn add_files(
                         source,
                     })?;
                 let object_id = format!("blake3:{}", hashed.blake3_hex);
-                match existing.as_ref().and_then(|value| value.as_deref()) {
+                if annex.is_none() {
+                    if let Some((expected, file_id, state)) = &existing {
+                        if state != "resolved" || expected.is_none() {
+                            return Err(V2InventoryError::Invalid(format!(
+                                "cataloged path {} has unresolved identity; ordinary inventory cannot replace it",
+                                logical_encoded.display
+                            )));
+                        }
+                        let expected = expected.as_ref().expect("checked above");
+                        if expected != &object_id && config.accept_changes.is_empty() {
+                            let item = ordinary_verification_failure_item(
+                                config,
+                                file_id,
+                                expected,
+                                &logical_path,
+                                &copy_path,
+                                &hashed,
+                                observed_time_utc_ms,
+                            );
+                            write_spool_item(&mut spool, &item)?;
+                            record_seen
+                                .execute(params![
+                                    logical_encoded.encoding.as_str(),
+                                    logical_encoded.bytes
+                                ])
+                                .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+                            summary.files_observed = summary.files_observed.saturating_add(1);
+                            summary.bytes_observed =
+                                summary.bytes_observed.saturating_add(hashed.size_bytes);
+                            summary.integrity_mismatches =
+                                summary.integrity_mismatches.saturating_add(1);
+                            if summary.integrity_findings.len() < 20 {
+                                summary
+                                    .integrity_findings
+                                    .push(RegistryPath::from_path(&logical_path));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                match existing.as_ref().and_then(|value| value.0.as_deref()) {
                     None => summary.new_paths = summary.new_paths.saturating_add(1),
                     Some(existing) if existing != object_id => {
                         summary.changed_paths = summary.changed_paths.saturating_add(1)
                     }
                     Some(_) => summary.confirmed_good = summary.confirmed_good.saturating_add(1),
                 }
-                let file_ref_id = stable_id(
-                    "file",
-                    &[
-                        config.collection_id.as_bytes(),
-                        logical_encoded.encoding.as_str().as_bytes(),
-                        &logical_encoded.bytes,
-                    ],
-                );
+                let file_ref_id = existing
+                    .as_ref()
+                    .map(|value| value.1.clone())
+                    .unwrap_or_else(|| {
+                        stable_id(
+                            "file",
+                            &[
+                                config.collection_id.as_bytes(),
+                                logical_encoded.encoding.as_str().as_bytes(),
+                                &logical_encoded.bytes,
+                            ],
+                        )
+                    });
                 let copy_claim_id = annex
                     .as_ref()
                     .and_then(|known| known.copy_claim_id.clone())
@@ -784,6 +857,7 @@ pub fn add_files(
                     });
                 let item = json!({
                     "kind": "content_observed",
+                    "accepted_change": !config.accept_changes.is_empty(),
                     "collection_id": config.collection_id,
                     "location_id": config.location_id,
                     "logical_path": registry_path(&logical_encoded),
@@ -1220,10 +1294,16 @@ pub fn add_files(
 fn default_inventory_batch_entries(value: &mut serde_json::Value) {
     if let Some(object) = value.as_object_mut() {
         object.entry("batch_entries").or_insert(json!(1_000));
+        object.entry("accept_changes").or_insert(json!([]));
     }
 }
 
 fn validate_config(config: &V2InventoryConfig) -> Result<()> {
+    if !config.accept_changes.is_empty() && config.scan_mode != ScanMode::Add {
+        return Err(V2InventoryError::Invalid(
+            "accept_changes is only valid for collection add".to_owned(),
+        ));
+    }
     if config.batch_entries == 0 {
         return Err(V2InventoryError::Invalid(
             "batch_entries must be positive".to_owned(),
@@ -1435,6 +1515,56 @@ fn annex_missing_copy_item(
         "location_id": config.location_id,
         "path": RegistryPath::from_path(copy_path),
     }))
+}
+
+fn ordinary_verification_failure_item(
+    config: &V2InventoryConfig,
+    file_ref_id: &str,
+    expected_object: &str,
+    logical_path: &Path,
+    copy_path: &Path,
+    hashed: &HashedContent,
+    observed_time: u64,
+) -> serde_json::Value {
+    let encoded = encode_relative_path(copy_path);
+    let copy_claim_id = stable_id(
+        "copy",
+        &[
+            config.location_id.as_bytes(),
+            encoded.encoding.as_str().as_bytes(),
+            &encoded.bytes,
+            expected_object.as_bytes(),
+        ],
+    );
+    json!({
+        "kind": "copy_verification_failed",
+        "collection_id": config.collection_id,
+        "file_ref_id": file_ref_id,
+        "copy_claim_id": copy_claim_id,
+        "object_id": expected_object,
+        "location_id": config.location_id,
+        "logical_path": RegistryPath::from_path(logical_path),
+        "copy_path": RegistryPath::from_path(copy_path),
+        "result": "hash_mismatch",
+        "expected_hash_algo": "blake3",
+        "expected_hash_hex": expected_object.strip_prefix("blake3:"),
+        "observed_hash_hex": hashed.blake3_hex,
+        "size_bytes": hashed.size_bytes,
+        "duration_ms": hashed.duration_ms,
+        "verified_time_utc_ms": observed_time,
+        "device_fingerprint_status": config.device_fingerprint_status,
+        "error_detail": "content differs from catalog",
+        "job_id": config.job_id,
+        "scan_id": config.scan_id,
+        "job_type": if config.scan_mode == ScanMode::Add { "inventory_add" } else { "location_scan" },
+        "item_type": "copy_claim",
+        "item_key": copy_claim_id,
+        "outcome_kind": "hash_mismatch",
+        "operation_key": stable_id("op", &[
+            config.job_id.as_bytes(), config.scan_id.as_bytes(), copy_claim_id.as_bytes(),
+            b"hash_mismatch", hashed.blake3_hex.as_bytes(),
+        ]),
+    })
 }
 
 fn annex_verification_failure_item(

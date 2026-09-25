@@ -114,7 +114,8 @@ pub use v2_fsck::{
     fsck_v2_archive, V2FsckCheck, V2FsckError, V2FsckOptions, V2FsckReport, V2TableDigest,
 };
 pub use v2_inventory::{
-    add_files as v2_add_files, record_placements as v2_record_placements, V2InventoryConfig,
+    add_files as v2_add_files, preview_changes as v2_preview_changes,
+    record_placements as v2_record_placements, V2ChangePreview, V2InventoryConfig,
     V2InventoryError, V2InventoryResult, V2InventorySummary, V2Placement,
 };
 pub use v2_projection::{

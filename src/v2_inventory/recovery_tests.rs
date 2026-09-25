@@ -44,6 +44,7 @@ fn checkpoint_keeps_nonspooled_decisions_atomic_with_outcomes_and_summary() {
             concurrent_changes: 2,
             observed_without_verification: 3,
             integrity_mismatches: 4,
+            integrity_findings: vec![RegistryPath::from_path(Path::new("damaged.txt"))],
             ..Default::default()
         };
         checkpoint_inventory(&mut spool, &seen, &seen_path, &summary).unwrap();
@@ -133,4 +134,24 @@ fn interruption_before_first_checkpoint_restarts_unpublished_progress() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn legacy_inventory_jobs_default_to_no_accepted_changes() {
+    let mut old_config = json!({"scan_mode": "add"});
+    default_inventory_batch_entries(&mut old_config);
+    assert_eq!(old_config["accept_changes"], json!([]));
+    let mut explicit =
+        json!({"scan_mode": "add", "accept_changes": [{"encoding": "utf8", "text": "chosen"}]});
+    let selection = explicit["accept_changes"].clone();
+    default_inventory_batch_entries(&mut explicit);
+    assert_eq!(explicit["accept_changes"], selection);
+
+    let mut legacy_summary = serde_json::to_value(V2InventorySummary::default()).unwrap();
+    legacy_summary
+        .as_object_mut()
+        .unwrap()
+        .remove("integrity_findings");
+    let summary: V2InventorySummary = serde_json::from_value(legacy_summary).unwrap();
+    assert!(summary.integrity_findings.is_empty());
 }
