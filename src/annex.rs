@@ -392,6 +392,7 @@ impl<'a> V2AnnexImporter<'a> {
             }
         })?;
         self.progress_phase("Preparing catalog");
+        self.store.recover_pending_publication()?;
         self.projection.apply(self.store)?;
         self.progress_phase("Inspecting source metadata");
         let initial = SourceSnapshot::capture_with_progress(&self.config.repo_path, self.progress)?;

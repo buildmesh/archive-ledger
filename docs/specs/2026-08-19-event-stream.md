@@ -120,6 +120,15 @@ The canonical Git commit binds both the pointer and referenced manifest. Git
 synchronization constructs a verified successor rather than text-merging this
 pointer.
 
+If interruption occurs after `HEAD` advances but before its Git commit, job resume and the next
+local append reconcile that pending publication under the append lock. Recovery verifies the
+signed history and requires one direct successor of the committed frontier, advancing only the
+active local origin by one segment. Only the exact segment, manifest, successor frontier, and
+`HEAD` may differ; unrelated worktree/index changes, unfinished Git operations, unsafe links, or
+ambiguous historical files cause a recoverable refusal. Already-staged matching files are allowed. Recovery commits the
+verified bytes without generating another batch, before resume projects completion or removes
+local job inputs. Read-only verification does not perform this recovery.
+
 An interrupted local append can leave its next-sequence segment, manifest, or
 detached successor frontier durable before `HEAD` advances. On retry, the writer
 holds the append lock, verifies accepted history, and checks that the leftover

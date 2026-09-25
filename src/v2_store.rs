@@ -40,6 +40,9 @@ const COORDINATION_LEASE_VERSION: u32 = 1;
 const PORTABLE_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_COORDINATION_LEASE_MS: u64 = 120_000;
 
+mod publication;
+#[cfg(test)]
+mod publication_tests;
 mod recovery;
 #[cfg(test)]
 mod recovery_tests;
@@ -71,6 +74,8 @@ impl Drop for RemoveOnDrop {
 
 #[derive(Debug, Error)]
 pub enum V2StoreError {
+    #[error("pending publication recovery refused: {0}; preserve the files, resolve unrelated Git changes, and inspect with archive fsck before retrying")]
+    PublicationRecoveryRefused(String),
     #[error("unpublished append recovery refused: {0}; preserve the files and inspect with archive fsck")]
     AppendRecoveryRefused(String),
     #[error("version 2 event tree is invalid: {0}")]
@@ -112,6 +117,7 @@ pub enum V2StoreError {
 impl V2StoreError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::PublicationRecoveryRefused(_) => "v2_publication_recovery_refused",
             Self::AppendRecoveryRefused(_) => "v2_append_recovery_refused",
             Self::Io { .. } => "v2_store_io",
             Self::Json { .. } => "v2_store_json_invalid",
@@ -2117,6 +2123,24 @@ impl V2OriginStore {
                 "batch context and defaults must be JSON objects".to_owned(),
             ));
         }
+        let (lock, lock_path) = self.acquire_append_lock()?;
+        let result = self.append_batch_locked(
+            operation_kind,
+            item_schema_version,
+            context,
+            defaults,
+            items,
+        );
+        let unlock = FileExt::unlock(&lock)
+            .map_err(|source| io_error("unlock canonical append", &lock_path, source));
+        match (result, unlock) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(())) => Ok(result),
+        }
+    }
+
+    fn acquire_append_lock(&self) -> Result<(File, PathBuf)> {
         let local = self.root.parent().ok_or_else(|| {
             V2StoreError::Invalid("canonical event tree has no Archive parent".to_owned())
         })?;
@@ -2134,20 +2158,7 @@ impl V2OriginStore {
             .map_err(|source| io_error("open append lock", &lock_path, source))?;
         lock.lock_exclusive()
             .map_err(|source| io_error("lock canonical append", &lock_path, source))?;
-        let result = self.append_batch_locked(
-            operation_kind,
-            item_schema_version,
-            context,
-            defaults,
-            items,
-        );
-        let unlock = FileExt::unlock(&lock)
-            .map_err(|source| io_error("unlock canonical append", &lock_path, source));
-        match (result, unlock) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(result), Ok(())) => Ok(result),
-        }
+        Ok((lock, lock_path))
     }
 
     fn append_batch_locked<I>(
@@ -2162,6 +2173,7 @@ impl V2OriginStore {
         I: Iterator<Item = Result<Value>>,
     {
         validate_item_defaults(item_schema_version, &defaults)?;
+        self.recover_pending_publication_locked()?;
         let origin_id = self.active_origin_id()?;
         let genesis_path = self.root.join("genesis.json");
         let genesis: SignedGenesis = parse_json(&genesis_path, &read_file(&genesis_path)?)?;
@@ -4091,6 +4103,10 @@ fn commit_canonical_tree(root: &Path, operation_kind: &str) -> Result<String> {
         "stage canonical mutation",
         &["add", "--", "events", "manifests", "frontiers"],
     )?;
+    commit_staged_canonical_tree(root, operation_kind)
+}
+
+fn commit_staged_canonical_tree(root: &Path, operation_kind: &str) -> Result<String> {
     let message = format!("Archive Ledger: {operation_kind}");
     let output = managed_git_command()
         .arg("-C")

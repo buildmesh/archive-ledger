@@ -1791,6 +1791,93 @@ mod unix {
     }
 
     #[test]
+    fn inventory_resume_finishes_interrupted_git_publication_without_duplicate_events() {
+        for already_applied in [false, true] {
+            let (temp, content) = inventory_checkpoint_fixture();
+            assert_eq!(
+                inventory_checkpoint_scan(&temp, &content, true)["status"],
+                "running"
+            );
+            let canonical = root(&temp).join("canonical");
+            let before_commit = git(&canonical, &["rev-parse", "HEAD"]).stdout;
+            let before_frontier = fs::read(canonical.join("frontiers/v2/HEAD")).unwrap();
+            // Exercise the real boundary: append advances its durable frontier,
+            // then Git refuses publication because its index is locked.
+            let index_lock = canonical.join(".git/index.lock");
+            fs::write(&index_lock, b"test-owned publication interruption").unwrap();
+            let failed = archive(&temp)
+                .args(["--json", "job", "resume", "job_inventory_checkpoint"])
+                .output()
+                .unwrap();
+            assert!(!failed.status.success());
+            assert_ne!(
+                fs::read(canonical.join("frontiers/v2/HEAD")).unwrap(),
+                before_frontier
+            );
+            assert_eq!(
+                git(&canonical, &["rev-parse", "HEAD"]).stdout,
+                before_commit
+            );
+            fs::remove_file(index_lock).unwrap();
+            let canonical_bytes = || {
+                let mut files = regular_file_tree(&canonical);
+                files.retain(|path, _| !path.starts_with(".git"));
+                files
+            };
+            let pending_tree = canonical_bytes();
+            let pending_events = json(&success(
+                archive(&temp).args(["--json", "events", "verify"]),
+            ));
+            let spool =
+                root(&temp).join("local/jobs/job_inventory_checkpoint/inventory-items.jsonl");
+            assert!(spool.exists());
+            if already_applied {
+                success(archive(&temp).args(["db", "apply"]));
+                let job = json(&success(archive(&temp).args([
+                    "--json",
+                    "job",
+                    "show",
+                    "job_inventory_checkpoint",
+                ])));
+                assert_eq!(job["status"], "complete");
+            }
+            let resumed = json(&success(archive(&temp).args([
+                "--json",
+                "job",
+                "resume",
+                "job_inventory_checkpoint",
+            ])));
+            assert_eq!(resumed["status"], "complete");
+            assert_eq!(resumed["summary"]["files_observed"], 3);
+            assert!(!spool.exists());
+            assert_eq!(canonical_bytes(), pending_tree);
+            assert!(git(&canonical, &["status", "--porcelain"])
+                .stdout
+                .is_empty());
+            assert_eq!(
+                git(&canonical, &["show", "HEAD:frontiers/v2/HEAD"]).stdout,
+                fs::read(canonical.join("frontiers/v2/HEAD")).unwrap()
+            );
+            assert_eq!(
+                git(&canonical, &["rev-parse", "HEAD^"]).stdout,
+                before_commit
+            );
+            let after_events = json(&success(
+                archive(&temp).args(["--json", "events", "verify"]),
+            ));
+            assert_eq!(after_events, pending_events);
+            let projected = immutable_projection_state(&temp);
+            success(archive(&temp).args(["db", "rebuild"]));
+            assert_eq!(immutable_projection_state(&temp), projected);
+            success(
+                archive(&temp)
+                    .args(["fsck", "--full", "--rebuild-dir"])
+                    .arg(temp.path().join("publication-rebuild")),
+            );
+        }
+    }
+
+    #[test]
     fn inventory_checkpoint_discards_uncommitted_tail_and_preserves_scan_summary() {
         let (baseline_temp, baseline_content) = inventory_checkpoint_fixture();
         let uninterrupted = inventory_checkpoint_scan(&baseline_temp, &baseline_content, false);
@@ -2755,6 +2842,23 @@ mod unix {
         ])));
         assert_eq!(paused["annex_import"]["status"], "running");
         assert_eq!(paused["annex_import"]["summary"]["unchecked"], 1);
+        let canonical = root(&temp).join("canonical");
+        let before_commit = git(&canonical, &["rev-parse", "HEAD"]).stdout;
+        let index_lock = canonical.join(".git/index.lock");
+        fs::write(&index_lock, b"test-owned publication interruption").unwrap();
+        let failed = archive(&temp)
+            .args(["--json", "job", "resume", "job_unchecked_resume"])
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        fs::remove_file(index_lock).unwrap();
+        let pending = json(&success(
+            archive(&temp).args(["--json", "events", "verify"]),
+        ));
+        assert_ne!(
+            git(&canonical, &["show", "HEAD:frontiers/v2/HEAD"]).stdout,
+            fs::read(canonical.join("frontiers/v2/HEAD")).unwrap()
+        );
         let resumed = json(&success(archive(&temp).args([
             "--json",
             "job",
@@ -2764,6 +2868,19 @@ mod unix {
         assert_eq!(resumed["summary"]["unchecked"], 4);
         assert_eq!(resumed["summary"]["present"], 0);
         assert_eq!(resumed["summary"]["mismatched"], 0);
+        assert_eq!(
+            json(&success(
+                archive(&temp).args(["--json", "events", "verify"])
+            )),
+            pending
+        );
+        assert_eq!(
+            git(&canonical, &["rev-parse", "HEAD^"]).stdout,
+            before_commit
+        );
+        assert!(git(&canonical, &["status", "--porcelain"])
+            .stdout
+            .is_empty());
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         assert_eq!(
             database

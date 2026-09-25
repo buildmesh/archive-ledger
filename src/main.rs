@@ -8871,7 +8871,17 @@ fn execute_v2_job(
         JobCommand::Resume { job_id, max_items } => {
             let job = v2_local_job(database, job_id)?
                 .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
-            if matches!(job.status.as_str(), "complete" | "cancelled") {
+            let recovered = V2OriginStore::open(cli.events_path())?
+                .recover_pending_publication()?
+                .is_some();
+            // db apply may already have projected the pending completion. Let
+            // the job reconcile and clean up after finishing its publication.
+            let recovered_inventory = recovered
+                && matches!(
+                    job.job_type.as_str(),
+                    "inventory_add" | "location_scan" | "annex_import"
+                );
+            if job.status == "cancelled" || (job.status == "complete" && !recovered_inventory) {
                 return Err(AppError::Input(format!(
                     "job {job_id} is already {}",
                     job.status

@@ -716,8 +716,11 @@ archive job show <job-id>
 archive job resume <job-id>
 ```
 
-Resume applies canonical events first and uses deterministic outcomes, so interruption does not
-duplicate durable facts. Operations are batched and do not require all paths in memory.
+Resume first finishes a verified local publication interrupted between frontier advancement and
+its Git commit, then applies canonical events and reconciles deterministic outcomes. It does not
+duplicate durable facts. Recovery refuses unrelated canonical edits, unfinished Git operations, or
+ambiguous history; preserve the files and inspect the reported problem before retrying. Operations
+are batched and do not require all paths in memory.
 
 ## Protect and recover the catalog
 

@@ -288,6 +288,9 @@ pub fn add_files(
             io_error("lock inventory job", job.path(), source)
         }
     })?;
+    // A durable frontier may still need its Git commit after an interrupted
+    // append. Finish that publication before projecting completion or cleanup.
+    store.recover_pending_publication()?;
     let coordination_remote =
         if config.scan_mode == ScanMode::Complete && store.coordination_required()? {
             let remote = store.coordination_remote()?;
