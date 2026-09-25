@@ -293,6 +293,157 @@ These are recorded-present copy counts, not qualifying Policy copies, distinct D
 distinct Sites. Refresh relevant Locations first when current physical presence matters. Use the
 Policy workflow above when freshness and independent failure domains should affect the result.
 
+## SQLite temporary-directory failure and recovery
+
+A large annex import can save canonical events before updating the SQLite projection fails:
+
+```text
+error [v2_projection_sqlite]: SQLite operation failed for .../archive.db: disk I/O error
+```
+
+The database path identifies the affected catalog; it does not establish which underlying file
+operation failed. SQLite can need temporary files as operations outgrow their temporary page
+caches, and an unavailable temporary directory can produce an I/O error. Other I/O errors have
+different causes, so do not assume every occurrence has this explanation. See SQLite's
+[temporary-file documentation](https://www.sqlite.org/tempfiles.html#temporary_file_storage_locations)
+and [extended error codes](https://www.sqlite.org/rescode.html#ioerr_gettemppath).
+
+### What the observed failure established
+
+During a real large-repository import, the catalog was on a read/write ext4 bind mount. It had
+42 GB available despite `df` rounding usage to 100%, and only 5% of its inodes were used. The
+supplied kernel-log excerpt contained normal startup messages without a reported storage error;
+this did not rule out all storage faults. In the diagnostic container, `/tmp` resolved to the
+overlay filesystem rather than the writable tmpfs configured in this repository's Compose file.
+
+Routine `fsck` passed Git, signed-event, SQLite `quick_check`, and foreign-key checks, but found
+SQLite behind canonical history. Ordinary `db apply` reproduced the I/O error. Running the same
+command with `SQLITE_TMPDIR=/state` succeeded, and a subsequent `fsck` reported a current,
+healthy catalog with matching record counts and origin cursors.
+
+The operator subsequently reported an earlier out-of-space failure and changing the Compose
+`tmpfs` destination from `/tmp` to a host-looking disk directory. A `tmpfs` entry names a
+destination inside the container; it does not bind that host directory or use its disk space or
+permissions. That change explains why `/tmp` was on overlay and strongly supports unusable
+default temporary storage as the cause of the later I/O error. The exact failing syscall and
+SQLite extended error code were not captured. There was no evidence requiring a database
+rebuild, and this recovery did not rehash annex content.
+
+### Diagnose and recover
+
+Stop the failed import before recovery and preserve the Archive directory, including database
+sidecars and local job files. Do not delete the database or repeat `collection init` to clear
+this error. From the directory containing your Compose configuration, inspect the mounts:
+
+```bash
+docker compose run --rm --no-deps --entrypoint /bin/sh archive -c '
+  df -h /state /tmp
+  df -i /state /tmp
+  findmnt -T /state -o TARGET,SOURCE,FSTYPE,OPTIONS
+  findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS
+'
+```
+
+This starts a new container: it shows the current configuration, not the failed container's
+previous temporary-file usage. Also check host kernel logs around the failure for filesystem or
+device errors. Check the catalog without attempting repairs (replace `Main` with your Archive):
+
+```bash
+docker compose run --rm archive --archive Main fsck
+```
+
+If history and SQLite checks pass but the projection is behind, test the temporary-directory
+workaround with `/state` writable by the configured container UID/GID:
+
+```bash
+docker compose run --rm -e SQLITE_TMPDIR=/state archive --archive Main db apply
+# Run this after db apply succeeds:
+docker compose run --rm archive --archive Main fsck
+```
+
+`db apply` updates SQLite from saved canonical events. It does not scan or hash Location content.
+If the workaround also fails, preserve the error and investigate further instead of repeatedly
+retrying or assuming disk exhaustion. A successful routine `fsck` establishes the checks it
+reports; it does not verify annex payload integrity, prove the entire intended import completed,
+or perform the optional full projection-rebuild comparison.
+
+### Disk-backed temporary storage in Compose
+
+The repository's Compose configuration now sets `SQLITE_TMPDIR=/state` by default. Large SQLite
+operations can spill to disk without competing with the application for the RAM backing `/tmp`.
+Older or custom Compose files can adopt the same setting by adding this entry to the existing
+service environment, preserving its other entries:
+
+```yaml
+services:
+  archive:
+    environment:
+      SQLITE_TMPDIR: /state
+```
+
+It takes effect on subsequent `docker compose run` invocations without rebuilding the image.
+SQLite then prefers `/state` for temporary-file selection; temporary spill uses the state disk
+and needs free space there. This does not relocate the catalog or disable SQLite journaling.
+Temporary-space requirements depend on the operation and catalog; 4 GiB is not a universal
+threshold or a sizing guarantee. Increasing the tmpfs limit alone does not add RAM. Disk-backed
+SQLite temporary storage addresses the capacity limitation without enlarging tmpfs.
+
+Restore the original `/tmp` tmpfs entry if it was changed to a host-looking path: other tools
+also use `/tmp`. The container's tmpfs is separate from the host's `/tmp` mount. Docker normally
+limits a tmpfs to half the host's RAM unless a size is specified; a 4 GiB limit on an 8 GiB
+machine does not mean Docker mounted the host's `/tmp`. See
+[Docker tmpfs mounts](https://docs.docker.com/engine/storage/tmpfs/).
+
+### Use a dedicated disk directory for large temporary files
+
+`SQLITE_TMPDIR=/state` is sufficient when the state disk has adequate free space. To put SQLite
+spill files on a different disk, create a dedicated host directory on that mounted disk and make
+it writable by the configured container UID/GID. Use a bind mount, keeping the original `/tmp`
+tmpfs for other tools. Merge these settings into the service, preserving its existing environment
+and `/state` and Location volume entries:
+
+```yaml
+services:
+  archive:
+    environment:
+      SQLITE_TMPDIR: /sqlite-tmp
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: /var/data/disk7/tmp/archive-ledger
+        target: /sqlite-tmp
+        read_only: false
+        bind:
+          create_host_path: false
+```
+
+Here `source` is the host directory and `target` is its container path. SQLite temporary files
+use the host directory's filesystem capacity rather than the `/tmp` tmpfs limit. Mount the disk
+before starting the container. For the reported UID 1000 setup, host directory ownership by UID
+1000 works with a container configured to run as that UID. Confirm the effective mounts with:
+
+```bash
+docker compose run --rm --entrypoint /bin/sh archive -c '
+  id
+  df -h /tmp /sqlite-tmp
+  findmnt -T /sqlite-tmp -o TARGET,SOURCE,FSTYPE,OPTIONS
+  test -w /sqlite-tmp
+'
+```
+
+See [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/) for the distinction
+between a host source and a container destination.
+
+The reported I/O failure followed a deployment configuration mistake; the earlier temporary-space
+exhaustion also exposed a limitation of using tmpfs for large imports. The Compose default now
+addresses that limitation using the already-required writable state mount. Custom Compose files,
+overrides, and plain `docker run` deployments need to provide usable temporary storage too;
+plain `docker run` does not inherit Compose's environment settings. There is no demonstrated
+event-replay defect from this incident. Archive Ledger's error reporting still needs improvement:
+the current projection error message omits SQLite's extended error code, making different I/O
+failures hard to distinguish.
+
 ## Repeat the Docker end-to-end test
 
 With Docker Compose running and Python 3 available, run from the repository root. Image builds

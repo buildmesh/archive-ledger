@@ -179,6 +179,14 @@ mounts; `/state` and explicit copy destinations remain writable. See the
 [Docker Compose service reference](https://docs.docker.com/reference/compose-file/services/) for
 the capability and network controls.
 
+Compose sets `SQLITE_TMPDIR=/state` so large SQLite operations use the state disk for temporary
+files instead of consuming the RAM-backed `/tmp` capacity. Keep enough free space on the state
+disk for both the catalog and temporary files. Other tools retain writable `/tmp` on tmpfs.
+For a dedicated temporary-file disk, or if an older/custom setup fails during import or
+`db apply` with `v2_projection_sqlite: disk I/O error`, see
+[SQLite temporary-directory failure and recovery](docs/guides/annex-workflows.md#sqlite-temporary-directory-failure-and-recovery)
+for configuration, diagnostics, and recovery from saved events.
+
 Remote HTTP(S)/SSH synchronization and cloning require an explicit network opt-in for that command:
 
 ```bash
