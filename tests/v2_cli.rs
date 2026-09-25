@@ -1270,6 +1270,41 @@ mod unix {
         (temp, content)
     }
 
+    #[test]
+    fn location_scan_announces_resumable_job_only_in_human_mode() {
+        let (temp, content) = immutable_files_fixture();
+        let scan = |extra: &[&str]| {
+            let mut command = archive(&temp);
+            command.args(extra).args([
+                "location",
+                "scan",
+                "--path",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--max-items",
+                "1",
+                "--job-id",
+            ]);
+            command
+        };
+        let human = success(scan(&[]).arg("job_scan_hint"));
+        assert_eq!(
+            String::from_utf8(human.stderr).unwrap(),
+            "Location scan job job_scan_hint. If interrupted, resume with: archive job resume job_scan_hint\n",
+            "redirected stderr gets the hint but no live progress block"
+        );
+        assert!(String::from_utf8_lossy(&human.stdout)
+            .contains("Resume with: archive job resume job_scan_hint"));
+
+        let machine = success(scan(&["--json"]).arg("job_scan_json"));
+        assert!(machine.stderr.is_empty());
+        assert_eq!(json(&machine)["status"], "running");
+        let resumed = success(archive(&temp).args(["--json", "job", "resume", "job_scan_json"]));
+        assert!(resumed.stderr.is_empty());
+        assert_eq!(json(&resumed)["status"], "complete");
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()

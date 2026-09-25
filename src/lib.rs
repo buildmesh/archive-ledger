@@ -1,7 +1,6 @@
 //! Core library for Archive Ledger.
 
 pub mod annex;
-pub mod annex_progress;
 pub mod app_integration;
 pub mod catalog;
 pub mod discovery;
@@ -12,6 +11,7 @@ mod git;
 mod job;
 pub mod metadata;
 pub mod policy;
+pub mod progress;
 pub mod projection;
 pub mod registry;
 pub mod review;

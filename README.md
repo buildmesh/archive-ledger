@@ -328,6 +328,9 @@ cd /srv/archive/documents
 archive location scan
 ```
 
+On a terminal the scan shows live progress on stderr. It first prints its job ID; if the scan
+is interrupted, continue it with `archive job resume <job-id>`.
+
 Only a successfully completed scan can mark prior paths missing. Traversal errors, permission
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.
 Partial runs retain positives but cannot publish missing facts or fresh complete-coverage evidence.

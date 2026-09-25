@@ -1,4 +1,5 @@
-//! Ephemeral annex-import progress. No display state is persisted as archive evidence.
+//! Ephemeral job progress for annex imports and Location scans. No display
+//! state is persisted as archive evidence.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::{mpsc, Arc, Mutex};
@@ -6,24 +7,53 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::annex::AnnexSummary;
+use crate::v2_inventory::V2InventorySummary;
 use crate::v2_projection::V2ApplyProgress;
 use crate::v2_store::V2AppendProgress;
 
-#[derive(Clone, Default)]
-pub struct AnnexProgress {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressKind {
+    AnnexImport,
+    LocationScan,
+}
+
+#[derive(Clone)]
+pub struct Progress {
     state: Arc<Mutex<ProgressState>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ProgressState {
     phase: &'static str,
     inspected: u64,
     count: Option<(&'static str, u64, u64)>,
-    summary: AnnexSummary,
+    counters: Counters,
     bytes_read: u64,
 }
 
-impl AnnexProgress {
+#[derive(Clone)]
+enum Counters {
+    Annex(AnnexSummary),
+    Scan(V2InventorySummary),
+}
+
+impl Progress {
+    fn new(kind: ProgressKind) -> Self {
+        let counters = match kind {
+            ProgressKind::AnnexImport => Counters::Annex(AnnexSummary::default()),
+            ProgressKind::LocationScan => Counters::Scan(V2InventorySummary::default()),
+        };
+        Self {
+            state: Arc::new(Mutex::new(ProgressState {
+                phase: "",
+                inspected: 0,
+                count: None,
+                counters,
+                bytes_read: 0,
+            })),
+        }
+    }
+
     pub fn phase(&self, phase: &'static str) {
         let mut state = self.state.lock().unwrap();
         state.phase = phase;
@@ -85,7 +115,11 @@ impl AnnexProgress {
     }
 
     pub fn summary(&self, summary: &AnnexSummary) {
-        self.state.lock().unwrap().summary = summary.clone();
+        self.state.lock().unwrap().counters = Counters::Annex(summary.clone());
+    }
+
+    pub(crate) fn scan_summary(&self, summary: &V2InventorySummary) {
+        self.state.lock().unwrap().counters = Counters::Scan(summary.clone());
     }
 
     pub fn read_bytes(&self, count: usize) {
@@ -93,50 +127,97 @@ impl AnnexProgress {
         state.bytes_read = state.bytes_read.saturating_add(count as u64);
     }
 
-    fn fields(&self, elapsed: Duration) -> [String; 10] {
+    fn snapshot(&self, elapsed: Duration) -> Snapshot {
         let state = self.state.lock().unwrap().clone();
-        let summary = &state.summary;
-        [
-            format!("Annex import: {}", state.phase),
-            match state.count {
-                Some((label, done, total)) => format!("{done} / {total} {label}"),
-                None if state.inspected > 0 => format!("{} inspected", state.inspected),
-                None => String::new(),
-            },
-            format!("{} entries", summary.entries_seen),
-            format!("{} verified", summary.present),
-            format!("{} absent", summary.absent),
-            format!("{} unchecked", summary.unchecked),
-            format!(
-                "{} skipped links + {} other",
-                summary.ignored_symlinks,
-                summary
-                    .ignored_non_annex
-                    .saturating_sub(summary.ignored_symlinks)
+        let count = match state.count {
+            Some((label, done, total)) => format!("{done} / {total} {label}"),
+            None if state.inspected > 0 => format!("{} inspected", state.inspected),
+            None => String::new(),
+        };
+        let (title, counters) = match &state.counters {
+            Counters::Annex(summary) => (
+                "Annex import",
+                [
+                    vec![
+                        format!("{} entries", summary.entries_seen),
+                        format!("{} verified", summary.present),
+                        format!("{} absent", summary.absent),
+                    ],
+                    vec![
+                        format!("{} unchecked", summary.unchecked),
+                        format!(
+                            "{} skipped links + {} other",
+                            summary.ignored_symlinks,
+                            summary
+                                .ignored_non_annex
+                                .saturating_sub(summary.ignored_symlinks)
+                        ),
+                        format!("{} errors", summary.mismatched + summary.read_errors),
+                    ],
+                    vec![format!("{} read this run", gib(state.bytes_read))],
+                ],
             ),
-            format!("{} errors", summary.mismatched + summary.read_errors),
-            format!(
-                "{:.2} GiB read this run",
-                state.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0)
+            // No total is known during a walk, so show counts and elapsed time
+            // rather than a percentage. Counts include work resumed from a checkpoint.
+            Counters::Scan(summary) => (
+                "Location scan",
+                [
+                    vec![
+                        format!("{} files", summary.files_observed),
+                        format!("{} observed", gib(summary.bytes_observed)),
+                        // Moves during a long single-file hash, when file counts cannot.
+                        format!("{} read this run", gib(state.bytes_read)),
+                    ],
+                    vec![
+                        format!("{} new", summary.new_paths),
+                        format!("{} changed", summary.changed_paths),
+                        format!("{} confirmed good", summary.confirmed_good),
+                    ],
+                    vec![
+                        format!("{} integrity mismatches", summary.integrity_mismatches),
+                        format!(
+                            "{} read errors",
+                            summary.read_errors + summary.concurrent_changes
+                        ),
+                    ],
+                ],
             ),
-            format!("{}s", elapsed.as_secs()),
-        ]
+        };
+        let [first, second, third] = counters;
+        Snapshot {
+            heading: format!("{title}: {}", state.phase),
+            elapsed: format!("{}s", elapsed.as_secs()),
+            rows: [vec![count], first, second, third],
+        }
     }
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+/// A heading plus four display rows, each a list of `|`-separated fields.
+struct Snapshot {
+    heading: String,
+    elapsed: String,
+    rows: [Vec<String>; 4],
 }
 
 /// A heartbeat continues even while Git, a content read, or catalog publication blocks.
 /// Dropping it stops the thread immediately and leaves a final, newline-ended status.
-pub struct AnnexProgressReporter {
-    progress: AnnexProgress,
+pub struct ProgressReporter {
+    progress: Progress,
     stop: mpsc::Sender<()>,
     worker: Option<JoinHandle<()>>,
     finished: bool,
 }
 
-impl AnnexProgressReporter {
-    pub fn start() -> io::Result<Self> {
+impl ProgressReporter {
+    /// Terminals get a redrawn status block; redirected stderr gets a periodic log line.
+    pub fn start(kind: ProgressKind) -> io::Result<Self> {
         let terminal = io::stderr().is_terminal();
         Self::with_writer(
+            kind,
             io::stderr(),
             terminal,
             Duration::from_secs(if terminal { 1 } else { 30 }),
@@ -144,17 +225,18 @@ impl AnnexProgressReporter {
     }
 
     fn with_writer(
+        kind: ProgressKind,
         mut writer: impl Write + Send + 'static,
         terminal: bool,
         interval: Duration,
     ) -> io::Result<Self> {
-        let progress = AnnexProgress::default();
+        let progress = Progress::new(kind);
         progress.phase("Preparing");
         let start = Instant::now();
         let mut rendered = false;
         render(
             &mut writer,
-            &progress.fields(start.elapsed()),
+            &progress.snapshot(start.elapsed()),
             terminal,
             false,
             &mut rendered,
@@ -162,13 +244,13 @@ impl AnnexProgressReporter {
         let (stop, receiver) = mpsc::channel();
         let display = progress.clone();
         let worker = thread::Builder::new()
-            .name("annex-progress".to_owned())
+            .name("job-progress".to_owned())
             .spawn(move || loop {
                 let finished =
                     receiver.recv_timeout(interval) != Err(mpsc::RecvTimeoutError::Timeout);
                 render(
                     &mut writer,
-                    &display.fields(start.elapsed()),
+                    &display.snapshot(start.elapsed()),
                     terminal,
                     finished,
                     &mut rendered,
@@ -185,7 +267,7 @@ impl AnnexProgressReporter {
         })
     }
 
-    pub fn progress(&self) -> &AnnexProgress {
+    pub fn progress(&self) -> &Progress {
         &self.progress
     }
 
@@ -195,7 +277,7 @@ impl AnnexProgressReporter {
     }
 }
 
-impl Drop for AnnexProgressReporter {
+impl Drop for ProgressReporter {
     fn drop(&mut self) {
         if !self.finished {
             self.progress.continue_phase("Stopped before completion");
@@ -209,14 +291,14 @@ impl Drop for AnnexProgressReporter {
 
 fn render(
     writer: &mut impl Write,
-    fields: &[String; 10],
+    snapshot: &Snapshot,
     terminal: bool,
     finished: bool,
     rendered: &mut bool,
 ) {
     // Keep a compact five-line display on terminals instead of repeatedly wrapping
     // a long status line. Redirected logs get plain, newline-delimited snapshots.
-    // Display failures must not fail or interrupt an otherwise valid import.
+    // Display failures must not fail or interrupt an otherwise valid job.
     let joined = |values: &[String]| {
         values
             .iter()
@@ -229,20 +311,22 @@ fn render(
         if *rendered {
             let _ = write!(writer, "\x1b[4A");
         }
-        let _ = write!(writer, "\r\x1b[2K{} | {}\n", fields[0], fields[9]);
-        let _ = write!(writer, "\r\x1b[2K{}\n", fields[1]);
-        let _ = write!(writer, "\r\x1b[2K{}\n", joined(&fields[2..5]));
         let _ = write!(
             writer,
-            "\r\x1b[2K{} | {} | {}\n",
-            fields[5], fields[6], fields[7]
+            "\r\x1b[2K{} | {}",
+            snapshot.heading, snapshot.elapsed
         );
-        let _ = write!(writer, "\r\x1b[2K{}", fields[8]);
+        for row in &snapshot.rows {
+            let _ = write!(writer, "\n\r\x1b[2K{}", joined(row));
+        }
         if finished {
             let _ = writeln!(writer);
         }
     } else {
-        let _ = writeln!(writer, "{}", joined(fields));
+        let mut fields = vec![snapshot.heading.clone()];
+        fields.extend(snapshot.rows.iter().flatten().cloned());
+        fields.push(snapshot.elapsed.clone());
+        let _ = writeln!(writer, "{}", joined(&fields));
     }
     *rendered = true;
     let _ = writer.flush();
@@ -267,7 +351,7 @@ mod tests {
 
     #[test]
     fn publication_counters_use_phase_units_and_survive_finalization() {
-        let progress = AnnexProgress::default();
+        let progress = Progress::new(ProgressKind::AnnexImport);
         progress.phase("Rechecking source metadata");
         progress.inspected_entry();
         progress.summary(&AnnexSummary {
@@ -276,35 +360,35 @@ mod tests {
             ..Default::default()
         });
         progress.append_progress(V2AppendProgress::Verifying);
-        assert!(progress.fields(Duration::ZERO)[1].is_empty());
+        assert!(progress.snapshot(Duration::ZERO).rows[0][0].is_empty());
         progress.append_progress(V2AppendProgress::ReadingSpool {
             bytes_read: 256,
             total_bytes: 512,
         });
-        let fields = progress.fields(Duration::ZERO);
-        assert_eq!(fields[1], "256 / 512 spool bytes read");
-        assert_eq!(fields[2], "12 entries");
+        let snapshot = progress.snapshot(Duration::ZERO);
+        assert_eq!(snapshot.rows[0][0], "256 / 512 spool bytes read");
+        assert_eq!(snapshot.rows[1][0], "12 entries");
         progress.append_progress(V2AppendProgress::ReadingSpool {
             bytes_read: 512,
             total_bytes: 512,
         });
         progress.append_progress(V2AppendProgress::Publishing);
         assert_eq!(
-            progress.fields(Duration::ZERO)[0],
+            progress.snapshot(Duration::ZERO).heading,
             "Annex import: Finalizing catalog events"
         );
         assert_eq!(
-            progress.fields(Duration::ZERO)[1],
+            progress.snapshot(Duration::ZERO).rows[0][0],
             "512 / 512 spool bytes read"
         );
         progress.apply_progress(V2ApplyProgress::Verifying);
-        assert!(progress.fields(Duration::ZERO)[1].is_empty());
+        assert!(progress.snapshot(Duration::ZERO).rows[0][0].is_empty());
         progress.apply_progress(V2ApplyProgress::Applying {
             records_applied: 2,
             total_records: 5,
         });
         assert_eq!(
-            progress.fields(Duration::ZERO)[1],
+            progress.snapshot(Duration::ZERO).rows[0][0],
             "2 / 5 records replayed this pass"
         );
         progress.apply_progress(V2ApplyProgress::Applying {
@@ -313,18 +397,18 @@ mod tests {
         });
         progress.apply_progress(V2ApplyProgress::Finalizing);
         assert_eq!(
-            progress.fields(Duration::ZERO)[0],
+            progress.snapshot(Duration::ZERO).heading,
             "Annex import: Finalizing catalog index"
         );
         assert_eq!(
-            progress.fields(Duration::ZERO)[1],
+            progress.snapshot(Duration::ZERO).rows[0][0],
             "5 / 5 records replayed this pass"
         );
         progress.continue_phase("Stopped before completion");
         let mut log = Vec::new();
         render(
             &mut log,
-            &progress.fields(Duration::ZERO),
+            &progress.snapshot(Duration::ZERO),
             false,
             true,
             &mut false,
@@ -335,11 +419,71 @@ mod tests {
     }
 
     #[test]
+    fn scan_counters_render_without_a_percentage_and_fit_80_columns() {
+        let progress = Progress::new(ProgressKind::LocationScan);
+        progress.phase("Scanning files");
+        progress.scan_summary(&V2InventorySummary {
+            files_observed: 1_234_567,
+            bytes_observed: 3 * 1024 * 1024 * 1024,
+            new_paths: 1_000_000,
+            changed_paths: 12,
+            confirmed_good: 234_555,
+            integrity_mismatches: 1,
+            read_errors: 2,
+            concurrent_changes: 1,
+            ..Default::default()
+        });
+        progress.read_bytes(1536 * 1024 * 1024);
+        let snapshot = progress.snapshot(Duration::from_secs(7));
+        assert_eq!(snapshot.heading, "Location scan: Scanning files");
+        let mut output = Vec::new();
+        render(&mut output, &snapshot, true, true, &mut false);
+        let text = String::from_utf8(output).unwrap();
+        let rows: Vec<_> = text
+            .lines()
+            .map(|row| row.trim_start_matches("\r\x1b[2K"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "Location scan: Scanning files | 7s",
+                "",
+                "1234567 files | 3.00 GiB observed | 1.50 GiB read this run",
+                "1000000 new | 12 changed | 234555 confirmed good",
+                "1 integrity mismatches | 3 read errors",
+            ]
+        );
+        assert!(rows.iter().all(|row| row.len() <= 80));
+        assert!(!text.contains('%'));
+
+        progress.append_progress(V2AppendProgress::ReadingSpool {
+            bytes_read: 10,
+            total_bytes: 20,
+        });
+        let mut log = Vec::new();
+        render(
+            &mut log,
+            &progress.snapshot(Duration::from_secs(8)),
+            false,
+            false,
+            &mut false,
+        );
+        assert_eq!(
+            String::from_utf8(log).unwrap(),
+            "Location scan: Saving catalog events | 10 / 20 spool bytes read | 1234567 files | 3.00 GiB observed | 1.50 GiB read this run | 1000000 new | 12 changed | 234555 confirmed good | 1 integrity mismatches | 3 read errors | 8s\n"
+        );
+    }
+
+    #[test]
     fn heartbeat_reports_idle_phase_and_bytes_without_polluting_log_output() {
         let capture = Capture::default();
-        let reporter =
-            AnnexProgressReporter::with_writer(capture.clone(), false, Duration::from_millis(5))
-                .unwrap();
+        let reporter = ProgressReporter::with_writer(
+            ProgressKind::AnnexImport,
+            capture.clone(),
+            false,
+            Duration::from_millis(5),
+        )
+        .unwrap();
         reporter.progress().phase("Reading content");
         reporter.progress().read_bytes(1024 * 1024 * 1024);
         reporter.progress().summary(&AnnexSummary {
@@ -371,7 +515,7 @@ mod tests {
 
     #[test]
     fn terminal_counter_layout_fits_80_columns_and_redraws_all_rows() {
-        let progress = AnnexProgress::default();
+        let progress = Progress::new(ProgressKind::AnnexImport);
         progress.summary(&AnnexSummary {
             entries_seen: 800_000,
             present: 800_000,
@@ -385,7 +529,7 @@ mod tests {
         let mut rendered = false;
         render(
             &mut output,
-            &progress.fields(Duration::ZERO),
+            &progress.snapshot(Duration::ZERO),
             true,
             false,
             &mut rendered,
@@ -405,7 +549,7 @@ mod tests {
         progress.phase("Verifying catalog events");
         render(
             &mut output,
-            &progress.fields(Duration::ZERO),
+            &progress.snapshot(Duration::ZERO),
             true,
             true,
             &mut rendered,
@@ -420,9 +564,13 @@ mod tests {
     #[test]
     fn terminal_reporter_cleans_up_on_error_without_claiming_completion() {
         let capture = Capture::default();
-        let reporter =
-            AnnexProgressReporter::with_writer(capture.clone(), true, Duration::from_secs(30))
-                .unwrap();
+        let reporter = ProgressReporter::with_writer(
+            ProgressKind::AnnexImport,
+            capture.clone(),
+            true,
+            Duration::from_secs(30),
+        )
+        .unwrap();
         drop(reporter);
         let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         assert!(text.starts_with("\r\x1b[2K"));

@@ -26,15 +26,16 @@ pub fn preview_changes(
             let expected_object_id =
                 selected_object(&connection, projection.path(), config, &relative)?;
             validate_selected_path(config, &relative)?;
-            let hashed = match hash_file_stable(&config.root_path.join(&relative), file, false) {
-                HashOutcome::Stable(hashed) => hashed,
-                _ => {
-                    return Err(V2InventoryError::Invalid(format!(
-                        "cannot stably read selected file {}",
-                        relative.display()
-                    )))
-                }
-            };
+            let hashed =
+                match hash_file_stable(&config.root_path.join(&relative), file, false, None) {
+                    HashOutcome::Stable(hashed) => hashed,
+                    _ => {
+                        return Err(V2InventoryError::Invalid(format!(
+                            "cannot stably read selected file {}",
+                            relative.display()
+                        )))
+                    }
+                };
             validate_selected_path(config, &relative)?;
             let observed_object_id = format!("blake3:{}", hashed.blake3_hex);
             Ok(V2ChangePreview {

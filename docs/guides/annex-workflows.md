@@ -97,7 +97,9 @@ archive-docker location scan "Media source" --path /locations/source
 The scan reads available content, validates its original annex checksum, and establishes its
 BLAKE3 identity and verified presence. The positional argument is a Location name or ID, not a
 filesystem path; supply the mounted directory with `--path`. An incomplete scan cannot mark
-unvisited files missing.
+unvisited files missing. The scan prints its job ID and resume command on stderr before it starts;
+keep it for `archive job resume` if the scan is interrupted. Live scan progress needs a terminal,
+so omit Compose's `-T` to see it.
 
 Import progress goes to stderr through metadata inspection, import, source rechecking,
 publication, and projection. It includes processed entries, skipped links and other entries,

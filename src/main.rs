@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use archive_ledger::annex_progress::AnnexProgressReporter;
+use archive_ledger::progress::{ProgressKind, ProgressReporter};
 use archive_ledger::{
     access_plan, central_archive, create_portable_snapshot, fsck_v2_archive,
     inspect_portable_snapshot, install_portable_snapshot, introduced_files, utf8_path,
@@ -8949,7 +8949,7 @@ fn execute_v2_job(
                     );
                 }
                 "annex_import" => {
-                    let progress = AnnexProgressReporter::start()?;
+                    let progress = ProgressReporter::start(ProgressKind::AnnexImport)?;
                     let store = V2OriginStore::open(cli.events_path())?;
                     let importer = archive_ledger::V2AnnexImporter::new(
                         &store,
@@ -10570,7 +10570,7 @@ fn execute_v2_collection_add(
         }
     }
     let store = V2OriginStore::open(cli.events_path())?;
-    let result = archive_ledger::v2_add_files(&store, database, &config)?;
+    let result = archive_ledger::v2_add_files(&store, database, &config, None)?;
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -10724,7 +10724,24 @@ fn execute_v2_location_scan(
         ));
     }
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
     let store = V2OriginStore::open(cli.events_path())?;
+    // Human mode only: announce the job before any long work so an interrupted
+    // scan can be resumed, and show live progress only on an interactive terminal.
+    let progress = if cli.json {
+        None
+    } else {
+        eprintln!(
+            "Location scan job {job_id}. If interrupted, resume with: archive job resume {job_id}"
+        );
+        std::io::stderr()
+            .is_terminal()
+            .then(|| ProgressReporter::start(ProgressKind::LocationScan))
+            .transpose()?
+    };
     let result = archive_ledger::v2_add_files(
         &store,
         database,
@@ -10737,10 +10754,7 @@ fn execute_v2_location_scan(
             collection_id: collection.collection_id.clone(),
             location_id: location.location_id,
             device_fingerprint_status: fingerprint_status,
-            job_id: args
-                .job_id
-                .clone()
-                .unwrap_or_else(|| format!("job_{suffix}")),
+            job_id,
             scan_id: args
                 .scan_id
                 .clone()
@@ -10749,7 +10763,15 @@ fn execute_v2_location_scan(
             batch_entries: args.batch_entries,
             max_items: args.max_items,
         },
+        progress.as_ref().map(ProgressReporter::progress),
     )?;
+    if let Some(progress) = progress {
+        progress.finish(match result.status.as_str() {
+            "running" => "Paused",
+            "partial" => "Partial",
+            _ => "Complete",
+        });
+    }
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -12752,7 +12774,7 @@ fn execute_v2_annex_setup(
         ));
     }
     let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection, reimport)?;
-    let progress = AnnexProgressReporter::start()?;
+    let progress = ProgressReporter::start(ProgressKind::AnnexImport)?;
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id

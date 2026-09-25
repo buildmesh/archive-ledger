@@ -14,11 +14,11 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 
-use crate::annex_progress::AnnexProgress;
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
 use crate::git::managed_git_command;
 use crate::job::{validate_job_id, JobDirectory};
+use crate::progress::Progress;
 use crate::projection::{ProjectionDb, ProjectionError};
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 use crate::v2_store::{V2OriginStore, V2StoreError};
@@ -203,7 +203,7 @@ pub struct V2AnnexImporter<'a> {
     store: &'a V2OriginStore,
     projection: &'a V2ProjectionDb,
     config: AnnexImportConfig,
-    progress: Option<&'a AnnexProgress>,
+    progress: Option<&'a Progress>,
 }
 
 /// Detects a git-annex worktree from its local Git configuration without
@@ -354,7 +354,7 @@ impl<'a> V2AnnexImporter<'a> {
         })
     }
 
-    pub fn with_progress(mut self, progress: &'a AnnexProgress) -> Self {
+    pub fn with_progress(mut self, progress: &'a Progress) -> Self {
         self.progress = Some(progress);
         self
     }
@@ -1664,7 +1664,7 @@ fn inspect_entry_v2(
     entry: &IndexEntry,
     index_blob: &[u8],
     key: &AnnexKey,
-    progress: Option<&AnnexProgress>,
+    progress: Option<&Progress>,
 ) -> Result<EntryOutcome> {
     if config.inventory_only {
         return inventory_entry_v2(config, entry, index_blob, key);
@@ -1929,7 +1929,7 @@ fn hash_file(
     path: &Path,
     initial_metadata: &Metadata,
     hash_sha512: bool,
-    progress: Option<&AnnexProgress>,
+    progress: Option<&Progress>,
 ) -> Result<ContentHashes> {
     let start = std::time::Instant::now();
     let mut file =
@@ -2434,7 +2434,7 @@ impl SourceSnapshot {
         Self::capture_with_progress(repo, None)
     }
 
-    fn capture_with_progress(repo: &Path, progress: Option<&AnnexProgress>) -> Result<Self> {
+    fn capture_with_progress(repo: &Path, progress: Option<&Progress>) -> Result<Self> {
         Ok(Self {
             head: git_text(repo, "read HEAD", &["rev-parse", "--verify", "HEAD"])?,
             annex_branch: git_text_optional(
@@ -2465,7 +2465,7 @@ impl SourceSnapshot {
 }
 
 #[cfg(unix)]
-fn worktree_metadata_digest(repo: &Path, progress: Option<&AnnexProgress>) -> Result<String> {
+fn worktree_metadata_digest(repo: &Path, progress: Option<&Progress>) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
@@ -2510,7 +2510,7 @@ fn worktree_metadata_digest(repo: &Path, progress: Option<&AnnexProgress>) -> Re
 }
 
 #[cfg(not(unix))]
-fn worktree_metadata_digest(_repo: &Path, _progress: Option<&AnnexProgress>) -> Result<String> {
+fn worktree_metadata_digest(_repo: &Path, _progress: Option<&Progress>) -> Result<String> {
     Err(AnnexImportError::UnsupportedPlatform)
 }
 

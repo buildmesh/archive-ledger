@@ -796,6 +796,7 @@ impl V2OriginStore {
         Ok(appended)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_coordinated_jsonl_batch(
         &self,
         remote: &str,
@@ -804,18 +805,20 @@ impl V2OriginStore {
         mut context: Value,
         defaults: Value,
         spool_path: impl AsRef<Path>,
+        progress: Option<&mut dyn FnMut(V2AppendProgress)>,
     ) -> Result<V2AppendResult> {
         let lease = self.acquire_archive_lease(remote)?;
         let context_object = context.as_object_mut().ok_or_else(|| {
             V2StoreError::Invalid("coordinated batch context must be an object".to_owned())
         })?;
         context_object.insert("coordination".to_owned(), lease_context(&lease));
-        let appended = match self.append_jsonl_batch(
+        let appended = match self.append_jsonl_batch_with_progress(
             operation_kind,
             item_schema_version,
             context,
             defaults,
             spool_path,
+            progress,
         ) {
             Ok(appended) => appended,
             Err(error) => {

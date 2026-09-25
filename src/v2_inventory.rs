@@ -18,6 +18,7 @@ use crate::discovery::{
     EncodedPath, FileDiscovery,
 };
 use crate::job::{validate_job_id, JobDirectory};
+use crate::progress::Progress;
 use crate::registry::RegistryPath;
 use crate::scan::ScanMode;
 use crate::v2_projection::{V2ApplyStats, V2ProjectionDb, V2ProjectionError};
@@ -266,10 +267,13 @@ pub fn record_placements(
     Ok(Some((append, apply)))
 }
 
+/// `progress` receives ephemeral display updates only; nothing it observes is
+/// written to the job, the spool, or canonical history.
 pub fn add_files(
     store: &V2OriginStore,
     projection: &V2ProjectionDb,
     config: &V2InventoryConfig,
+    progress: Option<&Progress>,
 ) -> Result<V2InventoryResult> {
     validate_config(config)?;
     let archive_root = projection
@@ -294,12 +298,15 @@ pub fn add_files(
     let coordination_remote =
         if config.scan_mode == ScanMode::Complete && store.coordination_required()? {
             let remote = store.coordination_remote()?;
+            if let Some(progress) = progress {
+                progress.phase("Synchronizing catalog");
+            }
             store.sync_remote(&remote)?;
             Some(remote)
         } else {
             None
         };
-    let initial_apply = projection.apply(store)?;
+    let initial_apply = apply_with_progress(store, projection, progress)?;
     validate_scope(projection.path(), config)?;
     let job_type = if config.scan_mode == ScanMode::Add {
         "inventory_add"
@@ -338,19 +345,22 @@ pub fn add_files(
             path: projection.path().to_path_buf(),
             source,
         })?;
-    if let Some((actual_type, input_version, progress)) = completed {
+    if let Some((actual_type, input_version, stored_summary)) = completed {
         if actual_type != job_type || input_version != config.scan_id {
             return Err(V2InventoryError::Invalid(format!(
                 "job {} belongs to different immutable inputs",
                 config.job_id
             )));
         }
-        let summary = progress
+        let summary = stored_summary
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
             .map_err(|error| V2InventoryError::Invalid(format!("job summary is invalid: {error}")))?
             .unwrap_or_default();
+        if let Some(progress) = progress {
+            progress.scan_summary(&summary);
+        }
         job.cleanup(&[
             "inventory-config.json",
             "inventory-items.jsonl",
@@ -614,7 +624,13 @@ pub fn add_files(
                 .map(DiscoveryItem::File),
         )
     };
+    if let Some(progress) = progress {
+        progress.phase("Scanning files");
+    }
     for discovered in discovery {
+        if let Some(progress) = progress {
+            progress.scan_summary(&summary);
+        }
         // Check at the next iteration so every branch (including nonspooled
         // outcomes and early continues) checkpoints its complete decision.
         if processed_this_run - checkpointed_items >= config.batch_entries {
@@ -701,6 +717,7 @@ pub fn add_files(
                     annex
                         .as_ref()
                         .is_some_and(|known| known.expected_hash_algo.as_deref() == Some("sha512")),
+                    progress,
                 ) {
                     HashOutcome::Stable(hashed) => hashed,
                     HashOutcome::ReadError => {
@@ -980,6 +997,7 @@ pub fn add_files(
                     &known,
                     config,
                     observed_time_utc_ms,
+                    progress,
                 )? {
                     AnnexSymlinkObservation::Absent => {
                         if let Some(item) = known
@@ -1114,7 +1132,13 @@ pub fn add_files(
         && summary.read_errors == 0
         && summary.concurrent_changes == 0
         && summary.traversal_errors == 0;
+    if let Some(progress) = progress {
+        progress.scan_summary(&summary);
+    }
     if complete_safe {
+        if let Some(progress) = progress {
+            progress.phase("Checking for missing files");
+        }
         let mut missing = connection
             .prepare(
                 "SELECT p.file_ref_id, p.observed_path_encoding, p.observed_path_bytes, p.observed_path_display,
@@ -1259,6 +1283,14 @@ pub fn add_files(
             "extension_hint": null,
         }
     });
+    if let Some(progress) = progress {
+        progress.scan_summary(&summary);
+    }
+    let mut append_progress =
+        progress.map(|progress| move |update| progress.append_progress(update));
+    let append_progress = append_progress
+        .as_mut()
+        .map(|observer| observer as &mut dyn FnMut(_));
     let append = if let Some(remote) = coordination_remote {
         store.append_coordinated_jsonl_batch(
             &remote,
@@ -1267,11 +1299,19 @@ pub fn add_files(
             context,
             defaults,
             &spool_path,
+            append_progress,
         )?
     } else {
-        store.append_jsonl_batch(operation_kind, 2, context, defaults, &spool_path)?
+        store.append_jsonl_batch_with_progress(
+            operation_kind,
+            2,
+            context,
+            defaults,
+            &spool_path,
+            append_progress,
+        )?
     };
-    let apply = projection.apply(store)?;
+    let apply = apply_with_progress(store, projection, progress)?;
     job.cleanup(&[
         "inventory-config.json",
         "inventory-items.jsonl",
@@ -1292,6 +1332,20 @@ pub fn add_files(
         append: Some(append),
         apply: Some(apply),
     })
+}
+
+fn apply_with_progress(
+    store: &V2OriginStore,
+    projection: &V2ProjectionDb,
+    progress: Option<&Progress>,
+) -> Result<V2ApplyStats> {
+    let mut observer = progress.map(|progress| move |update| progress.apply_progress(update));
+    Ok(projection.apply_with_progress(
+        store,
+        observer
+            .as_mut()
+            .map(|observer| observer as &mut dyn FnMut(_)),
+    )?)
 }
 
 fn default_inventory_batch_entries(value: &mut serde_json::Value) {
@@ -1630,6 +1684,7 @@ fn observe_annex_symlink(
     known: &KnownAnnexEntry,
     config: &V2InventoryConfig,
     observed_time_utc_ms: u64,
+    progress: Option<&Progress>,
 ) -> Result<AnnexSymlinkObservation> {
     let link = root.join(logical_relative);
     let target = match fs::read_link(&link) {
@@ -1678,6 +1733,7 @@ fn observe_annex_symlink(
         &content,
         &discovered,
         known.expected_hash_algo.as_deref() == Some("sha512"),
+        progress,
     ) {
         HashOutcome::Stable(hashed) => hashed,
         HashOutcome::ReadError | HashOutcome::Changed => return Ok(AnnexSymlinkObservation::Error),
@@ -1763,7 +1819,12 @@ enum HashOutcome {
     Changed,
 }
 
-fn hash_file_stable(path: &Path, discovered: &DiscoveredFile, hash_sha512: bool) -> HashOutcome {
+fn hash_file_stable(
+    path: &Path,
+    discovered: &DiscoveredFile,
+    hash_sha512: bool,
+    progress: Option<&Progress>,
+) -> HashOutcome {
     let started = Instant::now();
     let before = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -1793,6 +1854,9 @@ fn hash_file_stable(path: &Path, discovered: &DiscoveredFile, hash_sha512: bool)
                     sha512.update(&buffer[..read]);
                 }
                 bytes_read = bytes_read.saturating_add(read as u64);
+                if let Some(progress) = progress {
+                    progress.read_bytes(read);
+                }
             }
             Err(_) => return HashOutcome::ReadError,
         }
