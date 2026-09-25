@@ -301,6 +301,12 @@ A large annex import can save canonical events before updating the SQLite projec
 error [v2_projection_sqlite]: SQLite operation failed for .../archive.db: disk I/O error
 ```
 
+Current projection errors append SQLite's numeric primary and extended result codes to the
+original message, in both human and JSON output, while retaining `v2_projection_sqlite`.
+For example, extended code `6410` (`SQLITE_IOERR_GETTEMPPATH`) identifies failure to find
+a usable temporary directory and adds a permissions/storage hint. Other I/O codes do not
+receive that hint. The older failure quoted above did not capture its extended code.
+
 The database path identifies the affected catalog; it does not establish which underlying file
 operation failed. SQLite can need temporary files as operations outgrow their temporary page
 caches, and an unavailable temporary directory can produce an I/O error. Other I/O errors have

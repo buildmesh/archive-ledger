@@ -522,7 +522,7 @@ pub enum V2ProjectionError {
     Store(#[from] V2StoreError),
     #[error("schema-6 projection is invalid: {0}")]
     Invalid(String),
-    #[error("SQLite operation failed for {path}: {source}")]
+    #[error("SQLite operation failed for {path}: {source}{}", sqlite_error_details(.source))]
     Sqlite {
         path: PathBuf,
         #[source]
@@ -3309,6 +3309,26 @@ fn sqlite_error(path: impl Into<PathBuf>, source: rusqlite::Error) -> V2Projecti
     }
 }
 
+fn sqlite_error_details(source: &rusqlite::Error) -> String {
+    let error = match source {
+        rusqlite::Error::SqliteFailure(error, _) | rusqlite::Error::SqlInputError { error, .. } => {
+            error
+        }
+        _ => return String::new(),
+    };
+    let mut details = format!(
+        " (SQLite primary code {}, extended code {})",
+        error.extended_code & 0xff,
+        error.extended_code
+    );
+    if error.extended_code == rusqlite::ffi::SQLITE_IOERR_GETTEMPPATH {
+        details.push_str(
+            "; SQLite could not find a usable temporary directory; check temporary-storage permissions and free space (SQLITE_TMPDIR on Unix)",
+        );
+    }
+    details
+}
+
 fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> V2ProjectionError {
     V2ProjectionError::Io {
         path: path.into(),
@@ -3327,6 +3347,67 @@ mod tests {
     use serde_json::json;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn sqlite_diagnostics_distinguish_temp_path_failure_from_other_sqlite_errors() {
+        for code in [
+            rusqlite::ffi::SQLITE_IOERR_GETTEMPPATH,
+            rusqlite::ffi::SQLITE_IOERR_FSYNC,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+        ] {
+            let source = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("original SQLite detail".to_owned()),
+            );
+            let error = sqlite_error("fixture.db", source);
+            let message = error.to_string();
+            assert_eq!(error.code(), "v2_projection_sqlite");
+            assert!(message
+                .starts_with("SQLite operation failed for fixture.db: original SQLite detail"));
+            assert!(message.contains(&format!(
+                "SQLite primary code {}, extended code {code}",
+                code & 0xff
+            )));
+            assert_eq!(
+                message.contains("SQLITE_TMPDIR"),
+                code == rusqlite::ffi::SQLITE_IOERR_GETTEMPPATH
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_diagnostics_preserve_errors_without_sqlite_result_codes() {
+        let error = sqlite_error("fixture.db", rusqlite::Error::QueryReturnedNoRows);
+        assert_eq!(error.code(), "v2_projection_sqlite");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "SQLite operation failed for fixture.db: {}",
+                rusqlite::Error::QueryReturnedNoRows
+            )
+        );
+        let invalid = V2ProjectionError::Invalid("original validation detail".to_owned());
+        assert_eq!(invalid.code(), "v2_projection_invalid");
+        assert_eq!(
+            invalid.to_string(),
+            "schema-6 projection is invalid: original validation detail"
+        );
+    }
+
+    #[test]
+    fn sqlite_diagnostics_include_codes_from_real_sql_input_errors() {
+        let connection = Connection::open_in_memory().unwrap();
+        let source = connection.execute_batch("SELEC 1").unwrap_err();
+        assert!(matches!(&source, rusqlite::Error::SqlInputError { .. }));
+        let original = source.to_string();
+        let error = sqlite_error("fixture.db", source);
+        assert_eq!(error.code(), "v2_projection_sqlite");
+        assert_eq!(error.to_string(), format!(
+            "SQLite operation failed for fixture.db: {original} (SQLite primary code 1, extended code 1)"
+        ));
+    }
 
     fn copy_tree(source: &Path, target: &Path) {
         fs::create_dir_all(target).unwrap();

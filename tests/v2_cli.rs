@@ -99,6 +99,44 @@ mod unix {
             .join("data/archive-ledger/archives/arc_personal")
     }
 
+    #[test]
+    fn sqlite_diagnostics_reach_human_and_json_errors() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        // A real SQLite failure against disposable bytes exercises the complete
+        // projection-to-CLI error path without exhausting disks or changing mounts.
+        let database = root(&temp).join("archive.db");
+        fs::write(&database, vec![0xa5; 4096]).unwrap();
+        for json_mode in [false, true] {
+            let mut command = archive(&temp);
+            command.env("ARCHIVE_LEDGER_OUTPUT", "human");
+            if json_mode {
+                command.arg("--json");
+            }
+            let output = command.arg("status").output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            let message = if json_mode {
+                let error: Value = serde_json::from_str(&stderr).unwrap();
+                assert_eq!(error["error"]["code"], "v2_projection_sqlite");
+                error["error"]["message"].as_str().unwrap().to_owned()
+            } else {
+                assert!(stderr.starts_with("error [v2_projection_sqlite]:"));
+                stderr
+            };
+            assert!(message.contains("file is not a database"));
+            assert!(message.contains("SQLite primary code 26, extended code 26"));
+            assert!(!message.contains("SQLITE_TMPDIR"));
+        }
+    }
+
     fn git(root: &Path, args: &[&str]) -> Output {
         Command::new("git")
             .arg("-C")
