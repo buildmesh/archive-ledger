@@ -542,9 +542,10 @@ metadata inspection, import, source rechecking, publication, and projection; it 
 completion time. JSON results remain on stdout.
 
 For SHA512 entries imported by an earlier version without their expected checksum metadata,
-rerun `location import-annex` on the same registered path with its existing Collection and
-Location settings, then run `verify`. Re-import preserves the Location and File identities while
-learning the original checksum; a database rebuild alone does not discover missing hashes. See
+rerun `location import-annex --reimport` on the same registered path with its existing
+Collection and Location settings, then run `verify`. Re-import preserves the Location and File
+identities while learning the original checksum; a database rebuild alone does not discover missing
+hashes. See
 the [legacy annex guide](docs/guides/annex-workflows.md#2-create-a-collection-by-importing-git-annex)
 for commands.
 

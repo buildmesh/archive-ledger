@@ -110,10 +110,10 @@ gap. Verification and finalization are named separately, so a full spool counter
 that the Git publication is already complete. There is no percentage or ETA.
 
 If an earlier Archive Ledger version imported SHA512 entries as unresolved or without their
-expected checksum metadata, rerun import on the same registered path, then verify:
+expected checksum metadata, explicitly re-import the same registered path, then verify:
 
 ```bash
-archive-docker location import-annex /locations/source \
+archive-docker location import-annex /locations/source --reimport \
   --collection Media --location-name "Media source" \
   --device "Source disk" --site Home --non-interactive
 archive-docker verify "Media source" --path /locations/source
@@ -122,6 +122,11 @@ archive-docker verify "Media source" --path /locations/source
 Use the existing Collection and Location settings, including `--allow-unidentified-root` if that
 was required after discovery. Re-import reuses the Location and Files while learning the original
 SHA512 checksum metadata. Rebuilding the catalog database alone cannot discover missing hashes.
+
+Ordinary updates use `location scan`. Repeating a completed import requires `--reimport` to
+avoid an accidental full rescan and duplicate import evidence. If an import is unfinished,
+setup names its job and refuses to start another; use the printed `archive job resume <job-id>`
+command. `--reimport` does not bypass an unfinished job.
 
 ## 3. Verify presence and integrity throughout a Location
 

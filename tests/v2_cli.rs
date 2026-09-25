@@ -2998,6 +2998,157 @@ mod unix {
     }
 
     #[test]
+    fn annex_setup_guards_unfinished_and_completed_imports_before_writes() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let repo = inventory_only_annex_fixture(&temp);
+        let alias = temp.path().join("annex-alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let setup = [
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--inventory-only",
+        ];
+        success(
+            archive(&temp)
+                .args([
+                    "collection",
+                    "init",
+                    repo.to_str().unwrap(),
+                    "--name",
+                    "Files",
+                    "--import-annex",
+                    "--job-id",
+                    "job_guard",
+                    "--max-items",
+                    "5",
+                ])
+                .args(setup),
+        );
+        let canonical = root(&temp).join("canonical");
+        let state = || {
+            let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+            let counts: (i64, i64, i64) = database
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM annex_imports),
+                        (SELECT COUNT(*) FROM operation_outcomes)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            (git(&canonical, &["rev-parse", "HEAD"]).stdout, counts)
+        };
+        let assert_refused = |args: &[&str], expected: &str| {
+            let before = state();
+            let output = archive(&temp)
+                .arg("--json")
+                .args(args)
+                .args(setup)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{error}"
+            );
+            assert_eq!(
+                state(),
+                before,
+                "refusal must not append topology or import evidence, or start a job"
+            );
+            assert!(git(&canonical, &["status", "--porcelain"])
+                .stdout
+                .is_empty());
+        };
+        assert_refused(
+            &[
+                "location",
+                "import-annex",
+                alias.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ],
+            "archive job resume 'job_guard'",
+        );
+        assert_refused(
+            &[
+                "location",
+                "import-annex",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--reimport",
+            ],
+            "archive job resume 'job_guard'",
+        );
+        assert_refused(
+            &[
+                "collection",
+                "init",
+                repo.to_str().unwrap(),
+                "--name",
+                "Files",
+                "--import-annex",
+            ],
+            "archive job resume 'job_guard'",
+        );
+        success(archive(&temp).args(["job", "resume", "job_guard"]));
+        assert_refused(
+            &[
+                "location",
+                "import-annex",
+                alias.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ],
+            "--reimport",
+        );
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_refused(
+            &[
+                "location",
+                "import-annex",
+                repo.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ],
+            "--reimport",
+        );
+        success(
+            archive(&temp)
+                .args([
+                    "location",
+                    "import-annex",
+                    repo.to_str().unwrap(),
+                    "--collection",
+                    "Files",
+                    "--reimport",
+                ])
+                .args(setup),
+        );
+        assert_eq!(state().1 .1, 2, "explicit reimport remains available");
+    }
+
+    #[test]
     fn annex_inventory_only_requires_an_annex_import_command() {
         let temp = TempDir::new().unwrap();
         for args in [
@@ -3175,6 +3326,7 @@ mod unix {
         success(archive(&temp).args([
             "location",
             "import-annex",
+            "--reimport",
             repo.to_str().unwrap(),
             "--collection",
             "Files",
@@ -3375,6 +3527,7 @@ mod unix {
             "--json",
             "location",
             "import-annex",
+            "--reimport",
             repo.to_str().unwrap(),
             "--collection",
             "Files",

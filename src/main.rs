@@ -1234,6 +1234,9 @@ struct LocationImportAnnexArgs {
     /// Inventory annex references without checking local presence or reading content.
     #[arg(long)]
     inventory_only: bool,
+    /// Deliberately repeat a completed import, for example to repair source metadata.
+    #[arg(long)]
+    reimport: bool,
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long)]
@@ -7715,7 +7718,7 @@ fn execute_v2_registry_command(
                     import_id: args.import_id.clone(),
                     max_items: args.max_items,
                 };
-                execute_v2_annex_setup(cli, database, &setup, Some(collection))?
+                execute_v2_annex_setup(cli, database, &setup, Some(collection), args.reimport)?
             }
             LocationCommand::Copy(args) => execute_v2_copy_mutation(cli, database, args)?,
         },
@@ -10256,6 +10259,38 @@ fn v2_stale_location_count(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+fn refuse_v2_unfinished_annex_import(
+    database: &V2ProjectionDb,
+    repository: &Path,
+) -> Result<(), AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT job_id, params_json FROM jobs
+             WHERE job_type = 'annex_import' AND status = 'running'
+             ORDER BY created_time_utc_ms, job_id",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    for row in rows {
+        let (job_id, params) = row.map_err(|source| v2_cli_sql_error(database, source))?;
+        let params: serde_json::Value = serde_json::from_str(&params)?;
+        // Import jobs store a canonical, lossless path. Do not resolve unrelated
+        // historical paths: their removable source may currently be unavailable.
+        if job_registry_path(&params, "repo_path")? == repository {
+            return Err(AppError::Input(format!(
+                "this repository has an unfinished annex import; resume it with archive job resume {}",
+                shell_quote(&job_id)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn v2_location_has_completed_annex_import(
     database: &V2ProjectionDb,
     collection_id: &str,
@@ -12249,7 +12284,7 @@ fn execute_v2_collection_init(
     let mut setup = args.clone();
     setup.name = Some(name);
     if setup.import_annex {
-        execute_v2_annex_setup(cli, database, &setup, None)
+        execute_v2_annex_setup(cli, database, &setup, None, false)
     } else {
         execute_v2_filesystem_setup(cli, database, &setup, None)
     }
@@ -12271,6 +12306,7 @@ fn prepare_v2_filesystem_setup(
     database: &V2ProjectionDb,
     args: &CollectionInitArgs,
     existing_collection: Option<CollectionSnapshot>,
+    reimport: bool,
 ) -> Result<V2FilesystemSetup, AppError> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     let collection_name = existing_collection
@@ -12280,6 +12316,9 @@ fn prepare_v2_filesystem_setup(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Input("Collection name must be non-empty".to_owned()))?;
     let mounted = archive_ledger::discover_mounted_filesystem(&args.path)?;
+    if args.import_annex {
+        refuse_v2_unfinished_annex_import(database, &mounted.path)?;
+    }
     if mounted.identity_state == "unavailable"
         && !args.allow_unidentified_root
         && (!interactive
@@ -12536,6 +12575,19 @@ fn prepare_v2_filesystem_setup(
         ));
         (collection, Some(policy))
     };
+    if args.import_annex
+        && !reimport
+        && v2_location_has_completed_annex_import(
+            database,
+            &collection.collection_id,
+            &location.location_id,
+        )?
+    {
+        return Err(AppError::Input(format!(
+            "Location {:?} already has a completed annex import for Collection {:?}; use archive location scan for ordinary updates, or location import-annex --reimport for an intentional repeat",
+            location.display_name, collection.display_name
+        )));
+    }
     changes.push(RegistryChange::DeviceMount(DeviceMount {
         mount_id: generated_id("mount"),
         device_id: device.device_id.clone(),
@@ -12616,7 +12668,7 @@ fn execute_v2_filesystem_setup(
     args: &CollectionInitArgs,
     existing_collection: Option<CollectionSnapshot>,
 ) -> Result<u8, AppError> {
-    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection)?;
+    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection, false)?;
     print_v2_filesystem_setup(cli, &setup)?;
     Ok(EXIT_OK)
 }
@@ -12626,6 +12678,7 @@ fn execute_v2_annex_setup(
     database: &V2ProjectionDb,
     args: &CollectionInitArgs,
     existing_collection: Option<CollectionSnapshot>,
+    reimport: bool,
 ) -> Result<u8, AppError> {
     validate_setup_source(&args.path, true, SetupCommand::Collection)?;
     if args.batch_entries == 0 {
@@ -12633,7 +12686,7 @@ fn execute_v2_annex_setup(
             "--batch-entries must be greater than zero".to_owned(),
         ));
     }
-    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection)?;
+    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection, reimport)?;
     let progress = AnnexProgressReporter::start()?;
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
