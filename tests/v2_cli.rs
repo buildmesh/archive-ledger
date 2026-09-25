@@ -34,6 +34,66 @@ mod unix {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    #[test]
+    fn cli_information_exits_succeed_without_opening_an_archive() {
+        let temp = TempDir::new().unwrap();
+        for mode in ["human", "flag_json", "env_json"] {
+            for args in [
+                vec!["--help"],
+                vec!["-h"],
+                vec!["help"],
+                vec!["location", "--help"],
+                vec!["help", "location"],
+                vec!["--version"],
+                vec!["-V"],
+            ] {
+                let mut command = archive(&temp);
+                command.env(
+                    "ARCHIVE_LEDGER_OUTPUT",
+                    if mode == "env_json" { "json" } else { "human" },
+                );
+                if mode == "flag_json" {
+                    command.arg("--json");
+                }
+                let output = success(command.args(&args));
+                assert!(output.stderr.is_empty(), "{mode} {args:?}");
+                let text = String::from_utf8(output.stdout).unwrap();
+                if args == ["--version"] || args == ["-V"] {
+                    assert_eq!(text, format!("archive {}\n", env!("CARGO_PKG_VERSION")));
+                } else {
+                    assert!(text.contains("Usage:"), "{mode} {args:?}: {text}");
+                }
+            }
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cli_invalid_input_remains_an_error_in_human_and_json_modes() {
+        let temp = TempDir::new().unwrap();
+        for mode in ["human", "flag_json", "env_json"] {
+            for args in [vec!["--unknown-option"], vec!["location"], vec![]] {
+                let mut command = archive(&temp);
+                command.env(
+                    "ARCHIVE_LEDGER_OUTPUT",
+                    if mode == "env_json" { "json" } else { "human" },
+                );
+                if mode == "flag_json" {
+                    command.arg("--json");
+                }
+                let output = command.args(&args).output().unwrap();
+                assert_eq!(output.status.code(), Some(2), "{mode} {args:?}");
+                assert!(output.stdout.is_empty(), "{mode} {args:?}");
+                assert!(!output.stderr.is_empty(), "{mode} {args:?}");
+                if mode != "human" {
+                    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+                    assert_eq!(error["error"]["code"], "invalid_input");
+                }
+            }
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
     fn root(temp: &TempDir) -> PathBuf {
         temp.path()
             .join("data/archive-ledger/archives/arc_personal")

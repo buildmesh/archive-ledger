@@ -1914,6 +1914,10 @@ fn main() -> ExitCode {
     let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
+            if error.exit_code() == 0 {
+                let _ = error.print();
+                return ExitCode::SUCCESS;
+            }
             if json_requested {
                 let output = json!({
                     "version": 1,
