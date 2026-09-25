@@ -409,6 +409,14 @@ pub struct V2ArchiveInitialization {
     pub git_commit: String,
 }
 
+/// Ephemeral append progress; never stored in canonical history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2AppendProgress {
+    Verifying,
+    ReadingSpool { bytes_read: u64, total_bytes: u64 },
+    Publishing,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct V2AppendResult {
     pub version: u32,
@@ -2082,16 +2090,86 @@ impl V2OriginStore {
         defaults: Value,
         spool_path: impl AsRef<Path>,
     ) -> Result<V2AppendResult> {
+        self.append_jsonl_batch_with_progress(
+            operation_kind,
+            item_schema_version,
+            context,
+            defaults,
+            spool_path,
+            None,
+        )
+    }
+
+    /// Like `append_jsonl_batch`, with bounded progress notifications on the
+    /// calling thread. Spool byte counts include original line delimiters.
+    pub fn append_jsonl_batch_with_progress(
+        &self,
+        operation_kind: &str,
+        item_schema_version: u32,
+        context: Value,
+        defaults: Value,
+        spool_path: impl AsRef<Path>,
+        mut progress: Option<&mut dyn FnMut(V2AppendProgress)>,
+    ) -> Result<V2AppendResult> {
+        if let Some(report) = progress.as_mut() {
+            report(V2AppendProgress::Verifying);
+        }
         let spool_path = spool_path.as_ref().to_path_buf();
         let file = File::open(&spool_path)
             .map_err(|source| io_error("open batch item spool", &spool_path, source))?;
-        let items = BufReader::new(file).lines().map(|line| {
-            let line =
-                line.map_err(|source| io_error("read batch item spool", &spool_path, source))?;
-            serde_json::from_str::<Value>(&line).map_err(|source| V2StoreError::Json {
-                path: spool_path.clone(),
-                source,
-            })
+        let total_bytes = file
+            .metadata()
+            .map_err(|source| io_error("stat batch item spool", &spool_path, source))?
+            .len();
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut bytes_read = 0_u64;
+        let mut last_reported = 0_u64;
+        let mut started = false;
+        let items = std::iter::from_fn(|| {
+            if !started {
+                started = true;
+                if let Some(report) = progress.as_mut() {
+                    report(V2AppendProgress::ReadingSpool {
+                        bytes_read: 0,
+                        total_bytes,
+                    });
+                }
+            }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    if let Some(report) = progress.as_mut() {
+                        if bytes_read != last_reported {
+                            report(V2AppendProgress::ReadingSpool {
+                                bytes_read,
+                                total_bytes,
+                            });
+                        }
+                        report(V2AppendProgress::Publishing);
+                    }
+                    None
+                }
+                Ok(length) => {
+                    bytes_read += length as u64;
+                    if bytes_read - last_reported >= 64 * 1024 {
+                        if let Some(report) = progress.as_mut() {
+                            report(V2AppendProgress::ReadingSpool {
+                                bytes_read,
+                                total_bytes,
+                            });
+                        }
+                        last_reported = bytes_read;
+                    }
+                    Some(serde_json::from_str::<Value>(&line).map_err(|source| {
+                        V2StoreError::Json {
+                            path: spool_path.clone(),
+                            source,
+                        }
+                    }))
+                }
+                Err(source) => Some(Err(io_error("read batch item spool", &spool_path, source))),
+            }
         });
         self.append_batch_iter(
             operation_kind,
@@ -5356,14 +5434,66 @@ mod tests {
         let spool = temp.path().join("items.jsonl");
         let mut spool_file = File::create(&spool).unwrap();
         for index in 0..10_001_u64 {
-            writeln!(spool_file, "{{\"index\":{index},\"kind\":\"test_fact\"}}").unwrap();
+            // Exercise LF, CRLF, and an unterminated final line.
+            let delimiter = if index == 10_000 {
+                ""
+            } else if index % 2 == 0 {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            write!(
+                spool_file,
+                "{{\"index\":{index},\"kind\":\"test_fact\"}}{delimiter}"
+            )
+            .unwrap();
         }
         spool_file.sync_all().unwrap();
 
         let store = V2OriginStore::open(root.join("canonical")).unwrap();
+        let mut progress = Vec::new();
         let appended = store
-            .append_jsonl_batch("stream_test", 1, json!({}), json!({}), &spool)
+            .append_jsonl_batch_with_progress(
+                "stream_test",
+                1,
+                json!({}),
+                json!({}),
+                &spool,
+                Some(&mut |event| progress.push(event)),
+            )
             .unwrap();
+        let total_bytes = fs::metadata(&spool).unwrap().len();
+        assert_eq!(progress.first(), Some(&V2AppendProgress::Verifying));
+        assert_eq!(
+            progress[1],
+            V2AppendProgress::ReadingSpool {
+                bytes_read: 0,
+                total_bytes
+            }
+        );
+        assert_eq!(
+            progress[progress.len() - 2],
+            V2AppendProgress::ReadingSpool {
+                bytes_read: total_bytes,
+                total_bytes
+            }
+        );
+        assert_eq!(progress.last(), Some(&V2AppendProgress::Publishing));
+        let mut previous = 0;
+        for event in &progress[2..progress.len() - 1] {
+            let V2AppendProgress::ReadingSpool {
+                bytes_read,
+                total_bytes: reported_total,
+            } = event
+            else {
+                panic!("unexpected spool phase");
+            };
+            assert_eq!(*reported_total, total_bytes);
+            assert!(*bytes_read > previous);
+            assert!(*bytes_read - previous >= 64 * 1024 || *bytes_read == total_bytes);
+            previous = *bytes_read;
+        }
+        assert!(progress.len() <= (total_bytes / (64 * 1024)) as usize + 4);
 
         assert_eq!(appended.items_written, 10_001);
         assert_eq!(appended.records_written, 13);
@@ -5384,6 +5514,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn invalid_spool_never_reports_publication_or_advances_history() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("archive");
+        initialize_v2_archive(&root, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(root.join("canonical")).unwrap();
+        let before = store.canonical_commit().unwrap();
+        let spool = temp.path().join("items.jsonl");
+        fs::write(&spool, "{invalid json}\n").unwrap();
+        let mut progress = Vec::new();
+        assert!(store
+            .append_jsonl_batch_with_progress(
+                "stream_test",
+                1,
+                json!({}),
+                json!({}),
+                &spool,
+                Some(&mut |event| progress.push(event)),
+            )
+            .is_err());
+        assert_eq!(progress.first(), Some(&V2AppendProgress::Verifying));
+        assert!(!progress.contains(&V2AppendProgress::Publishing));
+        assert_eq!(store.canonical_commit().unwrap(), before);
     }
 
     #[test]

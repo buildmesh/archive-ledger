@@ -104,7 +104,10 @@ publication, and projection. It includes processed entries, skipped links and ot
 verified, absent and unchecked counts, errors, and bytes read this run. A terminal gets updates
 about once a second; redirected output gets updates every 30 seconds, plus start and finish
 updates. The helper above uses Compose's `-T`, so it uses the redirected cadence. Omit `-T` for
-terminal progress. JSON results stay on stdout. There is no percentage or ETA.
+terminal progress. JSON results stay on stdout. Saving events shows bytes read from the spool
+against its size; SQLite replay shows committed records processed this pass against the frontier
+gap. Verification and finalization are named separately, so a full spool counter does not claim
+that the Git publication is already complete. There is no percentage or ETA.
 
 If an earlier Archive Ledger version imported SHA512 entries as unresolved or without their
 expected checksum metadata, rerun import on the same registered path, then verify:

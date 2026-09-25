@@ -2812,6 +2812,11 @@ mod unix {
             .expect("annex import reports completion on stderr");
         assert!(final_progress.contains("5 unchecked"), "{final_progress}");
         assert!(
+            final_progress.contains("records replayed this pass"),
+            "{final_progress}"
+        );
+        assert!(!final_progress.contains("inspected"), "{final_progress}");
+        assert!(
             final_progress.contains("4 skipped links"),
             "{final_progress}"
         );
@@ -2949,6 +2954,9 @@ mod unix {
             .output()
             .unwrap();
         assert!(!failed.status.success());
+        let progress = String::from_utf8_lossy(&failed.stderr);
+        assert!(progress.contains("Stopped before completion"), "{progress}");
+        assert!(progress.contains("spool bytes read"), "{progress}");
         fs::remove_file(index_lock).unwrap();
         let pending = json(&success(
             archive(&temp).args(["--json", "events", "verify"]),

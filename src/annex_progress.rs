@@ -6,6 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::annex::AnnexSummary;
+use crate::v2_projection::V2ApplyProgress;
+use crate::v2_store::V2AppendProgress;
 
 #[derive(Clone, Default)]
 pub struct AnnexProgress {
@@ -16,6 +18,7 @@ pub struct AnnexProgress {
 struct ProgressState {
     phase: &'static str,
     inspected: u64,
+    count: Option<(&'static str, u64, u64)>,
     summary: AnnexSummary,
     bytes_read: u64,
 }
@@ -25,6 +28,56 @@ impl AnnexProgress {
         let mut state = self.state.lock().unwrap();
         state.phase = phase;
         state.inspected = 0;
+        state.count = None;
+    }
+
+    fn continue_phase(&self, phase: &'static str) {
+        self.state.lock().unwrap().phase = phase;
+    }
+
+    fn counted_phase(&self, phase: &'static str, label: &'static str, done: u64, total: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.phase = phase;
+        state.inspected = 0;
+        state.count = Some((label, done, total));
+    }
+
+    pub(crate) fn append_progress(&self, update: V2AppendProgress) {
+        match update {
+            V2AppendProgress::Verifying => self.phase("Verifying existing catalog events"),
+            V2AppendProgress::ReadingSpool {
+                bytes_read,
+                total_bytes,
+            } => {
+                self.counted_phase(
+                    "Saving catalog events",
+                    "spool bytes read",
+                    bytes_read,
+                    total_bytes,
+                );
+            }
+            V2AppendProgress::Publishing => self.continue_phase("Finalizing catalog events"),
+        }
+    }
+
+    pub(crate) fn apply_progress(&self, update: V2ApplyProgress) {
+        match update {
+            V2ApplyProgress::Verifying => self.phase("Verifying catalog events"),
+            V2ApplyProgress::Applying {
+                records_applied,
+                total_records,
+            } => {
+                // Each segment is verified before replay; gaps between these
+                // updates can therefore still be verification work.
+                self.counted_phase(
+                    "Verifying and updating catalog index",
+                    "records replayed this pass",
+                    records_applied,
+                    total_records,
+                );
+            }
+            V2ApplyProgress::Finalizing => self.continue_phase("Finalizing catalog index"),
+        }
     }
 
     pub fn inspected_entry(&self) {
@@ -45,7 +98,11 @@ impl AnnexProgress {
         let summary = &state.summary;
         [
             format!("Annex import: {}", state.phase),
-            format!("{} inspected", state.inspected),
+            match state.count {
+                Some((label, done, total)) => format!("{done} / {total} {label}"),
+                None if state.inspected > 0 => format!("{} inspected", state.inspected),
+                None => String::new(),
+            },
             format!("{} entries", summary.entries_seen),
             format!("{} verified", summary.present),
             format!("{} absent", summary.absent),
@@ -133,7 +190,7 @@ impl AnnexProgressReporter {
     }
 
     pub fn finish(mut self, phase: &'static str) {
-        self.progress.phase(phase);
+        self.progress.continue_phase(phase);
         self.finished = true;
     }
 }
@@ -141,7 +198,7 @@ impl AnnexProgressReporter {
 impl Drop for AnnexProgressReporter {
     fn drop(&mut self) {
         if !self.finished {
-            self.progress.phase("Stopped before completion");
+            self.progress.continue_phase("Stopped before completion");
         }
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
@@ -157,19 +214,24 @@ fn render(
     finished: bool,
     rendered: &mut bool,
 ) {
-    // Keep a compact four-line display on terminals instead of repeatedly wrapping
+    // Keep a compact five-line display on terminals instead of repeatedly wrapping
     // a long status line. Redirected logs get plain, newline-delimited snapshots.
     // Display failures must not fail or interrupt an otherwise valid import.
+    let joined = |values: &[String]| {
+        values
+            .iter()
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
     if terminal {
         if *rendered {
-            let _ = write!(writer, "\x1b[3A");
+            let _ = write!(writer, "\x1b[4A");
         }
         let _ = write!(writer, "\r\x1b[2K{} | {}\n", fields[0], fields[9]);
-        let _ = write!(
-            writer,
-            "\r\x1b[2K{} | {} | {} | {}\n",
-            fields[1], fields[2], fields[3], fields[4]
-        );
+        let _ = write!(writer, "\r\x1b[2K{}\n", fields[1]);
+        let _ = write!(writer, "\r\x1b[2K{}\n", joined(&fields[2..5]));
         let _ = write!(
             writer,
             "\r\x1b[2K{} | {} | {}\n",
@@ -180,7 +242,7 @@ fn render(
             let _ = writeln!(writer);
         }
     } else {
-        let _ = writeln!(writer, "{}", fields.join(" | "));
+        let _ = writeln!(writer, "{}", joined(fields));
     }
     *rendered = true;
     let _ = writer.flush();
@@ -201,6 +263,75 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn publication_counters_use_phase_units_and_survive_finalization() {
+        let progress = AnnexProgress::default();
+        progress.phase("Rechecking source metadata");
+        progress.inspected_entry();
+        progress.summary(&AnnexSummary {
+            entries_seen: 12,
+            unchecked: 12,
+            ..Default::default()
+        });
+        progress.append_progress(V2AppendProgress::Verifying);
+        assert!(progress.fields(Duration::ZERO)[1].is_empty());
+        progress.append_progress(V2AppendProgress::ReadingSpool {
+            bytes_read: 256,
+            total_bytes: 512,
+        });
+        let fields = progress.fields(Duration::ZERO);
+        assert_eq!(fields[1], "256 / 512 spool bytes read");
+        assert_eq!(fields[2], "12 entries");
+        progress.append_progress(V2AppendProgress::ReadingSpool {
+            bytes_read: 512,
+            total_bytes: 512,
+        });
+        progress.append_progress(V2AppendProgress::Publishing);
+        assert_eq!(
+            progress.fields(Duration::ZERO)[0],
+            "Annex import: Finalizing catalog events"
+        );
+        assert_eq!(
+            progress.fields(Duration::ZERO)[1],
+            "512 / 512 spool bytes read"
+        );
+        progress.apply_progress(V2ApplyProgress::Verifying);
+        assert!(progress.fields(Duration::ZERO)[1].is_empty());
+        progress.apply_progress(V2ApplyProgress::Applying {
+            records_applied: 2,
+            total_records: 5,
+        });
+        assert_eq!(
+            progress.fields(Duration::ZERO)[1],
+            "2 / 5 records replayed this pass"
+        );
+        progress.apply_progress(V2ApplyProgress::Applying {
+            records_applied: 5,
+            total_records: 5,
+        });
+        progress.apply_progress(V2ApplyProgress::Finalizing);
+        assert_eq!(
+            progress.fields(Duration::ZERO)[0],
+            "Annex import: Finalizing catalog index"
+        );
+        assert_eq!(
+            progress.fields(Duration::ZERO)[1],
+            "5 / 5 records replayed this pass"
+        );
+        progress.continue_phase("Stopped before completion");
+        let mut log = Vec::new();
+        render(
+            &mut log,
+            &progress.fields(Duration::ZERO),
+            false,
+            true,
+            &mut false,
+        );
+        let log = String::from_utf8(log).unwrap();
+        assert!(log.contains("Stopped before completion | 5 / 5 records replayed this pass"));
+        assert!(!log.contains("inspected"));
     }
 
     #[test]
@@ -236,6 +367,54 @@ mod tests {
         assert!(text.lines().last().unwrap().contains("Complete"));
         assert!(!text.contains('\x1b'));
         assert!(!text.contains('\r'));
+    }
+
+    #[test]
+    fn terminal_counter_layout_fits_80_columns_and_redraws_all_rows() {
+        let progress = AnnexProgress::default();
+        progress.summary(&AnnexSummary {
+            entries_seen: 800_000,
+            present: 800_000,
+            ..Default::default()
+        });
+        progress.apply_progress(V2ApplyProgress::Applying {
+            records_applied: 800,
+            total_records: 802,
+        });
+        let mut output = Vec::new();
+        let mut rendered = false;
+        render(
+            &mut output,
+            &progress.fields(Duration::ZERO),
+            true,
+            false,
+            &mut rendered,
+        );
+        let text = String::from_utf8(output.clone()).unwrap();
+        let rows: Vec<_> = text.split('\n').collect();
+        assert!(
+            rows.iter()
+                .all(|row| row.trim_start_matches("\r\x1b[2K").len() <= 80),
+            "{text:?}"
+        );
+        assert_eq!(rows.len(), 5);
+        assert!(rows[1].ends_with("800 / 802 records replayed this pass"));
+        assert!(rows[2].contains("800000 entries"));
+
+        output.clear();
+        progress.phase("Verifying catalog events");
+        render(
+            &mut output,
+            &progress.fields(Duration::ZERO),
+            true,
+            true,
+            &mut rendered,
+        );
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("\x1b[4A"));
+        assert_eq!(text.matches("\r\x1b[2K").count(), 5);
+        assert!(text.lines().nth(1).unwrap().ends_with("\x1b[2K"));
+        assert!(text.ends_with('\n'));
     }
 
     #[test]

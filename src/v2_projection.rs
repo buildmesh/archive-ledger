@@ -577,6 +577,17 @@ pub struct V2RebuildStats {
     pub applied_frontier_hash: String,
 }
 
+/// Ephemeral replay progress. Counts advance only after a transaction commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2ApplyProgress {
+    Verifying,
+    Applying {
+        records_applied: u64,
+        total_records: u64,
+    },
+    Finalizing,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct V2ApplyStats {
     pub version: u32,
@@ -781,7 +792,7 @@ impl V2ProjectionDb {
         let database = Self {
             path: path.to_path_buf(),
         };
-        let applied = database.apply_with_mode(store, ReplayMode::Rebuild)?;
+        let applied = database.apply_with_mode(store, ReplayMode::Rebuild, None)?;
         let mut connection = database.open()?;
         ReplayMode::Rebuild.configure(&connection, path)?;
         let transaction = connection
@@ -902,10 +913,28 @@ impl V2ProjectionDb {
     /// Transactions are intentionally bounded to one control/chunk record so a
     /// crash can resume without replaying already projected chunks.
     pub fn apply(&self, store: &V2OriginStore) -> Result<V2ApplyStats> {
-        self.apply_with_mode(store, ReplayMode::Incremental)
+        self.apply_with_progress(store, None)
     }
 
-    fn apply_with_mode(&self, store: &V2OriginStore, mode: ReplayMode) -> Result<V2ApplyStats> {
+    /// Applies canonical records with notifications after durable replay commits.
+    /// Counts include records revisited when resuming a partially applied batch.
+    pub fn apply_with_progress(
+        &self,
+        store: &V2OriginStore,
+        progress: Option<&mut dyn FnMut(V2ApplyProgress)>,
+    ) -> Result<V2ApplyStats> {
+        self.apply_with_mode(store, ReplayMode::Incremental, progress)
+    }
+
+    fn apply_with_mode(
+        &self,
+        store: &V2OriginStore,
+        mode: ReplayMode,
+        mut progress: Option<&mut dyn FnMut(V2ApplyProgress)>,
+    ) -> Result<V2ApplyStats> {
+        if let Some(report) = progress.as_mut() {
+            report(V2ApplyProgress::Verifying);
+        }
         let mut connection = self.open()?;
         mode.configure(&connection, &self.path)?;
         let applied_frontier_hash = meta(&connection, &self.path, "applied_frontier_hash")?;
@@ -999,6 +1028,7 @@ impl V2ProjectionDb {
         }
         let mut next_sequences = cursors.clone();
         let mut records_applied = 0_u64;
+        let mut total_records = 0_u64;
         let mut advanced_origins = BTreeMap::<String, ()>::new();
         let mut validated_context = false;
         let records_per_transaction = if mode == ReplayMode::Rebuild { 64 } else { 1 };
@@ -1031,6 +1061,15 @@ impl V2ProjectionDb {
                         )));
                     }
                 }
+                total_records = context.accepted_frontier.origins.iter().try_fold(
+                    0_u64,
+                    |total, origin| {
+                        let applied = cursors.get(&origin.origin_id).copied().unwrap_or(0) as u64;
+                        total.checked_add(origin.seq - applied).ok_or_else(|| {
+                            V2ProjectionError::Invalid("replay record count overflow".to_owned())
+                        })
+                    },
+                )?;
                 connection
                     .execute(
                         "UPDATE archive_meta SET value = ?1 WHERE key = 'accepted_frontier_hash'",
@@ -1097,6 +1136,11 @@ impl V2ProjectionDb {
             records_applied = records_applied.checked_add(1).ok_or_else(|| {
                 V2ProjectionError::Invalid("applied record count overflow".to_owned())
             })?;
+            if pending_records == 0 {
+                if let Some(report) = progress.as_mut() {
+                    report(V2ApplyProgress::Applying { records_applied, total_records });
+                }
+            }
             Ok(())
         },
         )?;
@@ -1105,6 +1149,12 @@ impl V2ProjectionDb {
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(&self.path, source))?;
+            if let Some(report) = progress.as_mut() {
+                report(V2ApplyProgress::Applying {
+                    records_applied,
+                    total_records,
+                });
+            }
         }
         drop(pending_transaction);
         if !validated_context {
@@ -1123,6 +1173,15 @@ impl V2ProjectionDb {
                 .map_err(|source| sqlite_error(&self.path, source))?;
         }
 
+        if let Some(report) = progress.as_mut() {
+            if records_applied == 0 {
+                report(V2ApplyProgress::Applying {
+                    records_applied: 0,
+                    total_records: 0,
+                });
+            }
+            report(V2ApplyProgress::Finalizing);
+        }
         let final_transaction = connection
             .transaction()
             .map_err(|source| sqlite_error(&self.path, source))?;
@@ -3737,11 +3796,26 @@ mod tests {
             );
         }
         let grouped = V2ProjectionDb::open_existing(grouped_path).unwrap();
+        let mut progress = Vec::new();
         assert!(grouped
-            .apply_with_mode(&store, ReplayMode::Rebuild)
+            .apply_with_mode(
+                &store,
+                ReplayMode::Rebuild,
+                Some(&mut |event| progress.push(event))
+            )
             .unwrap_err()
             .to_string()
             .contains("operation_outcomes.operation_key"));
+        assert_eq!(
+            progress,
+            vec![
+                V2ApplyProgress::Verifying,
+                V2ApplyProgress::Applying {
+                    records_applied: 64,
+                    total_records: 69
+                },
+            ]
+        );
         let connection = grouped.open().unwrap();
         // The first group ends with batch 21's start, at origin sequence 67.
         // Its chunk and the failing batch are in the rolled-back second group.
@@ -3872,13 +3946,61 @@ mod tests {
             .unwrap();
 
         let database = V2ProjectionDb::open_existing(database_path).unwrap();
-        let first = database.apply(&store).unwrap();
+        let mut progress = Vec::new();
+        let first = database
+            .apply_with_progress(
+                &store,
+                Some(&mut |event| {
+                    if let V2ApplyProgress::Applying {
+                        records_applied,
+                        total_records,
+                    } = event
+                    {
+                        assert_eq!(total_records, 6);
+                        // A separate connection can see every reported record: callbacks
+                        // must never advertise uncommitted progress.
+                        let visible: i64 = database
+                            .open()
+                            .unwrap()
+                            .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+                            .unwrap();
+                        assert_eq!(visible as u64, 3 + records_applied);
+                    }
+                    progress.push(event);
+                }),
+            )
+            .unwrap();
+        assert_eq!(progress.first(), Some(&V2ApplyProgress::Verifying));
+        assert_eq!(progress.last(), Some(&V2ApplyProgress::Finalizing));
+        assert_eq!(
+            &progress[1..progress.len() - 1],
+            &(1..=6)
+                .map(|records_applied| V2ApplyProgress::Applying {
+                    records_applied,
+                    total_records: 6
+                })
+                .collect::<Vec<_>>()
+        );
         assert_eq!(first.records_applied, 6);
         assert_eq!(first.origins_advanced, 1);
         let status = database.status().unwrap();
         assert_eq!(status.archive_name, "Family Archive");
         assert_eq!(status.records, 9);
-        let second = database.apply(&store).unwrap();
+        progress.clear();
+        let second = database
+            .apply_with_progress(&store, Some(&mut |event| progress.push(event)))
+            .unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                V2ApplyProgress::Verifying,
+                V2ApplyProgress::Applying {
+                    records_applied: 0,
+                    total_records: 0
+                },
+                V2ApplyProgress::Finalizing,
+            ]
+        );
         assert_eq!(second.records_applied, 0);
         assert_eq!(second.origins_advanced, 0);
     }
@@ -3935,7 +4057,49 @@ mod tests {
         }
         drop(connection);
 
-        let stats = database.apply(&store).unwrap();
+        let mut progress = Vec::new();
+        let stats = database
+            .apply_with_progress(
+                &store,
+                Some(&mut |event| {
+                    if let V2ApplyProgress::Applying {
+                        records_applied,
+                        total_records,
+                    } = event
+                    {
+                        assert_eq!(total_records, 3);
+                        let visible: i64 = database
+                            .open()
+                            .unwrap()
+                            .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+                            .unwrap();
+                        // The first two records were durable before this resume, but
+                        // count as revisited work until the batch cursor advances.
+                        assert_eq!(visible as u64, 3 + records_applied.max(2));
+                    }
+                    progress.push(event);
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            progress,
+            vec![
+                V2ApplyProgress::Verifying,
+                V2ApplyProgress::Applying {
+                    records_applied: 1,
+                    total_records: 3
+                },
+                V2ApplyProgress::Applying {
+                    records_applied: 2,
+                    total_records: 3
+                },
+                V2ApplyProgress::Applying {
+                    records_applied: 3,
+                    total_records: 3
+                },
+                V2ApplyProgress::Finalizing,
+            ]
+        );
         assert_eq!(stats.records_applied, 3);
         let status = database.status().unwrap();
         assert_eq!(status.archive_name, "Resumable");

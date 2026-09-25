@@ -729,8 +729,10 @@ impl<'a> V2AnnexImporter<'a> {
             .and_then(|()| spool.get_ref().sync_all())
             .map_err(|source| io_error("sync annex import spool", &spool_path, source))?;
         drop(spool);
-        self.progress_phase("Saving catalog events");
-        self.store.append_jsonl_batch(
+        let mut append_progress = self
+            .progress
+            .map(|progress| move |update| progress.append_progress(update));
+        self.store.append_jsonl_batch_with_progress(
             "annex_import",
             1,
             json!({
@@ -740,9 +742,19 @@ impl<'a> V2AnnexImporter<'a> {
             }),
             json!({}),
             &spool_path,
+            append_progress
+                .as_mut()
+                .map(|observer| observer as &mut dyn FnMut(_)),
         )?;
-        self.progress_phase("Updating catalog index");
-        self.projection.apply(self.store)?;
+        let mut apply_progress = self
+            .progress
+            .map(|progress| move |update| progress.apply_progress(update));
+        self.projection.apply_with_progress(
+            self.store,
+            apply_progress
+                .as_mut()
+                .map(|observer| observer as &mut dyn FnMut(_)),
+        )?;
         drop(connection);
         job.cleanup(&[
             "annex-items.jsonl",
