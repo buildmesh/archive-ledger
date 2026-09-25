@@ -165,9 +165,163 @@ The attempted guarded release build never launched: the 180-second preflight
 wait expired below its 1,240 MiB available-RAM threshold. Available RAM was
 796 MiB afterward. The original 896/768 MiB hard/soft limits, zero-swap rule,
 832 MiB early stop, and pressure/reserve thresholds were retained. Thus the
-patch remains **unbuilt and unrun**; replay spill counts and a new full-rebuild
-comparison remain outstanding. The temporary source copy was removed after
+patch was **unbuilt and unrun** at that checkpoint; replay spill counts and a
+new full-rebuild comparison remained outstanding. The temporary source copy was removed after
 preserving the patch and preflight evidence.
+
+## Instrumented replay follow-up
+
+After the user closed unused coding sessions, the original 1,240 MiB preflight
+passed. No remaining coding sessions or shared services were stopped. The patch
+was applied only to a new disposable source copy and compiled in release mode
+with one build job, one CPU core, and the original 896/768 MiB hard/soft limits,
+zero scope swap, 832 MiB early stop, 384 MiB host reserve, and sustained memory
+PSI stops. The first build stopped on PSI after 257.42 seconds; a retry reusing
+compiled dependencies succeeded in 46.76 seconds. Neither had OOM or hard-limit
+events. The production source remains unchanged.
+
+Both cache settings completed replay of all 398 canonical records in seven
+transaction groups. The following counters are differences between explicit
+`replay_start` and `replay_complete` markers on the same connection. They exclude
+initial verification, deferred index creation, and subsequent validation.
+
+| Replay measurement | 64 MiB cache | 128 MiB cache |
+| --- | ---: | ---: |
+| Observed elapsed seconds | 92.17 | 87.99 |
+| SQLite cache misses | 670,596 | 123,163 |
+| SQLite dirty-page spills | 756,745 | 172,992 |
+| SQLite page writes | 860,868 | 370,207 |
+| Linux recorded write bytes, MB | 2,159.14 | 1,887.51 |
+| Linux recorded read bytes, MB | 85.13 | 305.50 |
+| Bytes passed to write syscalls, MB | 16,873.35 | 14,863.60 |
+
+The larger cache reduced spills by **77.1%**, SQLite page writes by **57.0%**,
+and recorded storage writes by only **12.6%**. Spill counts now establish the
+replay mechanism directly, but more cache alone did not eliminate most write
+traffic. SQLite counters, write-syscall bytes, and Linux storage accounting
+measure different layers; repeated page writes can be combined by filesystem
+caching. These results do not establish which remaining writes can be removed.
+
+Spilling grows substantially through the stream, even within equal-size groups:
+
+| Group | Cumulative records | Spills, 64 MiB | Spills, 128 MiB |
+| --- | ---: | ---: | ---: |
+| 1 | 64 | 1,849 | 0 |
+| 2 | 128 | 16,943 | 2,468 |
+| 3 | 192 | 54,965 | 9,934 |
+| 4 | 256 | 142,469 | 19,246 |
+| 5 | 320 | 242,976 | 44,929 |
+| 6 | 384 | 251,391 | 85,871 |
+| 7 | 398 | 46,152 | 10,544 |
+
+Record counts include control events; they are not file counts. The final group
+has only 14 records. These are per-group spill deltas, not cumulative totals.
+
+**Neither full rebuild completed.** The 64 MiB run built all deferred indexes
+in 43.16 seconds, then stopped on PSI during `optimize` at 160.00 seconds overall.
+The 128 MiB run built indexes in 22.05 seconds, completed `optimize`, and passed
+`integrity_check` in 57.81 seconds; it stopped on PSI during the foreign-key
+check at 188.74 seconds overall. No complete FK result, installed database,
+full equivalence check, or end-to-end speedup is claimed. Filesystem caches were
+not flushed, and changing host load and reclaim complicate elapsed-time and
+storage-read comparisons. The earlier successful 178.7-second rebuild remains
+the last completed 200k end-to-end measurement.
+
+Both replay scopes reached approximately 768.22 MiB, with 6,255 and 6,641
+soft-limit events respectively. Available host RAM remained above 1,266 MiB
+in sampled replay telemetry, yet PSI still crossed the stop thresholds; spare
+host RAM does not eliminate reclaim pressure inside the capped workload. All
+four build/replay guards reported zero hard-limit, OOM, and OOM-kill events,
+with unchanged global OOM-kill counts. No guard thresholds were relaxed.
+
+Both incomplete databases retained `user_version = 0`; neither was published
+as a valid rebuild. Their exact owned paths and a small sidecar were removed,
+recovering approximately 1,271 MiB. Reference database size, inode, modification
+time, canonical Git HEAD, and clean Git status were unchanged. No benchmark
+scope remains active.
+
+At the user's request, retain the diagnostic build, compiled dependencies,
+source copy, commands, guard reports, raw phase logs, and `replay-summary.json`
+at `/home/ubuntu/tmp/archive-ledger-al-j5k-replay-xggzy6_z`, owned by Codex for
+**al-j5k**. The executable is `target/release/archive`, SHA-256
+`702a3df975b37abfc23a8424c577f4b09ac3b94fdef4d723a0de2ede191fa1c3`.
+The source is the production projection at `251fe05` plus the retained research
+patch. Remove this staging root only when the user ends the larger-batch
+investigation or explicitly retires the build. Future unchanged-code tests can
+reuse the executable; source edits can reuse the compiled dependencies. No
+256 MiB cache or larger fixture was run in this follow-up.
+
+## Quiet-host completion with more scope headroom
+
+The user authorized stopping the Hermes gateway during a quiet period, then
+rerunning the planned 200k comparison. The retained diagnostic executable above
+was reused without compilation or production source changes. Both rebuilds
+completed, including integrity/FK checks, the completion marker, installation,
+and installed validation.
+
+The revised guard requires 2,560 MiB available host RAM and quiet memory PSI
+before launch. Its scope has a 1,536 MiB soft limit, 2,048 MiB hard limit, zero
+swap, a 1,920 MiB early stop, and a 512 MiB host reserve. The existing sustained
+memory-PSI stops, 1 GiB free-disk floor, single-core affinity, and low CPU/I/O
+priority remain. Both successful execution and watchdog termination were
+smoke-tested before the workloads; the termination test deliberately stopped
+a sleeping process on timeout.
+
+| Measurement | 64 MiB cache | 128 MiB cache |
+| --- | ---: | ---: |
+| Complete CLI rebuild, seconds | 103.61 | 102.31 |
+| Replay, seconds | 73.34 | 74.06 |
+| Deferred index creation, seconds | 2.04 | 1.77 |
+| Integrity check, seconds | 7.32 | 7.55 |
+| Foreign-key check, seconds | 1.68 | 1.79 |
+| Peak CLI RSS, MiB | 95.5 | 171.3 |
+| Peak scope charge including filesystem cache, MiB | 1,148.9 | 960.9 |
+| Minimum available host RAM, MiB | 2,636.6 | 2,603.4 |
+| Replay dirty-page spills | 756,745 | 172,992 |
+| Replay recorded writes, MB | 1,748.97 | 1,809.59 |
+| Complete rebuild recorded writes, MB | 1,790.18 | 1,850.80 |
+
+SQLite replay miss, spill, and page-write counts exactly reproduce the earlier
+instrumented runs. The larger cache again reduces spills by 77.1%, but here
+recorded storage writes increase slightly and overall timing barely changes.
+This does not justify changing the production 64 MiB setting. These sequential
+runs used warmed filesystem caches: reference hashing also read the reference
+before the first case. Neither cache-size timing differences nor comparison
+with earlier constrained runs establish a controlled HDD speedup.
+
+Both 666,390,528-byte outputs had schema version six, DELETE journaling, no
+sidecars, and exact schema and row equality across **all 33 tables**, without
+local-state exclusions, against the retained rebuilt reference. Each principal
+inventory table contained 200,000 rows. The two streaming comparisons completed
+in 44.20 and 37.75 seconds. Routine fsck of the 64 MiB output also completed:
+92.30 scope seconds, healthy and current, with all requested checks passing.
+Its SQLite quick check took 69.95 seconds. `fsck --full` was not run; the separate
+exact comparisons provide the rebuild-equivalence evidence.
+
+All seven guard reports, including both smoke tests, recorded zero soft-limit,
+hard-limit, OOM, and OOM-kill events, zero scope swap, and unchanged global
+OOM-kill counts. Minimum available host RAM across the actual workloads was
+2,428.1 MiB. Reference SHA-256, size, inode, modification time, canonical Git
+HEAD, and clean status were unchanged. No benchmark scope remains active.
+
+A guarded **400k attempt is plausible, not yet demonstrated**. Process RAM is
+modest, but scope cache demand and runtime need measurement at the larger size.
+After deleting only these two verified disposable outputs (1,271.0 MiB), free
+disk was 4,841 MiB. Linear sizing from the 200k fixture suggests about 3.3 GiB
+for 400k canonical history and two database copies alone, excluding source
+fixture, spool, journal, and temporary overhead. A larger run needs staged
+space management or more disk; the stock complete harness should not be
+launched assuming that 4.7 GiB is sufficient. No 400k fixture was run here.
+
+Raw commands, revised guards, phase logs, exact comparisons, fsck result,
+identity checks, cleanup record, and `summary.json` are retained at
+`/home/ubuntu/tmp/archive-ledger-al-j5k-quiet-8ajvi1ws`, owned by Codex for
+**al-j5k**. Remove this evidence when the user ends the larger-batch
+investigation. The original 200k fixture and separately retained compiled
+build remain available; Hermes was stopped during these measurements. The later
+[400k and partial 800k results](2026-09-25-rebuild-400k.md) supersede the
+400k feasibility assessment above. Further performance work is now deferred,
+and the user has announced restarting Hermes.
 
 ## Reproduction and evidence
 
