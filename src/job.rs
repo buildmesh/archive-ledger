@@ -29,6 +29,134 @@ pub fn validate_job_id(job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Original local configuration for a resumable job, independent of the rebuildable projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalJobConfig {
+    pub job_type: &'static str,
+    pub input_version: String,
+    pub params: serde_json::Value,
+}
+
+/// Reads existing local configuration under the per-job lock, without recreating job state.
+/// The lock is released before returning; a runner must acquire its own lock and recheck state.
+pub fn read_local_job_config(
+    archive_root: &Path,
+    job_id: &str,
+) -> io::Result<Option<LocalJobConfig>> {
+    validate_job_id(job_id).map_err(invalid_input)?;
+    let Some(jobs_root) = existing_jobs_root(archive_root)? else {
+        return Ok(None);
+    };
+    let job = JobDirectory {
+        path: jobs_root.join(job_id),
+        jobs_root,
+    };
+    match job.verify() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let _lock = job.try_lock()?;
+    // The previous owner may have removed the directory before this lock was acquired.
+    match job.verify() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    job.verify_safe_entries(&["annex-config.json", "inventory-config.json"])?;
+    let annex = job.read_optional("annex-config.json")?;
+    let inventory = job.read_optional("inventory-config.json")?;
+    let (bytes, annex) = match (annex, inventory) {
+        (Some(_), Some(_)) => {
+            return Err(unsafe_path(
+                "job has conflicting annex and inventory configurations",
+            ));
+        }
+        (Some(bytes), None) => (bytes, true),
+        (None, Some(bytes)) => (bytes, false),
+        (None, None) => return Ok(None),
+    };
+    let params: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| unsafe_path(format!("invalid local job configuration: {error}")))?;
+    let job_type = if annex {
+        if params.get("job_id").and_then(serde_json::Value::as_str) != Some(job_id) {
+            return Err(unsafe_path(
+                "annex configuration job ID does not match its directory",
+            ));
+        }
+        "annex_import"
+    } else {
+        match params.get("scan_mode").and_then(serde_json::Value::as_str) {
+            Some("add") => "inventory_add",
+            Some("complete") => "location_scan",
+            _ => {
+                return Err(unsafe_path(
+                    "inventory configuration has an invalid scan mode",
+                ))
+            }
+        }
+    };
+    let version_field = if annex { "import_id" } else { "scan_id" };
+    let input_version = params
+        .get(version_field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| unsafe_path(format!("local job configuration requires {version_field}")))?
+        .to_owned();
+    Ok(Some(LocalJobConfig {
+        job_type,
+        input_version,
+        params,
+    }))
+}
+
+/// Lists validated direct local job directories in sorted order, without creating directories.
+pub fn local_job_ids(archive_root: &Path) -> io::Result<Vec<String>> {
+    let Some(jobs_root) = existing_jobs_root(archive_root)? else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(&jobs_root)? {
+        let entry = entry?;
+        let id = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| unsafe_path("local job directory name is not UTF-8"))?;
+        validate_job_id(&id).map_err(unsafe_path)?;
+        JobDirectory {
+            path: jobs_root.join(&id),
+            jobs_root: jobs_root.clone(),
+        }
+        .verify()?;
+        ids.push(id);
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn existing_jobs_root(archive_root: &Path) -> io::Result<Option<PathBuf>> {
+    let archive_root = match fs::canonicalize(archive_root) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    require_real_directory(&archive_root)?;
+    let local = archive_root.join("local");
+    let jobs_root = local.join("jobs");
+    for path in [&local, &jobs_root] {
+        match require_real_directory(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    let actual = fs::canonicalize(&jobs_root)?;
+    if actual != jobs_root || actual.parent() != Some(local.as_path()) {
+        return Err(unsafe_path("local/jobs is not a direct Archive child"));
+    }
+    Ok(Some(actual))
+}
+
 /// A validated job directory beneath an Archive's private `local/jobs` directory.
 pub(crate) struct JobDirectory {
     jobs_root: PathBuf,
@@ -513,6 +641,153 @@ fn unsupported_job_files() -> io::Error {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn reading_absent_local_jobs_does_not_create_state() {
+        let temp = tempdir().unwrap();
+        for root in [temp.path().to_path_buf(), temp.path().join("absent")] {
+            assert!(local_job_ids(&root).unwrap().is_empty());
+            assert!(read_local_job_config(&root, "job_missing")
+                .unwrap()
+                .is_none());
+            assert!(!root.join("local").exists());
+        }
+        let job = JobDirectory::new(temp.path(), "job_missing").unwrap();
+        assert!(read_local_job_config(temp.path(), "job_missing")
+            .unwrap()
+            .is_none());
+        assert!(!job.path().exists());
+        assert!(!temp.path().join("local/job-locks").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_configuration_preserves_params_and_releases_lock() {
+        let temp = tempdir().unwrap();
+        let cases = [
+            (
+                "job_z",
+                "annex-config.json",
+                "annex_import",
+                "import_1",
+                serde_json::json!({"job_id": "job_z", "import_id": "import_1", "inventory_only": true, "extra": [1, 2]}),
+            ),
+            (
+                "job_a",
+                "inventory-config.json",
+                "inventory_add",
+                "scan_1",
+                serde_json::json!({"scan_mode": "add", "scan_id": "scan_1", "extra": {"unchanged": true}}),
+            ),
+            (
+                "job_c",
+                "inventory-config.json",
+                "location_scan",
+                "scan_2",
+                serde_json::json!({"scan_mode": "complete", "scan_id": "scan_2"}),
+            ),
+        ];
+        for (id, filename, job_type, version, params) in cases {
+            let job = JobDirectory::new(temp.path(), id).unwrap();
+            job.ensure().unwrap();
+            assert!(read_local_job_config(temp.path(), id).unwrap().is_none());
+            job.write_new(filename, &serde_json::to_vec(&params).unwrap())
+                .unwrap();
+            let recovered = read_local_job_config(temp.path(), id).unwrap().unwrap();
+            assert_eq!(recovered.job_type, job_type);
+            assert_eq!(recovered.input_version, version);
+            assert_eq!(recovered.params, params);
+            let lock = job.try_lock().unwrap();
+            assert_eq!(
+                read_local_job_config(temp.path(), id).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(lock);
+        }
+        // Lock files are siblings of local/jobs and must never be treated as jobs.
+        assert_eq!(
+            local_job_ids(temp.path()).unwrap(),
+            ["job_a", "job_c", "job_z"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_configuration_rejects_malformed_mismatched_and_conflicting_state() {
+        let temp = tempdir().unwrap();
+        let job = JobDirectory::new(temp.path(), "job_test").unwrap();
+        job.ensure().unwrap();
+        for bytes in [
+            br#"{"#.as_slice(),
+            br#"[]"#,
+            br#"{"job_id":"another_job","import_id":"import_1"}"#,
+            br#"{"job_id":"job_test","import_id":""}"#,
+        ] {
+            fs::write(job.path().join("annex-config.json"), bytes).unwrap();
+            assert_eq!(
+                read_local_job_config(temp.path(), "job_test")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        fs::remove_file(job.path().join("annex-config.json")).unwrap();
+        for params in [
+            serde_json::json!({"scan_id": "scan_1", "scan_mode": "unknown"}),
+            serde_json::json!({"scan_id": "", "scan_mode": "add"}),
+            serde_json::json!({"scan_mode": "complete"}),
+        ] {
+            fs::write(
+                job.path().join("inventory-config.json"),
+                serde_json::to_vec(&params).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                read_local_job_config(temp.path(), "job_test")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        fs::write(
+            job.path().join("annex-config.json"),
+            br#"{"job_id":"job_test","import_id":"import_1"}"#,
+        )
+        .unwrap();
+        assert!(read_local_job_config(temp.path(), "job_test")
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_configuration_and_listing_reuse_containment_checks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let job = JobDirectory::new(temp.path(), "job_test").unwrap();
+        job.ensure().unwrap();
+        let sentinel = temp.path().join("sentinel");
+        let contents = br#"{"job_id":"job_test","import_id":"import_1"}"#;
+        fs::write(&sentinel, contents).unwrap();
+        let config = job.path().join("annex-config.json");
+        symlink(&sentinel, &config).unwrap();
+        assert!(read_local_job_config(temp.path(), "job_test").is_err());
+        fs::remove_file(&config).unwrap();
+        fs::hard_link(&sentinel, &config).unwrap();
+        assert!(read_local_job_config(temp.path(), "job_test").is_err());
+        fs::remove_file(&config).unwrap();
+        fs::remove_dir(job.path()).unwrap();
+        symlink(temp.path(), job.path()).unwrap();
+        assert!(local_job_ids(temp.path()).is_err());
+        assert!(read_local_job_config(temp.path(), "job_test").is_err());
+        fs::remove_file(job.path()).unwrap();
+        fs::create_dir(job.jobs_root.join("invalid.name")).unwrap();
+        assert!(local_job_ids(temp.path()).is_err());
+        assert!(read_local_job_config(temp.path(), "../sentinel").is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), contents);
+    }
 
     #[cfg(unix)]
     #[test]

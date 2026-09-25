@@ -8876,8 +8876,21 @@ fn execute_v2_job(
             }
         }
         JobCommand::Resume { job_id, max_items } => {
-            let job = v2_local_job(database, job_id)?
-                .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+            let (job_type, job_status, input_version, job_params) =
+                if let Some(job) = v2_local_job(database, job_id)? {
+                    (job.job_type, job.status, job.input_version, job.params)
+                } else {
+                    let config = v2_local_job_config(database, job_id)?
+                        .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+                    // Existing runners recheck these inputs and checkpoints under
+                    // their lock before reconstructing the missing operational row.
+                    (
+                        config.job_type.to_owned(),
+                        "running".to_owned(),
+                        config.input_version,
+                        config.params,
+                    )
+                };
             let recovered = V2OriginStore::open(cli.events_path())?
                 .recover_pending_publication()?
                 .is_some();
@@ -8885,36 +8898,36 @@ fn execute_v2_job(
             // the job reconcile and clean up after finishing its publication.
             let recovered_inventory = recovered
                 && matches!(
-                    job.job_type.as_str(),
+                    job_type.as_str(),
                     "inventory_add" | "location_scan" | "annex_import"
                 );
-            if job.status == "cancelled" || (job.status == "complete" && !recovered_inventory) {
+            if job_status == "cancelled" || (job_status == "complete" && !recovered_inventory) {
                 return Err(AppError::Input(format!(
                     "job {job_id} is already {}",
-                    job.status
+                    job_status
                 )));
             }
-            match job.job_type.as_str() {
+            match job_type.as_str() {
                 "inventory_add" => {
                     return execute_v2_collection_add(
                         cli,
                         database,
                         &CollectionAddArgs {
-                            path: job_registry_path(&job.params, "root_path")?,
-                            location: Some(json_string(&job.params, "location_id")?),
-                            collection: Some(json_string(&job.params, "collection_id")?),
-                            exclusions: job_registry_paths(&job.params, "exclusions")?,
-                            accept_changes: if job.params.get("accept_changes").is_some() {
-                                job_registry_paths(&job.params, "accept_changes")?
+                            path: job_registry_path(&job_params, "root_path")?,
+                            location: Some(json_string(&job_params, "location_id")?),
+                            collection: Some(json_string(&job_params, "collection_id")?),
+                            exclusions: job_registry_paths(&job_params, "exclusions")?,
+                            accept_changes: if job_params.get("accept_changes").is_some() {
+                                job_registry_paths(&job_params, "accept_changes")?
                             } else {
                                 Vec::new()
                             },
                             dry_run: false,
                             yes: true,
                             non_interactive: true,
-                            job_id: Some(job.job_id),
-                            scan_id: Some(job.input_version),
-                            batch_entries: inventory_job_batch_entries(&job.params)?,
+                            job_id: Some(job_id.clone()),
+                            scan_id: Some(input_version),
+                            batch_entries: inventory_job_batch_entries(&job_params)?,
                             max_items: *max_items,
                         },
                     );
@@ -8924,13 +8937,13 @@ fn execute_v2_job(
                         cli,
                         database,
                         &LocationScanArgs {
-                            location: Some(json_string(&job.params, "location_id")?),
-                            path: Some(job_registry_path(&job.params, "root_path")?),
-                            collection: Some(json_string(&job.params, "collection_id")?),
-                            exclusions: job_registry_paths(&job.params, "exclusions")?,
-                            job_id: Some(job.job_id),
-                            scan_id: Some(job.input_version),
-                            batch_entries: inventory_job_batch_entries(&job.params)?,
+                            location: Some(json_string(&job_params, "location_id")?),
+                            path: Some(job_registry_path(&job_params, "root_path")?),
+                            collection: Some(json_string(&job_params, "collection_id")?),
+                            exclusions: job_registry_paths(&job_params, "exclusions")?,
+                            job_id: Some(job_id.clone()),
+                            scan_id: Some(input_version),
+                            batch_entries: inventory_job_batch_entries(&job_params)?,
                             max_items: *max_items,
                         },
                     );
@@ -8942,16 +8955,16 @@ fn execute_v2_job(
                         &store,
                         database,
                         AnnexImportConfig {
-                            inventory_only: job.params["inventory_only"].as_bool().unwrap_or(false),
-                            repo_path: job_registry_path(&job.params, "repo_path")?,
-                            import_id: job.input_version.clone(),
-                            job_id: job.job_id.clone(),
-                            collection_id: json_string(&job.params, "collection_id")?,
-                            worktree_location_id: json_string(&job.params, "worktree_location_id")?,
-                            cas_location_id: json_string(&job.params, "cas_location_id")?,
-                            device_id: json_string(&job.params, "device_id")?,
-                            archive_root_id: json_string(&job.params, "archive_root_id")?,
-                            batch_entries: job.params["batch_entries"]
+                            inventory_only: job_params["inventory_only"].as_bool().unwrap_or(false),
+                            repo_path: job_registry_path(&job_params, "repo_path")?,
+                            import_id: input_version.clone(),
+                            job_id: job_id.clone(),
+                            collection_id: json_string(&job_params, "collection_id")?,
+                            worktree_location_id: json_string(&job_params, "worktree_location_id")?,
+                            cas_location_id: json_string(&job_params, "cas_location_id")?,
+                            device_id: json_string(&job_params, "device_id")?,
+                            archive_root_id: json_string(&job_params, "archive_root_id")?,
+                            batch_entries: job_params["batch_entries"]
                                 .as_u64()
                                 .and_then(|value| usize::try_from(value).ok())
                                 .ok_or_else(|| {
@@ -8978,8 +8991,8 @@ fn execute_v2_job(
                             "{}",
                             serde_json::to_string_pretty(&json!({
                                 "version": 2,
-                                "job_id": job.job_id,
-                                "import_id": job.input_version,
+                                "job_id": job_id,
+                                "import_id": input_version,
                                 "status": status,
                                 "annex_uuid": result.annex_uuid,
                                 "git_head_commit": result.git_head_commit,
@@ -8991,7 +9004,7 @@ fn execute_v2_job(
                             "Annex import paused after {} index entries.",
                             result.summary.entries_seen
                         );
-                        println!("Resume with: archive job resume {}", job.job_id);
+                        println!("Resume with: archive job resume {job_id}");
                     } else {
                         println!(
                             "Annex import complete: {} index entries; {} verified present; {} absent; {} unchecked.",
@@ -9003,23 +9016,23 @@ fn execute_v2_job(
                     }
                 }
                 "stage_import" => {
-                    let source = job_path(&job.params, "source")?;
-                    let manifest = Some(job_path(&job.params, "manifest")?);
-                    let destination_root = Some(job_path(&job.params, "destination_root")?);
-                    let into = Some(job_path(&job.params, "into")?);
+                    let source = job_path(&job_params, "source")?;
+                    let manifest = Some(job_path(&job_params, "manifest")?);
+                    let destination_root = Some(job_path(&job_params, "destination_root")?);
+                    let into = Some(job_path(&job_params, "into")?);
                     execute_v2_stage_import(
                         cli,
                         database,
                         &StageImportArgs {
                             source,
                             manifest,
-                            collection: Some(json_string(&job.params, "collection")?),
-                            location: Some(json_string(&job.params, "location")?),
+                            collection: Some(json_string(&job_params, "collection")?),
+                            location: Some(json_string(&job_params, "location")?),
                             into,
                             dry_run: false,
                             yes: true,
                             non_interactive: true,
-                            job_id: Some(job.job_id),
+                            job_id: Some(job_id.clone()),
                             destination_root,
                             max_items: *max_items,
                             stop_after_publish: false,
@@ -9027,7 +9040,7 @@ fn execute_v2_job(
                     )?;
                 }
                 "copy" => {
-                    let cwd = job_path(&job.params, "cwd")?;
+                    let cwd = job_path(&job_params, "cwd")?;
                     std::env::set_current_dir(&cwd).map_err(|error| {
                         AppError::Input(format!(
                             "cannot return to copy job source {}: {error}",
@@ -9035,7 +9048,7 @@ fn execute_v2_job(
                         ))
                     })?;
                     let logical_filters: Vec<PathBuf> = serde_json::from_value(
-                        job.params.get("logical_filters").cloned().ok_or_else(|| {
+                        job_params.get("logical_filters").cloned().ok_or_else(|| {
                             AppError::Input("copy job lacks logical filters".to_owned())
                         })?,
                     )?;
@@ -9043,21 +9056,21 @@ fn execute_v2_job(
                         cli,
                         database,
                         &CopyMutationArgs {
-                            to: Some(json_string(&job.params, "to")?),
-                            from: Some(json_string(&job.params, "from")?),
-                            collection: Some(json_string(&job.params, "collection")?),
+                            to: Some(json_string(&job_params, "to")?),
+                            from: Some(json_string(&job_params, "from")?),
+                            collection: Some(json_string(&job_params, "collection")?),
                             paths: Vec::new(),
                             dry_run: false,
                             yes: true,
                             non_interactive: true,
-                            job_id: Some(job.job_id),
+                            job_id: Some(job_id.clone()),
                             max_items: *max_items,
                             logical_filters: Some(logical_filters),
                         },
                     )?;
                 }
                 "background_stale" => {
-                    execute_v2_background_run(cli, database, Some(job.job_id), *max_items)?;
+                    execute_v2_background_run(cli, database, Some(job_id.clone()), *max_items)?;
                 }
                 other => {
                     return Err(AppError::Input(format!(
@@ -9852,28 +9865,40 @@ fn execute_v2_background_run(
 }
 
 fn list_v2_jobs(database: &V2ProjectionDb, limit: usize) -> Result<Vec<LocalJob>, AppError> {
+    query_v2_jobs(database, None, limit)
+}
+
+fn query_v2_jobs(
+    database: &V2ProjectionDb,
+    job_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<LocalJob>, AppError> {
     let connection = v2_cli_connection(database)?;
     let mut statement = connection
         .prepare(
             "SELECT job_id, job_type, status, created_time_utc_ms, started_time_utc_ms,
                     finished_time_utc_ms, params_json, progress_json, input_version
-             FROM jobs ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?1",
+             FROM jobs WHERE (?1 IS NULL OR job_id = ?1)
+             ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?2",
         )
         .map_err(|source| v2_cli_sql_error(database, source))?;
     let rows = statement
-        .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })
+        .query_map(
+            params![job_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
         .map_err(|source| v2_cli_sql_error(database, source))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|source| v2_cli_sql_error(database, source))?;
@@ -9895,9 +9920,7 @@ fn list_v2_jobs(database: &V2ProjectionDb, limit: usize) -> Result<Vec<LocalJob>
 }
 
 fn v2_local_job(database: &V2ProjectionDb, job_id: &str) -> Result<Option<LocalJob>, AppError> {
-    Ok(list_v2_jobs(database, 10_000)?
-        .into_iter()
-        .find(|job| job.job_id == job_id))
+    Ok(query_v2_jobs(database, Some(job_id), 1)?.into_iter().next())
 }
 
 fn job_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> {
@@ -9908,6 +9931,23 @@ fn job_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> 
             .ok_or_else(|| AppError::Input(format!("job parameters lack {key}")))?,
     )
     .map_err(AppError::Json)
+}
+
+fn v2_local_job_config(
+    database: &V2ProjectionDb,
+    job_id: &str,
+) -> Result<Option<archive_ledger::LocalJobConfig>, AppError> {
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    archive_ledger::read_local_job_config(archive_root, job_id).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            AppError::V2Inventory(archive_ledger::V2InventoryError::JobBusy(job_id.to_owned()))
+        } else {
+            AppError::Io(std::io::Error::new(
+                error.kind(),
+                format!("cannot read local job {job_id}: {error}"),
+            ))
+        }
+    })
 }
 
 fn inventory_job_batch_entries(params: &serde_json::Value) -> Result<usize, AppError> {
@@ -10286,6 +10326,31 @@ fn refuse_v2_unfinished_annex_import(
                 "this repository has an unfinished annex import; resume it with archive job resume {}",
                 shell_quote(&job_id)
             )));
+        }
+    }
+    // A canonical rebuild omits unpublished local jobs. Their original config
+    // remains sufficient for resume, so do not start a replacement import.
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    for job_id in archive_ledger::local_job_ids(archive_root)? {
+        let known: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
+                [&job_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if known {
+            continue; // In particular, a terminal database row takes precedence.
+        }
+        if let Some(config) = v2_local_job_config(database, &job_id)? {
+            if config.job_type == "annex_import"
+                && job_registry_path(&config.params, "repo_path")? == repository
+            {
+                return Err(AppError::Input(format!(
+                    "this repository has an unfinished annex import; resume it with archive job resume {}",
+                    shell_quote(&job_id)
+                )));
+            }
         }
     }
     Ok(())

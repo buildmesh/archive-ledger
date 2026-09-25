@@ -57,7 +57,7 @@ pub use genesis::{
 pub use git::{
     managed_git_command, validate_git_ref, validate_git_remote_locator, validate_git_remote_name,
 };
-pub use job::validate_job_id;
+pub use job::{local_job_ids, read_local_job_config, validate_job_id, LocalJobConfig};
 pub use metadata::{
     initialize_metadata_repository, restore_check, IndependenceAssessment,
     MetadataCheckpointResult, MetadataDestinationSnapshot, MetadataDestinationState, MetadataError,

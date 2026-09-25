@@ -35,6 +35,41 @@ mod unix {
     }
 
     #[test]
+    fn job_lookup_keeps_old_terminal_rows_authoritative() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        database
+            .execute_batch(
+                "BEGIN;
+            INSERT INTO jobs(job_id,job_type,status,created_time_utc_ms,params_json,input_version)
+            VALUES ('job_old','annex_import','cancelled',0,'{}','import_old');
+            WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10001)
+            INSERT INTO jobs(job_id,job_type,status,created_time_utc_ms,params_json,input_version)
+            SELECT 'job_new_'||x,'annex_import','complete',x,'{}','import_new_'||x FROM n;
+            COMMIT;",
+            )
+            .unwrap();
+        drop(database);
+        let shown = json(&success(
+            archive(&temp).args(["--json", "job", "show", "job_old"]),
+        ));
+        assert_eq!(shown["status"], "cancelled");
+        let output = archive(&temp)
+            .args(["job", "resume", "job_old"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("already cancelled"));
+    }
+
+    #[test]
     fn cli_information_exits_succeed_without_opening_an_archive() {
         let temp = TempDir::new().unwrap();
         for mode in ["human", "flag_json", "env_json"] {
@@ -2020,6 +2055,26 @@ mod unix {
             2
         );
         drop(database);
+        success(archive(&temp).args(["db", "rebuild"]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE job_id = 'job_inventory_checkpoint'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(database);
+        assert_eq!(fs::read(&spool_path).unwrap(), committed_spool);
+        assert_eq!(inventory_checkpoint(&job_root), checkpoint);
+        assert_job_resume_refuses_symlink(
+            &temp,
+            "job_inventory_checkpoint",
+            "inventory-config.json",
+        );
 
         let mut spool = fs::OpenOptions::new()
             .append(true)
@@ -2945,6 +3000,20 @@ mod unix {
         ])));
         assert_eq!(paused["annex_import"]["status"], "running");
         assert_eq!(paused["annex_import"]["summary"]["unchecked"], 1);
+        success(archive(&temp).args(["db", "rebuild"]));
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE job_id = 'job_unchecked_resume'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(database);
+        assert_job_resume_refuses_symlink(&temp, "job_unchecked_resume", "annex-config.json");
         let canonical = root(&temp).join("canonical");
         let before_commit = git(&canonical, &["rev-parse", "HEAD"]).stdout;
         let index_lock = canonical.join(".git/index.lock");
@@ -3108,6 +3177,18 @@ mod unix {
                 "--name",
                 "Files",
                 "--import-annex",
+            ],
+            "archive job resume 'job_guard'",
+        );
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert_refused(
+            &[
+                "location",
+                "import-annex",
+                alias.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--reimport",
             ],
             "archive job resume 'job_guard'",
         );
