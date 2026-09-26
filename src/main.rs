@@ -513,9 +513,14 @@ enum AnnexRemoteCommand {
 
 #[derive(Debug, Subcommand)]
 enum JobCommand {
+    /// List jobs. Version 2 Archives show unfinished jobs, including local jobs missing
+    /// from the catalog database, unless --all is given.
     List {
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Include finished, partial, failed and cancelled jobs (version 2 Archives).
+        #[arg(long)]
+        all: bool,
     },
     Show {
         job_id: String,
@@ -3447,7 +3452,7 @@ fn record_annex_remote(
 
 fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Result<u8, AppError> {
     match command {
-        JobCommand::List { limit } => {
+        JobCommand::List { limit, .. } => {
             if *limit == 0 || *limit > 10_000 {
                 return Err(AppError::Input(
                     "--limit must be between 1 and 10000".to_owned(),
@@ -4972,11 +4977,14 @@ fn execute_v2_status(cli: &Cli) -> Result<u8, AppError> {
         .iter()
         .any(|(_, summary)| summary.files_at_risk > 0 || summary.files_uncertain > 0)
         || status.unresolved_conflicts > 0;
+    let (unfinished_jobs, local_jobs_error) = unfinished_v2_job_ids(&database)?;
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
+                "unfinished_jobs": unfinished_jobs.len(),
+                "local_jobs_error": local_jobs_error,
                 "archive_id": status.archive_id,
                 "archive_name": status.archive_name,
                 "schema_version": status.schema_version,
@@ -5020,6 +5028,14 @@ fn execute_v2_status(cli: &Cli) -> Result<u8, AppError> {
                 "WARNING: {} unresolved metadata conflicts need review.",
                 status.unresolved_conflicts
             );
+        }
+        match unfinished_jobs.as_slice() {
+            [] => {}
+            [job_id] => println!("1 unfinished job ({job_id}); see archive job show {job_id}"),
+            jobs => println!("{} unfinished jobs; see archive job list", jobs.len()),
+        }
+        if let Some(error) = local_jobs_error {
+            println!("WARNING: cannot inspect local job directories: {error}");
         }
     }
     Ok(if has_findings { EXIT_FINDINGS } else { EXIT_OK })
@@ -8844,33 +8860,136 @@ fn execute_v2_job(
     command: &JobCommand,
 ) -> Result<u8, AppError> {
     match command {
-        JobCommand::List { limit } => {
-            let jobs = list_v2_jobs(database, *limit)?;
+        JobCommand::List { limit, all } => {
+            let jobs = query_v2_jobs(database, None, (!*all).then_some("running"), *limit)?;
+            // Local inspection problems must not hide the database jobs.
+            let (local_only, local_jobs_error) = match v2_local_only_jobs(database) {
+                Ok(jobs) => (jobs, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json!({"version": 2, "items": jobs}))?
+                    serde_json::to_string_pretty(&json!({
+                        "version": 2,
+                        "items": jobs,
+                        "local_only": local_only,
+                        "local_jobs_error": local_jobs_error,
+                    }))?
                 );
-            } else if jobs.is_empty() {
-                println!("No resumable jobs.");
-            } else {
-                for job in jobs {
-                    println!("{}  {}  {}", job.job_id, job.status, job.job_type);
+                return Ok(EXIT_OK);
+            }
+            if let Some(error) = &local_jobs_error {
+                println!("WARNING: cannot inspect local job directories: {error}");
+            }
+            if jobs.is_empty() && local_only.is_empty() {
+                println!(
+                    "{}",
+                    if *all {
+                        "No jobs."
+                    } else {
+                        "No unfinished jobs."
+                    }
+                );
+                return Ok(EXIT_OK);
+            }
+            let now = now_utc_ms()?;
+            for job in &jobs {
+                let mut line = format!(
+                    "{}  {}  {}  started {}",
+                    job.job_id,
+                    job.status,
+                    job.job_type,
+                    format_age(
+                        job.started_time_utc_ms.unwrap_or(job.created_time_utc_ms),
+                        now
+                    )
+                );
+                if let Some(progress) = job.progress.as_ref().and_then(job_progress_count) {
+                    line.push_str(&format!("  {progress}"));
                 }
+                println!("{line}");
+            }
+            if !local_only.is_empty() {
+                println!("Local job directories missing from the catalog database:");
+                for job in &local_only {
+                    println!(
+                        "{}  {}  {}",
+                        job.job_id,
+                        job.job_type.unwrap_or("unknown"),
+                        job.state.description()
+                    );
+                }
+            }
+            if jobs.iter().any(|job| job.status == "running")
+                || local_only
+                    .iter()
+                    .any(|job| job.state == LocalOnlyJobState::Resumable)
+            {
+                println!("Resume with: archive job resume <job-id>");
+            }
+            if !*all {
+                println!("Use --all to include finished jobs.");
             }
         }
         JobCommand::Show { job_id } => {
-            let job = v2_local_job(database, job_id)?
-                .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+            let Some(job) = v2_local_job(database, job_id)? else {
+                archive_ledger::validate_job_id(job_id)
+                    .map_err(|_| AppError::Input(format!("job not found: {job_id}")))?;
+                let job = v2_local_only_job(database, job_id)?
+                    .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&job)?);
+                } else {
+                    println!("Job: {}", job.job_id);
+                    println!(
+                        "Type: {}; not in the catalog database (for example after db rebuild)",
+                        job.job_type.unwrap_or("unknown")
+                    );
+                    println!("Local files: {}", job.path.display());
+                    println!("State: {}", job.state.description());
+                    if job.state == LocalOnlyJobState::Resumable {
+                        println!("Resume with: archive job resume {}", job.job_id);
+                    }
+                }
+                return Ok(EXIT_OK);
+            };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             } else {
                 println!("Job: {}", job.job_id);
                 println!("Type: {}; Status: {}", job.job_type, job.status);
-                if let Some(progress) = job.progress {
+                let now = now_utc_ms()?;
+                println!(
+                    "Started: {}",
+                    format_age(
+                        job.started_time_utc_ms.unwrap_or(job.created_time_utc_ms),
+                        now
+                    )
+                );
+                if let Some(finished) = job.finished_time_utc_ms {
+                    println!("Finished: {}", format_age(finished, now));
+                }
+                if job.status == "running" {
+                    // Recorded when a run pauses; a live or crashed run may be further along.
+                    let recorded = job.progress.as_ref().map(|progress| {
+                        job_progress_phase(progress)
+                            .into_iter()
+                            .chain(job_progress_count(progress))
+                            .collect::<Vec<_>>()
+                    });
+                    match recorded {
+                        Some(parts) if !parts.is_empty() => {
+                            println!("Last recorded progress: {}", parts.join(", "))
+                        }
+                        _ => println!(
+                            "Last recorded progress: none (the run may still be going, or was interrupted before pausing); resume continues from its local checkpoint"
+                        ),
+                    }
+                } else if let Some(progress) = job.progress {
                     println!("Progress: {progress}");
                 }
-                if job.status != "complete" {
+                if job.status == "running" {
                     println!("Resume with: archive job resume {}", job.job_id);
                 }
             }
@@ -9864,13 +9983,10 @@ fn execute_v2_background_run(
     })
 }
 
-fn list_v2_jobs(database: &V2ProjectionDb, limit: usize) -> Result<Vec<LocalJob>, AppError> {
-    query_v2_jobs(database, None, limit)
-}
-
 fn query_v2_jobs(
     database: &V2ProjectionDb,
     job_id: Option<&str>,
+    status: Option<&str>,
     limit: usize,
 ) -> Result<Vec<LocalJob>, AppError> {
     let connection = v2_cli_connection(database)?;
@@ -9878,13 +9994,13 @@ fn query_v2_jobs(
         .prepare(
             "SELECT job_id, job_type, status, created_time_utc_ms, started_time_utc_ms,
                     finished_time_utc_ms, params_json, progress_json, input_version
-             FROM jobs WHERE (?1 IS NULL OR job_id = ?1)
-             ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?2",
+             FROM jobs WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?3",
         )
         .map_err(|source| v2_cli_sql_error(database, source))?;
     let rows = statement
         .query_map(
-            params![job_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            params![job_id, status, i64::try_from(limit).unwrap_or(i64::MAX)],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -9920,7 +10036,163 @@ fn query_v2_jobs(
 }
 
 fn v2_local_job(database: &V2ProjectionDb, job_id: &str) -> Result<Option<LocalJob>, AppError> {
-    Ok(query_v2_jobs(database, Some(job_id), 1)?.into_iter().next())
+    Ok(query_v2_jobs(database, Some(job_id), None, 1)?
+        .into_iter()
+        .next())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalOnlyJobState {
+    /// Configuration is readable; `job resume` recreates the row from it.
+    Resumable,
+    /// Another process holds the job lock, normally a run that is still going.
+    InUse,
+    /// No readable configuration, so nothing can resume it.
+    Unrecognized,
+}
+
+impl LocalOnlyJobState {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Resumable => "resumable from its local checkpoint",
+            Self::InUse => "in use by another running process",
+            Self::Unrecognized => "no resumable configuration; kept for inspection",
+        }
+    }
+}
+
+/// A `local/jobs/<id>` directory whose job has no catalog database row, for
+/// example after `db rebuild` or an interruption before the row was written.
+#[derive(Debug, Serialize)]
+struct LocalOnlyJob {
+    job_id: String,
+    job_type: Option<&'static str>,
+    state: LocalOnlyJobState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    path: PathBuf,
+}
+
+fn v2_local_only_jobs(database: &V2ProjectionDb) -> Result<Vec<LocalOnlyJob>, AppError> {
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    let mut jobs = Vec::new();
+    for job_id in archive_ledger::local_job_ids(archive_root)? {
+        jobs.extend(v2_local_only_job(database, &job_id)?);
+    }
+    Ok(jobs)
+}
+
+/// Inspects one local job directory; `None` when it is absent or has a database row.
+fn v2_local_only_job(
+    database: &V2ProjectionDb,
+    job_id: &str,
+) -> Result<Option<LocalOnlyJob>, AppError> {
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    let known: bool = v2_cli_connection(database)?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
+            [job_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    if known {
+        return Ok(None); // A database row, including a terminal one, takes precedence.
+    }
+    let path = archive_root.join("local").join("jobs").join(job_id);
+    let (job_type, state, detail) =
+        match archive_ledger::read_local_job_config(archive_root, job_id) {
+            Ok(Some(config)) => (Some(config.job_type), LocalOnlyJobState::Resumable, None),
+            // Absent, or the owner finished and removed the directory meanwhile.
+            Ok(None) if !path.exists() => return Ok(None),
+            Ok(None) => (None, LocalOnlyJobState::Unrecognized, None),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                (None, LocalOnlyJobState::InUse, None)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => (
+                None,
+                LocalOnlyJobState::Unrecognized,
+                Some(error.to_string()),
+            ),
+            Err(error) => {
+                return Err(AppError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot read local job {job_id}: {error}"),
+                )))
+            }
+        };
+    Ok(Some(LocalOnlyJob {
+        job_id: job_id.to_owned(),
+        job_type,
+        state,
+        detail,
+        path,
+    }))
+}
+
+/// Running database jobs plus local-only jobs that can still be resumed or are in use,
+/// and any error from inspecting local job directories (status must still work).
+fn unfinished_v2_job_ids(
+    database: &V2ProjectionDb,
+) -> Result<(Vec<String>, Option<String>), AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare("SELECT job_id FROM jobs WHERE status = 'running' ORDER BY created_time_utc_ms DESC, job_id DESC")
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let local_error = match v2_local_only_jobs(database) {
+        Ok(jobs) => {
+            ids.extend(
+                jobs.into_iter()
+                    .filter(|job| job.state != LocalOnlyJobState::Unrecognized)
+                    .map(|job| job.job_id),
+            );
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    Ok((ids, local_error))
+}
+
+/// Last recorded count, written when a run pauses; absent after a crash.
+fn job_progress_count(progress: &serde_json::Value) -> Option<String> {
+    [
+        ("entries_seen", "entries seen"),
+        ("files_processed", "files processed"),
+        ("files_observed", "files observed"),
+    ]
+    .into_iter()
+    .find_map(|(key, label)| {
+        progress
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| format!("{count} {label}"))
+    })
+}
+
+fn job_progress_phase(progress: &serde_json::Value) -> Option<String> {
+    Some(
+        match progress.get("phase").and_then(serde_json::Value::as_str)? {
+            "reading_index" => "reading the annex index",
+            "enumerating" => "scanning files",
+            phase => phase,
+        }
+        .to_owned(),
+    )
+}
+
+fn format_age(then_ms: u64, now_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(then_ms) / 1000;
+    match seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }
 
 fn job_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> {

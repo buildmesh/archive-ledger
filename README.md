@@ -720,10 +720,14 @@ archive job show <job-id>
 archive job resume <job-id>
 ```
 
-Keep the job ID for unfinished imports and scans. After `db rebuild`, `job resume <job-id>`
-can recover annex and inventory work from this installation’s local checkpoint even if the job
-no longer appears in `job list`. Existing terminal job status still takes precedence; local
-checkpoints are not transferred by sync or portable snapshots.
+`job list` shows unfinished jobs with their type, age and last recorded progress; add `--all` to
+include finished, partial, failed and cancelled jobs. `archive status` mentions unfinished jobs.
+It also lists local job directories that have no row in the catalog database, for example after
+`db rebuild`. These are marked resumable, in use by another running process, or unrecognized.
+An unrecognized directory has no readable configuration and is kept for inspection. `job show`
+explains where an unfinished job stopped. After `db rebuild`, `job resume <job-id>` can recover
+annex and inventory work from this installation’s local checkpoint. Existing terminal job status
+still takes precedence; local checkpoints are not transferred by sync or portable snapshots.
 
 Resume first finishes a verified local publication interrupted between frontier advancement and
 its Git commit, then applies canonical events and reconciles deterministic outcomes. It does not

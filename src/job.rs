@@ -123,12 +123,17 @@ pub fn local_job_ids(archive_root: &Path) -> io::Result<Vec<String>> {
             .into_string()
             .map_err(|_| unsafe_path("local job directory name is not UTF-8"))?;
         validate_job_id(&id).map_err(unsafe_path)?;
-        JobDirectory {
+        match (JobDirectory {
             path: jobs_root.join(&id),
             jobs_root: jobs_root.clone(),
+        })
+        .verify()
+        {
+            Ok(()) => ids.push(id),
+            // A finishing job removes its own directory after read_dir listed it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        .verify()?;
-        ids.push(id);
     }
     ids.sort();
     Ok(ids)

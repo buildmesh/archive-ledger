@@ -1332,6 +1332,122 @@ mod unix {
         assert_eq!(json(&machine)["status"], "running");
     }
 
+    #[test]
+    fn unfinished_jobs_are_listed_by_default_and_local_only_jobs_are_discoverable() {
+        let (temp, content) = immutable_files_fixture();
+        let scan = |job_id: &str, max_items: Option<&str>| {
+            let mut command = archive(&temp);
+            command.args([
+                "location",
+                "scan",
+                "--path",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--job-id",
+                job_id,
+            ]);
+            if let Some(max_items) = max_items {
+                command.args(["--max-items", max_items]);
+            }
+            success(&mut command);
+        };
+        scan("job_finished", None);
+        scan("job_paused", Some("1"));
+        let ids = |list: &Value, key: &str| -> Vec<String> {
+            list[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|job| job["job_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        let unfinished = json(&success(archive(&temp).args(["--json", "job", "list"])));
+        assert_eq!(ids(&unfinished, "items"), ["job_paused"]);
+        assert_eq!(ids(&unfinished, "local_only"), Vec::<String>::new());
+        let all = json(&success(
+            archive(&temp).args(["--json", "job", "list", "--all"]),
+        ));
+        assert!(ids(&all, "items").contains(&"job_finished".to_owned()));
+        let human =
+            String::from_utf8(success(archive(&temp).args(["job", "list"])).stdout).unwrap();
+        assert!(human
+            .contains("job_paused  running  location_scan  started just now  1 files processed"));
+        assert!(!human.contains("job_finished"));
+        let status =
+            String::from_utf8(archive(&temp).arg("status").output().unwrap().stdout).unwrap();
+        assert!(status.contains("1 unfinished job (job_paused); see archive job show job_paused"));
+        let shown =
+            String::from_utf8(success(archive(&temp).args(["job", "show", "job_paused"])).stdout)
+                .unwrap();
+        assert!(shown.contains("Last recorded progress: scanning files, 1 files processed"));
+
+        // A rebuild drops the unpublished row; an interrupted run can leave a bare directory.
+        success(archive(&temp).args(["db", "rebuild"]));
+        fs::create_dir(root(&temp).join("local/jobs/job_orphan")).unwrap();
+        let rebuilt = json(&success(archive(&temp).args(["--json", "job", "list"])));
+        assert_eq!(ids(&rebuilt, "items"), Vec::<String>::new());
+        let local: Vec<_> = rebuilt["local_only"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|job| {
+                (
+                    job["job_id"].as_str().unwrap(),
+                    job["job_type"].as_str(),
+                    job["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            local,
+            [
+                ("job_orphan", None, "unrecognized"),
+                ("job_paused", Some("location_scan"), "resumable"),
+            ]
+        );
+        let shown = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "show",
+            "job_paused",
+        ])));
+        assert_eq!(shown["state"], "resumable");
+        let status = json(&archive(&temp).args(["--json", "status"]).output().unwrap());
+        assert_eq!(status["unfinished_jobs"], 1);
+        // Listing is read-only for job state: the orphan stays for inspection.
+        assert!(root(&temp).join("local/jobs/job_orphan").is_dir());
+
+        let resumed = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "resume",
+            "job_paused",
+        ])));
+        assert_eq!(resumed["status"], "complete");
+        let after = json(&success(archive(&temp).args(["--json", "job", "list"])));
+        assert_eq!(ids(&after, "local_only"), ["job_orphan"]);
+        assert_eq!(ids(&after, "items"), Vec::<String>::new());
+
+        // An unexpected entry is reported without hiding database jobs or breaking status.
+        scan("job_paused_again", Some("1"));
+        fs::write(root(&temp).join("local/jobs/.DS_Store"), b"").unwrap();
+        let listed = json(&success(archive(&temp).args(["--json", "job", "list"])));
+        assert_eq!(ids(&listed, "items"), ["job_paused_again"]);
+        assert!(listed["local_jobs_error"].is_string());
+        let human =
+            String::from_utf8(success(archive(&temp).args(["job", "list"])).stdout).unwrap();
+        assert!(human.contains("WARNING: cannot inspect local job directories"));
+        assert!(human.contains("job_paused_again  running"));
+        let status = archive(&temp).arg("status").output().unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout)
+            .contains("WARNING: cannot inspect local job directories"));
+        let status = json(&archive(&temp).args(["--json", "status"]).output().unwrap());
+        assert_eq!(status["unfinished_jobs"], 1);
+        assert!(status["local_jobs_error"].is_string());
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()
