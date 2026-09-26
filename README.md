@@ -330,6 +330,8 @@ archive location scan
 
 On a terminal, `location scan` and `collection add` show live progress on stderr. Each first
 prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
+While a Location has an unfinished scan, a new `location scan` of it is refused rather than
+silently starting over; the error names the job to resume or cancel.
 
 Only a successfully completed scan can mark prior paths missing. Traversal errors, permission
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.

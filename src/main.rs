@@ -1455,9 +1455,27 @@ enum AppError {
     Json(serde_json::Error),
     Clock,
     Input(String),
+    /// A fresh scan would strand these unfinished scan jobs: (job ID, live in another process).
+    UnfinishedScan {
+        location: String,
+        jobs: Vec<(String, bool)>,
+    },
 }
 
 impl AppError {
+    /// Structured context for JSON errors; `null` for most errors.
+    fn details(&self) -> serde_json::Value {
+        match self {
+            Self::UnfinishedScan { jobs, .. } => json!({
+                "jobs": jobs
+                    .iter()
+                    .map(|(job_id, live)| json!({"job_id": job_id, "live": live}))
+                    .collect::<Vec<_>>(),
+            }),
+            _ => serde_json::Value::Null,
+        }
+    }
+
     fn code(&self) -> &'static str {
         match self {
             Self::Catalog(error) => error.code(),
@@ -1482,6 +1500,7 @@ impl AppError {
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
             Self::Input(_) => "invalid_input",
+            Self::UnfinishedScan { .. } => "unfinished_scan_job",
         }
     }
 }
@@ -1511,6 +1530,23 @@ impl std::fmt::Display for AppError {
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
             Self::Input(message) => formatter.write_str(message),
+            Self::UnfinishedScan { location, jobs } => {
+                write!(formatter, "{location} has an unfinished scan job:")?;
+                for (job_id, live) in jobs {
+                    if *live {
+                        write!(
+                            formatter,
+                            "\n  {job_id} is running in another process; wait for it to finish"
+                        )?;
+                    } else {
+                        write!(
+                            formatter,
+                            "\n  {job_id} was interrupted; resume it with: archive job resume {job_id}\n    or abandon it with: archive job cancel {job_id}"
+                        )?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1950,13 +1986,12 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             if cli.json {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "version": 1,
-                        "error": {"code": error.code(), "message": error.to_string()},
-                    })
-                );
+                let mut body = json!({"code": error.code(), "message": error.to_string()});
+                let details = error.details();
+                if !details.is_null() {
+                    body["details"] = details;
+                }
+                eprintln!("{}", json!({"version": 1, "error": body}));
             } else {
                 eprintln!("error [{}]: {error}", error.code());
             }
@@ -10968,6 +11003,54 @@ fn execute_v2_collection_add(
     )
 }
 
+/// Starting a fresh scan beside an unfinished one would silently discard its
+/// progress and strand its row and spool. Continuing that exact job is allowed.
+fn refuse_unfinished_v2_scans(
+    database: &V2ProjectionDb,
+    location_name: &str,
+    location_id: &str,
+    collection_id: &str,
+    continuing: Option<&str>,
+) -> Result<(), AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT job_id FROM jobs
+             WHERE job_type = 'location_scan' AND status = 'running'
+               AND json_extract(params_json, '$.location_id') = ?1
+               AND json_extract(params_json, '$.collection_id') = ?2
+               AND (?3 IS NULL OR job_id != ?3)
+             ORDER BY created_time_utc_ms DESC, job_id DESC",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let ids = statement
+        .query_map(params![location_id, collection_id, continuing], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    let jobs = ids
+        .into_iter()
+        .map(|job_id| {
+            // The per-job lock is held only by a live runner.
+            let live = matches!(
+                archive_ledger::read_local_job_config(archive_root, &job_id),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            );
+            (job_id, live)
+        })
+        .collect();
+    Err(AppError::UnfinishedScan {
+        location: format!("Location \"{location_name}\""),
+        jobs,
+    })
+}
+
 /// Human mode only: announce the job before any long work so an interrupted
 /// scan can be resumed, and show live progress only on an interactive terminal.
 fn start_v2_inventory_progress(
@@ -11084,6 +11167,13 @@ fn execute_v2_location_scan(
                 .to_owned(),
         ));
     }
+    refuse_unfinished_v2_scans(
+        database,
+        &location.display_name,
+        &location.location_id,
+        &collection.collection_id,
+        args.job_id.as_deref(),
+    )?;
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id

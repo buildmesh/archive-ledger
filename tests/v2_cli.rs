@@ -1297,6 +1297,8 @@ mod unix {
         assert!(String::from_utf8_lossy(&human.stdout)
             .contains("Resume with: archive job resume job_scan_hint"));
 
+        // A fresh scan of the same Location is refused while that job is unfinished.
+        success(archive(&temp).args(["job", "cancel", "job_scan_hint"]));
         let machine = success(scan(&["--json"]).arg("job_scan_json"));
         assert!(machine.stderr.is_empty());
         assert_eq!(json(&machine)["status"], "running");
@@ -1596,6 +1598,104 @@ mod unix {
             .unwrap();
         assert!(String::from_utf8_lossy(&gone.stderr).contains("not found"));
         success(archive(&temp).args(["fsck"]));
+    }
+
+    #[test]
+    fn location_scan_refuses_to_strand_an_unfinished_scan_of_the_same_location() {
+        let (temp, content) = immutable_files_fixture();
+        let other = temp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("o.txt"), b"o").unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            other.to_str().unwrap(),
+            "--name",
+            "Other",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let path = content.to_str().unwrap();
+        let scan = |extra: &[&str]| {
+            let mut command = archive(&temp);
+            command
+                .args(extra)
+                .args(["location", "scan", "--path", path, "--collection", "Files"]);
+            command.output().unwrap()
+        };
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            path,
+            "--collection",
+            "Files",
+            "--job-id",
+            "job_first",
+            "--max-items",
+            "1",
+        ]));
+        let job_count = || -> i64 {
+            rusqlite::Connection::open(root(&temp).join("archive.db"))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = job_count();
+
+        let refused = scan(&[]);
+        assert!(!refused.status.success());
+        let message = String::from_utf8(refused.stderr).unwrap();
+        assert!(
+            message.starts_with("error [unfinished_scan_job]:"),
+            "{message}"
+        );
+        assert!(message.contains("archive job resume job_first"));
+        assert!(message.contains("archive job cancel job_first"));
+        let refused = scan(&["--json"]);
+        assert!(refused.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "unfinished_scan_job");
+        assert_eq!(error["error"]["details"]["jobs"][0]["job_id"], "job_first");
+        assert_eq!(error["error"]["details"]["jobs"][0]["live"], false);
+        assert_eq!(job_count(), before, "a refused scan creates no job");
+
+        // Other Locations are unaffected, and the unfinished job itself can resume.
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            other.to_str().unwrap(),
+            "--collection",
+            "Other",
+        ]));
+        success(archive(&temp).args(["job", "resume", "job_first"]));
+        success(&mut {
+            let mut command = archive(&temp);
+            command.args(["location", "scan", "--path", path, "--collection", "Files"]);
+            command
+        });
+
+        // After cancel, a fresh scan proceeds.
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            path,
+            "--collection",
+            "Files",
+            "--job-id",
+            "job_second",
+            "--max-items",
+            "1",
+        ]));
+        assert!(!scan(&[]).status.success());
+        success(archive(&temp).args(["job", "cancel", "job_second"]));
+        assert!(scan(&[]).status.success());
     }
 
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
