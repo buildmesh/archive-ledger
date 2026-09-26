@@ -314,8 +314,11 @@ archive collection add . --collection "Documents"
 ```
 
 `collection add` infers the current Location and is positive-only. It streams traversal, computes
-BLAKE3 for regular files, records matching reads as verification and presence at
-that Location, and never marks an unvisited file missing. Git metadata named `.git` is always
+BLAKE3 for new and changed regular files, records matching reads as verification and presence at
+that Location, and never marks an unvisited file missing. A known file whose size and modification
+time are unchanged at this Location, with a good last check, is not read again: adding a few new
+files to a large tree reads only those files. A file that appears at a Location for the first time
+is always read, even if the Collection already has it elsewhere. Git metadata named `.git` is always
 excluded. It can safely target a subtree:
 
 ```bash
@@ -337,6 +340,14 @@ On a terminal, `location scan` and `collection add` show live progress on stderr
 prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
 While a Location has an unfinished scan, a new `location scan` of it is refused rather than
 silently starting over; the error names the job to resume or cancel.
+
+A complete `location scan` also skips unchanged files, and when it finishes it refreshes presence
+for every file it saw. It re-reads new, changed, corrupt, and never-verified files. Byte integrity
+of unchanged files is the job of `archive verify` and the background runner, which re-read copies
+as their verification comes due. Content replaced with the same size and modification time (for
+example by `rsync -a`, coarse FAT timestamps, or some network filesystems) is therefore detected
+when that copy is next verified, not by the scan. Scan output reports how many copies at the
+Location are due and suggests `archive verify`.
 
 Only a successfully completed scan can mark prior paths missing. Traversal errors, permission
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.
@@ -708,9 +719,10 @@ conflicting, disconnected, or ambiguously mounted Device is skipped and its evid
 
 Adding or scanning content records the hashing read as baseline verification. Routine verification
 re-reads only the copies that are due: never verified, failed their last check, past their
-Policy's presence or verification age, or expiring within 30 days (`--verify-within DAYS`). It
-reads the least recently verified first and does not walk directories. Omit the Location to
-verify every connected Location; add `--all` to re-read every copy:
+Policy's presence or verification age, or expiring within 30 days (`--verify-within DAYS`), but
+never more often than every half of the Policy's verification age. It reads the least recently
+verified first and does not walk directories. Omit the Location to verify every connected
+Location whose identity currently matches; add `--all` to re-read every copy:
 
 ```bash
 archive verify

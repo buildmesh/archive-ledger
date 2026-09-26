@@ -3102,11 +3102,11 @@ fn finalize_scans_for_batch(
     for (scan_id, status, finished_time, summary_json, finished_record_id) in pending {
         let summary: Value = serde_json::from_str(&summary_json)?;
         let summary = object(&summary, "scan summary")?;
-        let scan_info: (String, String, String) = transaction
+        let scan_info: (String, String, String, i64) = transaction
             .query_row(
-                "SELECT scan_mode, location_id, collection_id FROM scan_runs WHERE scan_id = ?1 AND status = 'running'",
+                "SELECT scan_mode, location_id, collection_id, started_time_utc_ms FROM scan_runs WHERE scan_id = ?1 AND status = 'running'",
                 [&scan_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|source| sqlite_error(database_path, source))?;
         if status == "complete" && scan_info.0 == "complete" {
@@ -3187,6 +3187,41 @@ fn finalize_scans_for_batch(
                     params![scan_id, scan_info.1, scan_info.2],
                 )
                 .map_err(|source| sqlite_error(database_path, source))?;
+            // A complete scan saw every covered fact it did not make missing, including
+            // unchanged files it emitted no item for. Refresh their presence to the
+            // scan's start, never moving a later observation backwards. Completions
+            // from before unchanged files were skipped lack `unchanged_files`; they
+            // itemized everything they read, so replaying them stays exact.
+            if summary.contains_key("unchanged_files") {
+                transaction
+                    .execute(
+                        "UPDATE path_observations
+                         SET last_seen_time_utc_ms = MAX(COALESCE(last_seen_time_utc_ms, 0), ?2)
+                         WHERE last_complete_scan_id = ?1 AND state = 'present'",
+                        params![scan_id, scan_info.3],
+                    )
+                    .map_err(|source| sqlite_error(database_path, source))?;
+                // A claim is refreshed only through a present observation this scan
+                // covered: its own path, or for a locked annex symlink its key. A
+                // missing observation from another Collection never counts.
+                transaction
+                    .execute(
+                        "UPDATE copy_claims
+                         SET last_seen_time_utc_ms = MAX(COALESCE(last_seen_time_utc_ms, 0), ?2)
+                         WHERE location_id = ?3 AND state IN ('present', 'corrupt', 'unknown')
+                           AND EXISTS (
+                             SELECT 1 FROM path_observations p
+                             WHERE p.location_id = copy_claims.location_id
+                               AND p.last_complete_scan_id = ?1 AND p.state = 'present'
+                               AND ((p.observed_path_encoding = copy_claims.relative_path_encoding
+                                     AND p.observed_path_bytes = copy_claims.relative_path_bytes)
+                                 OR (p.representation = 'annex_locked_symlink'
+                                     AND p.external_identity_id = copy_claims.external_identity_id))
+                           )",
+                        params![scan_id, scan_info.3, scan_info.1],
+                    )
+                    .map_err(|source| sqlite_error(database_path, source))?;
+            }
         } else {
             let candidates: i64 = transaction
                 .query_row(

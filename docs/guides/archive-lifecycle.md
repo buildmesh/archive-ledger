@@ -138,7 +138,10 @@ Use the two scan commands for different jobs:
 - `archive collection add .` records new and changed files under the current directory. It only
   adds; it never marks anything missing. Use it after putting new files in place.
 - `archive location scan` reconciles a whole Location, so a complete run can also mark files that
-  are gone as missing.
+  are gone as missing, and it refreshes presence for everything it saw.
+
+Both read only new and changed files. Files whose size and modification time are unchanged are
+not read again. Re-reading their bytes is the job of `verify` (step 7), so routine scans stay fast.
 
 ```bash
 cd ~/Documents
@@ -188,8 +191,8 @@ refresh next.
 
 Re-read bytes to catch silent corruption. `verify` reads only the copies that are due: never
 verified, failed their last check, or past their Policy's age or within 30 days of it. It starts
-with the least recently verified. Without a Location it covers every connected Location, and
-`--all` re-reads everything. Use `--fingerprint-status match` only after confirming that the
+with the least recently verified. Without a Location it covers every connected Location whose
+identity is confirmed as matching, and `--all` re-reads everything. Use `--fingerprint-status match` only after confirming that the
 mounted disk is the registered Device:
 
 ```bash

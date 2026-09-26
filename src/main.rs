@@ -9517,7 +9517,17 @@ struct VerifyLocation {
     fingerprint_status: String,
 }
 
-/// Shared eligibility for verify and the background runner. `?1` is a JSON array
+/// A present path observation at the copy's Location for the copy itself: the same
+/// path, or for a locked annex symlink the same key (its claim is the object file).
+const COPY_OBSERVATION_MATCH: &str = "here.location_id = cc.location_id AND here.state = 'present'
+    AND ((here.observed_path_encoding = cc.relative_path_encoding
+          AND here.observed_path_bytes = cc.relative_path_bytes)
+      OR (here.representation = 'annex_locked_symlink'
+          AND here.external_identity_id = cc.external_identity_id))";
+
+/// Shared eligibility for verify and the background runner. A copy is due when its
+/// check is within the window of expiring, but never more often than every half of
+/// the Policy's verification age, so short Policies are not re-read on every run. `?1` is a JSON array
 /// of Location IDs (NULL for all), `?2` the selection time, `?3` 1 for all
 /// copies, and `?4` the due window in days.
 const DUE_COPIES_SQL: &str = "
@@ -9526,6 +9536,9 @@ const DUE_COPIES_SQL: &str = "
     WHERE (?1 IS NULL OR cc.location_id IN (SELECT value FROM json_each(?1)))
       AND cc.state IN ('present', 'corrupt', 'unknown')
       AND (cc.last_verified_time_utc_ms IS NULL OR cc.last_verified_time_utc_ms < ?2)
+      -- Only a path currently present at this Location is verified: verification
+      -- must never revive a missing path or invent one for another File.
+      AND EXISTS (SELECT 1 FROM path_observations here WHERE COPY_OBSERVATION_MATCH)
       AND EXISTS (
         SELECT 1 FROM file_refs due_file
         JOIN collections due_collection ON due_collection.collection_id = due_file.collection_id
@@ -9536,8 +9549,10 @@ const DUE_COPIES_SQL: &str = "
           AND (?3 = 1 OR (p.policy_id IS NOT NULL AND (
                 cc.last_verified_time_utc_ms IS NULL
              OR cc.last_verification_result IS NOT 'ok'
-             OR cc.last_verified_time_utc_ms < ?2 - MAX(0, CAST(json_extract(
-                    p.requirements_json, '$.max_verification_age_days') AS INTEGER) - ?4) * 86400000
+             OR cc.last_verified_time_utc_ms < ?2 - MAX(
+                    CAST(json_extract(p.requirements_json, '$.max_verification_age_days') AS INTEGER) - ?4,
+                    CAST(json_extract(p.requirements_json, '$.max_verification_age_days') AS INTEGER) / 2
+                ) * 86400000
              OR cc.last_seen_time_utc_ms IS NULL
              OR cc.last_seen_time_utc_ms < ?2 - CAST(json_extract(
                     p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000))))";
@@ -9574,12 +9589,52 @@ fn count_due_copies(
     let (ids, as_of, all, window) = verify_selection_params(locations, selection, as_of_ms)?;
     let count: i64 = v2_cli_connection(database)?
         .query_row(
-            &format!("SELECT COUNT(*) {DUE_COPIES_SQL}"),
+            &format!("SELECT COUNT(*) {DUE_COPIES_SQL}")
+                .replace("COPY_OBSERVATION_MATCH", COPY_OBSERVATION_MATCH),
             params![ids, as_of, all, window],
             |row| row.get(0),
         )
         .map_err(|source| v2_cli_sql_error(database, source))?;
     nonnegative_sql_count(count)
+}
+
+/// Copies at one Location due for verification within the default window, and
+/// those already past due, for scan and add summaries.
+fn verification_due_at(
+    database: &V2ProjectionDb,
+    location_id: &str,
+) -> Result<(u64, u64), AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let here = [VerifyLocation {
+        location_id: location_id.to_owned(),
+        root: PathBuf::new(),
+        fingerprint_status: String::new(),
+    }];
+    Ok((
+        count_due_copies(
+            database,
+            Some(&here),
+            VerifySelection::Due {
+                window_days: DEFAULT_VERIFY_WINDOW_DAYS,
+            },
+            now,
+        )?,
+        count_due_copies(
+            database,
+            Some(&here),
+            VerifySelection::Due { window_days: 0 },
+            now,
+        )?,
+    ))
+}
+
+fn print_verification_due(location_name: &str, (due, past_due): (u64, u64)) {
+    if due > 0 {
+        println!(
+            "  {due} copies here are due for verification within {DEFAULT_VERIFY_WINDOW_DAYS} days ({past_due} past due). Next: archive verify {}",
+            shell_quote(location_name)
+        );
+    }
 }
 
 /// Current copies with no content identity yet, e.g. after an inventory-only annex
@@ -9624,18 +9679,22 @@ fn due_verification_targets(
              {}
              ORDER BY COALESCE(cc.last_verified_time_utc_ms, -1), cc.copy_claim_id
              LIMIT ?5",
-            DUE_COPIES_SQL.replace(
-                "JOIN objects o ON o.object_id = cc.object_id",
-                "JOIN objects o ON o.object_id = cc.object_id
+            DUE_COPIES_SQL
+                .replace(
+                    "JOIN objects o ON o.object_id = cc.object_id",
+                    "JOIN objects o ON o.object_id = cc.object_id
                  JOIN file_refs f ON f.file_ref_id = (
-                     SELECT candidate.file_ref_id FROM file_refs candidate
+                     SELECT candidate.file_ref_id FROM path_observations here
+                     JOIN file_refs candidate ON candidate.file_ref_id = here.file_ref_id
                      JOIN collections c ON c.collection_id = candidate.collection_id
                                          AND c.status = 'active'
-                     WHERE candidate.object_id = cc.object_id AND candidate.path_state = 'active'
+                     WHERE COPY_OBSERVATION_MATCH
+                       AND candidate.object_id = cc.object_id AND candidate.path_state = 'active'
                      ORDER BY candidate.collection_id, candidate.logical_path_encoding,
                               candidate.logical_path_bytes, candidate.file_ref_id
                      LIMIT 1)",
-            )
+                )
+                .replace("COPY_OBSERVATION_MATCH", COPY_OBSERVATION_MATCH)
         ))
         .map_err(|source| v2_cli_sql_error(database, source))?;
     let rows = statement
@@ -10103,9 +10162,11 @@ fn verify_locations(
                 .iter()
                 .filter(|location| location.status == "active" && location.kind == "filesystem")
             {
+                // Without an explicit Location, read only storage proven to be the
+                // registered filesystem: an empty mountpoint must not turn copies unknown.
                 match v2_mounted_location_by_selector(cli, database, &state, &candidate.location_id)
                 {
-                    Ok((selected, root, status)) if status != "mismatch" => {
+                    Ok((selected, root, status)) if status == "match" => {
                         locations.push(checked(selected, root, status)?)
                     }
                     Ok(_) | Err(AppError::Input(_)) => skipped = skipped.saturating_add(1),
@@ -10234,6 +10295,7 @@ fn execute_v2_verify(
         .unwrap_or_default();
     summary.skipped_devices = summary.skipped_devices.max(skipped);
     let mut read_this_run = 0_usize;
+    let mut attempted = BTreeSet::new();
     let paused = loop {
         let budget = args
             .max_items
@@ -10249,6 +10311,14 @@ fn execute_v2_verify(
             args.batch_entries.min(VERIFY_BATCH_COPIES).min(budget),
         )?;
         if targets.is_empty() {
+            break false;
+        }
+        // Each copy is read at most once per run even if its recorded time did not
+        // advance past the job's selection time.
+        if !targets
+            .iter()
+            .any(|target| attempted.insert(target.copy_claim_id.clone()))
+        {
             break false;
         }
         summary.selected = summary
@@ -11380,9 +11450,11 @@ fn execute_v2_collection_add(
         });
     }
     let protection = v2_catalog_protection(cli.events_path());
+    let due = verification_due_at(database, &location.location_id)?;
     if cli.json {
         let mut output = serde_json::to_value(&result)?;
         output["catalog_protection"] = catalog_protection_json(&protection);
+        output["verification_due"] = json!({"due": due.0, "past_due": due.1});
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Added files to Collection \"{}\".", collection.display_name);
@@ -11394,6 +11466,13 @@ fn execute_v2_collection_add(
             "  {} files confirmed good; {} bytes verified",
             result.summary.confirmed_good, result.summary.bytes_observed
         );
+        if result.summary.unchanged_files > 0 {
+            println!(
+                "  {} unchanged files were not re-read",
+                result.summary.unchanged_files
+            );
+        }
+        print_verification_due(&location.display_name, due);
         if result.summary.ignored_symlinks > 0 {
             println!(
                 "  {} symlinks ignored (symlinks are not Archive Ledger Files)",
@@ -11676,7 +11755,7 @@ fn execute_v2_location_scan(
             exclusions: args.exclusions.clone(),
             accept_changes: Vec::new(),
             collection_id: collection.collection_id.clone(),
-            location_id: location.location_id,
+            location_id: location.location_id.clone(),
             device_fingerprint_status: fingerprint_status,
             job_id,
             scan_id: args
@@ -11709,9 +11788,11 @@ fn execute_v2_location_scan(
         });
     }
     let protection = v2_catalog_protection(cli.events_path());
+    let due = verification_due_at(database, &location.location_id)?;
     if cli.json {
         let mut output = serde_json::to_value(&result)?;
         output["catalog_protection"] = catalog_protection_json(&protection);
+        output["verification_due"] = json!({"due": due.0, "past_due": due.1});
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Location scan complete for \"{}\".", location.display_name);
@@ -11725,6 +11806,18 @@ fn execute_v2_location_scan(
             result.summary.confirmed_good
         );
         println!("  {} files now missing", result.summary.missing_paths);
+        if result.summary.unchanged_files > 0 {
+            println!(
+                "  {} unchanged files were not re-read{}",
+                result.summary.unchanged_files,
+                if result.status == "complete" {
+                    "; presence refreshed"
+                } else {
+                    ""
+                }
+            );
+        }
+        print_verification_due(&location.display_name, due);
         if result.summary.ignored_symlinks > 0 {
             println!(
                 "  {} ordinary symlinks ignored",

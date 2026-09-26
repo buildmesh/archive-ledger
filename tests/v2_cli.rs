@@ -1794,6 +1794,144 @@ mod unix {
             .contains("WARNING: cannot check whether catalog history is on a sync remote"));
     }
 
+    #[test]
+    fn unchanged_files_are_not_reread_and_complete_scans_refresh_presence_only() {
+        let (temp, content) = immutable_files_fixture();
+        let path = content.to_str().unwrap();
+        let database_path = root(&temp).join("archive.db");
+        let times = |name: &str| -> (i64, i64) {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT last_seen_time_utc_ms, last_verified_time_utc_ms FROM copy_claims WHERE relative_path_display = ?1",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        let age = |seen: i64, verified: i64| {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .execute(
+                    "UPDATE copy_claims SET last_seen_time_utc_ms = ?1, last_verified_time_utc_ms = ?2",
+                    rusqlite::params![seen, verified],
+                )
+                .unwrap();
+        };
+        // An unreadable but unchanged file proves the scan does not read it.
+        let locked = content.join("b.txt");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        age(1_000, 2_000);
+        let added = json(&success(archive(&temp).args([
+            "--json",
+            "collection",
+            "add",
+            path,
+            "--collection",
+            "Files",
+        ])));
+        assert_eq!(added["summary"]["unchanged_files"], 3);
+        assert_eq!(added["summary"]["read_errors"], 0);
+        assert_eq!(
+            times("a.txt"),
+            (1_000, 2_000),
+            "add refreshes neither presence nor integrity"
+        );
+
+        let output = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                path,
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert!(matches!(output.status.code(), Some(0 | 10)));
+        let scanned = json(&output);
+        assert_eq!(scanned["status"], "complete");
+        assert_eq!(scanned["summary"]["unchanged_files"], 3);
+        assert_eq!(scanned["summary"]["read_errors"], 0);
+        assert_eq!(scanned["summary"]["confirmed_good"], 0);
+        assert_eq!(scanned["verification_due"]["due"], 3);
+        let (seen, verified) = times("a.txt");
+        assert!(seen > 1_000, "a complete scan refreshes presence");
+        assert_eq!(verified, 2_000, "only reading bytes refreshes verification");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Human output names the next step; replay reproduces the refreshed presence.
+        let human = String::from_utf8(
+            archive(&temp)
+                .args(["location", "scan", "--path", path, "--collection", "Files"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(human.contains("unchanged files were not re-read; presence refreshed"));
+        assert!(human.contains("due for verification"));
+        assert!(human.contains("Next: archive verify"));
+        let before = times("c.txt").0;
+        success(archive(&temp).args(["db", "rebuild"]));
+        assert!(times("c.txt").0 >= before);
+        success(archive(&temp).args(["fsck"]));
+    }
+
+    #[test]
+    fn verification_never_revives_missing_paths_or_rereads_short_policies_every_run() {
+        let (temp, content) = immutable_files_fixture();
+        let path = content.to_str().unwrap();
+        // Two paths with identical bytes share one Object.
+        fs::write(content.join("twin-1.txt"), b"same bytes").unwrap();
+        fs::write(content.join("twin-2.txt"), b"same bytes").unwrap();
+        success(archive(&temp).args(["collection", "add", path, "--collection", "Files"]));
+        fs::remove_file(content.join("twin-1.txt")).unwrap();
+        success(archive(&temp).args(["location", "scan", "--path", path, "--collection", "Files"]));
+        let state = |name: &str| -> String {
+            rusqlite::Connection::open(root(&temp).join("archive.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT p.state FROM path_observations p JOIN file_refs f USING (file_ref_id) WHERE f.logical_path_display = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(state("twin-1.txt"), "missing");
+        let location = "Files on Test Device";
+        let all =
+            json(&success(archive(&temp).args([
+                "--json", "verify", location, "--path", path, "--all",
+            ])));
+        assert_eq!(all["summary"]["read_errors"], 0);
+        assert_eq!(
+            state("twin-1.txt"),
+            "missing",
+            "verify must not revive a removed path"
+        );
+        assert_eq!(state("twin-2.txt"), "present");
+
+        // A 30-day Policy is due at most every 15 days, not on every run.
+        success(archive(&temp).args([
+            "policy",
+            "update",
+            "Two copies at two sites",
+            "--verification-days",
+            "30",
+        ]));
+        let first = json(&success(
+            archive(&temp).args(["--json", "verify", location, "--path", path]),
+        ));
+        assert_eq!(
+            first["status"], "idle",
+            "copies verified just now are not due"
+        );
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()
@@ -1885,7 +2023,9 @@ mod unix {
         let summary = json(&output)["summary"].clone();
         assert_eq!(summary["integrity_mismatches"], 1);
         assert_eq!(summary["changed_paths"], 0);
-        assert_eq!(summary["confirmed_good"], 2);
+        // b.txt changed only its mtime, so it is re-read; c.txt is unchanged and skipped.
+        assert_eq!(summary["confirmed_good"], 1);
+        assert_eq!(summary["unchanged_files"], 1);
         assert_eq!(immutable_file_object(&temp, "a.txt"), expected);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         let corrupt: (String, String, String, Option<String>) = database.query_row(
@@ -1935,7 +2075,9 @@ mod unix {
             "Files",
         ])));
         assert_eq!(restored["summary"]["integrity_mismatches"], 0);
-        assert_eq!(restored["summary"]["confirmed_good"], 3);
+        // The corrupt copy is always re-read; the two untouched files are skipped.
+        assert_eq!(restored["summary"]["confirmed_good"], 1);
+        assert_eq!(restored["summary"]["unchanged_files"], 2);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         let restored: (String, String, String, Option<String>, Option<String>) = database.query_row(
             "SELECT object_id, state, last_verification_result, last_error_code, last_error_detail FROM copy_claims WHERE relative_path_display = 'a.txt' AND state != 'superseded'",
@@ -2886,7 +3028,9 @@ mod unix {
             "Files",
         ])));
         assert_eq!(second["summary"]["new_paths"], 0);
-        assert_eq!(second["summary"]["confirmed_good"], 2);
+        // Unchanged files are not re-read by a second add.
+        assert_eq!(second["summary"]["confirmed_good"], 0);
+        assert_eq!(second["summary"]["unchanged_files"], 2);
 
         let first_page = json(&success(archive(&temp).args([
             "--json",
@@ -2956,6 +3100,14 @@ mod unix {
         assert_eq!(object["files"]["items"].as_array().unwrap().len(), 1);
         assert!(object["files"]["next"].is_string());
 
+        // A full verification adds a second history record for each File.
+        success(archive(&temp).args([
+            "verify",
+            "Files on Test Device",
+            "--path",
+            content.to_str().unwrap(),
+            "--all",
+        ]));
         let history = json(&success(archive(&temp).args([
             "--json",
             "file",
@@ -3905,7 +4057,9 @@ mod unix {
             "--path",
             repo.to_str().unwrap(),
         ])));
-        assert_eq!(scanned["summary"]["confirmed_good"], 2);
+        // The two files verified by the previous scan are skipped; only the new one is read.
+        assert_eq!(scanned["summary"]["confirmed_good"], 0);
+        assert_eq!(scanned["summary"]["unchanged_files"], 2);
         assert_eq!(scanned["summary"]["new_paths"], 1);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         let claims =
@@ -4122,7 +4276,9 @@ mod unix {
             "--collection",
             "Files",
         ])));
-        assert_eq!(scanned["summary"]["confirmed_good"], 4);
+        // Import already read and verified the locked content; the scan reads the rest.
+        assert_eq!(scanned["summary"]["confirmed_good"], 2);
+        assert_eq!(scanned["summary"]["unchanged_files"], 2);
         // Re-import fills checksum metadata missing from an older projection
         // while preserving the same Location and Collection File identities.
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
@@ -4381,7 +4537,9 @@ mod unix {
             "Files",
         ])));
         assert_eq!(first_scan["summary"]["files_observed"], 2);
-        assert_eq!(first_scan["summary"]["confirmed_good"], 1);
+        // Import already read the present content, so the scan does not re-read it.
+        assert_eq!(first_scan["summary"]["confirmed_good"], 0);
+        assert_eq!(first_scan["summary"]["unchanged_files"], 1);
         assert_eq!(first_scan["summary"]["ignored_symlinks"], 1);
         assert_eq!(first_scan["summary"]["missing_paths"], 0);
 
@@ -4449,7 +4607,9 @@ mod unix {
             "--collection",
             "Files",
         ])));
-        assert_eq!(after_get["summary"]["confirmed_good"], 3);
+        // Only the newly retrieved content is read; already verified copies are skipped.
+        assert_eq!(after_get["summary"]["confirmed_good"], 1);
+        assert_eq!(after_get["summary"]["unchanged_files"], 2);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         assert_eq!(
             database

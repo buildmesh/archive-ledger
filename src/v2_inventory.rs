@@ -127,6 +127,9 @@ pub struct V2InventorySummary {
     pub read_errors: u64,
     pub concurrent_changes: u64,
     pub traversal_errors: u64,
+    /// Known files whose size and mtime matched a good copy here, so they were not read.
+    #[serde(default)]
+    pub unchanged_files: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -723,6 +726,24 @@ pub fn add_files(
                 }
                 if !config.accept_changes.is_empty() {
                     validate_selected_path(config, &relative)?;
+                } else if copy_unchanged(
+                    &connection,
+                    projection.path(),
+                    &config.collection_id,
+                    &config.location_id,
+                    &encode_relative_path(&ordinary_copy_path),
+                    file.size_bytes,
+                    file.modified_time_utc_ms,
+                )? {
+                    record_seen
+                        .execute(params![
+                            logical_encoded.encoding.as_str(),
+                            logical_encoded.bytes
+                        ])
+                        .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+                    summary.files_observed = summary.files_observed.saturating_add(1);
+                    summary.unchanged_files = summary.unchanged_files.saturating_add(1);
+                    continue;
                 }
                 let hashed = match hash_file_stable(
                     &absolute,
@@ -1011,7 +1032,31 @@ pub fn add_files(
                     config,
                     observed_time_utc_ms,
                     progress,
+                    &mut |size, modified| {
+                        copy_unchanged(
+                            &connection,
+                            projection.path(),
+                            &config.collection_id,
+                            &config.location_id,
+                            &encode_relative_path(&prefixed_path(
+                                config.location_prefix.as_deref(),
+                                &relative,
+                            )),
+                            size,
+                            modified,
+                        )
+                    },
                 )? {
+                    AnnexSymlinkObservation::Unchanged => {
+                        record_seen
+                            .execute(params![
+                                logical_encoded.encoding.as_str(),
+                                logical_encoded.bytes
+                            ])
+                            .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+                        summary.files_observed = summary.files_observed.saturating_add(1);
+                        summary.unchanged_files = summary.unchanged_files.saturating_add(1);
+                    }
                     AnnexSymlinkObservation::Absent => {
                         if let Some(item) = known
                             .copy_path
@@ -1595,6 +1640,55 @@ struct KnownAnnexEntry {
     copy_path: Option<PathBuf>,
 }
 
+/// Whether this path at this Location was last observed with the same size and
+/// mtime as a present Copy whose last check succeeded and whose Object is still
+/// the File's expected content. Such a file needs no read: its presence is
+/// refreshed when a complete scan finishes, and integrity belongs to verify.
+/// A missing mtime, a corrupt or unknown Copy, or any other doubt means read it.
+fn copy_unchanged(
+    connection: &Connection,
+    database: &Path,
+    collection_id: &str,
+    location_id: &str,
+    path: &EncodedPath,
+    size_bytes: u64,
+    modified_time_utc_ms: Option<u64>,
+) -> Result<bool> {
+    let Some(modified) = modified_time_utc_ms else {
+        return Ok(false);
+    };
+    let (Ok(size), Ok(modified)) = (i64::try_from(size_bytes), i64::try_from(modified)) else {
+        return Ok(false);
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM path_observations p
+               JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+               JOIN copy_claims c ON c.object_id = f.object_id AND c.state = 'present'
+                 AND c.location_id = p.location_id AND c.last_verification_result = 'ok'
+                 AND ((c.relative_path_encoding = p.observed_path_encoding
+                       AND c.relative_path_bytes = p.observed_path_bytes)
+                   OR (p.representation = 'annex_locked_symlink'
+                       AND c.external_identity_id = p.external_identity_id))
+               WHERE p.location_id = ?1 AND p.observed_path_encoding = ?2
+                 AND p.observed_path_bytes = ?3 AND p.state = 'present'
+                 AND p.observed_size_bytes = ?4 AND p.modified_time_utc_ms = ?5
+                 AND f.collection_id = ?6 AND f.path_state = 'active'
+                 AND f.object_id IS NOT NULL AND p.object_id = f.object_id)",
+            params![
+                location_id,
+                path.encoding.as_str(),
+                path.bytes,
+                size,
+                modified,
+                collection_id
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|source| inventory_sqlite_error(database, source))
+}
+
 fn known_annex_entry(
     connection: &Connection,
     database: &Path,
@@ -1836,12 +1930,20 @@ fn annex_verification_failure_item(
 }
 
 enum AnnexSymlinkObservation {
+    /// The annex object file matches a good copy here and was not read.
+    Unchanged,
     Absent,
-    Mismatch { item: Option<serde_json::Value> },
+    Mismatch {
+        item: Option<serde_json::Value>,
+    },
     Error,
-    Observed { item: serde_json::Value, size: u64 },
+    Observed {
+        item: serde_json::Value,
+        size: u64,
+    },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe_annex_symlink(
     root: &Path,
     logical_relative: &Path,
@@ -1850,6 +1952,7 @@ fn observe_annex_symlink(
     config: &V2InventoryConfig,
     observed_time_utc_ms: u64,
     progress: Option<&Progress>,
+    unchanged: &mut dyn FnMut(u64, Option<u64>) -> Result<bool>,
 ) -> Result<AnnexSymlinkObservation> {
     let link = root.join(logical_relative);
     let target = match fs::read_link(&link) {
@@ -1894,6 +1997,9 @@ fn observe_annex_symlink(
         size_bytes: metadata.len(),
         modified_time_utc_ms: modified_time_ms(&metadata),
     };
+    if unchanged(discovered.size_bytes, discovered.modified_time_utc_ms)? {
+        return Ok(AnnexSymlinkObservation::Unchanged);
+    }
     let hashed = match hash_file_stable(
         &content,
         &discovered,

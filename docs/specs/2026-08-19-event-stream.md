@@ -632,7 +632,11 @@ and is not made missing by an effective candidate. Facts already `missing` or
 `superseded` before the scan are excluded. The projector recomputes the declared
 observation count/digest by streaming that canonical set in stable
 encoded-path order. It then updates
-`last_complete_scan_id` for the covered set in the same finalization transaction.
+`last_complete_scan_id` for the covered set in the same finalization transaction, and raises its
+presence (`last_seen_time_utc_ms`) to the scan's start time without moving any later observation
+backwards, for completions that record `unchanged_files` (earlier completions itemized what
+they read and replay unchanged). Claims are refreshed only through present observations the scan
+covered. Verification time is unchanged: only reading bytes refreshes integrity.
 No local job row or per-file unchanged item is needed for replay. Causal
 comparison ensures an effective missing candidate never overwrites a concurrent
 or descendant positive/replacement fact for the same target.
