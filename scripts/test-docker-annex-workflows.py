@@ -193,8 +193,8 @@ rm /state/write-probe /locations/destination/write-probe
                 review = cli('file', 'show', initial[logical]['file_ref_id'])['file_review']
                 check(review['external_key'].startswith(backend + '-'), 'Original SHA512 key was lost')
             print(f'PASS 2: import {len(initial)} Files ({len(present)} present, {len(absent)} absent)', flush=True)
-            result = cli('verify', 'Source', '--path', '/locations/source')
-            check(result['summary']['confirmed_good'] == len(present), 'Full verify skipped present files')
+            result = cli('verify', 'Source', '--path', '/locations/source', '--all')
+            check(result['summary']['verified_ok'] == len(present), 'Full verify skipped present files')
             print('PASS 3: verify all Location content', flush=True)
             # Write new ordinary files only into our private source. A sibling proves
             # the subtree add does not accidentally inventory the entire Location.

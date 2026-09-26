@@ -4210,9 +4210,13 @@ mod unix {
                 "SELECT COUNT(*) FROM object_hashes WHERE hash_algo = 'sha512' AND hash_hex = ?1", [digest], |row| row.get::<_, i64>(0)
             ).unwrap(), 1);
         }
+        // Scans check the original annex SHA512; verify checks the established BLAKE3 identity.
         assert_eq!(rebuilt.query_row(
             "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'hash_mismatch' AND length(observed_hash_hex) = 128 AND expected_hash_hex != observed_hash_hex", [], |row| row.get::<_, i64>(0)
-        ).unwrap(), 5);
+        ).unwrap(), 3);
+        assert_eq!(rebuilt.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'blake3' AND result = 'hash_mismatch' AND expected_hash_hex != observed_hash_hex", [], |row| row.get::<_, i64>(0)
+        ).unwrap(), 2);
         // Prove this fixture would trigger the filter under the old snapshot
         // command, rather than merely configuring an unused filter.
         fs::remove_file(repo.join(".git/index")).unwrap();
@@ -4920,6 +4924,153 @@ mod unix {
         assert_eq!(after["checksums_reused"], 3);
         assert_eq!(after["known_at_risk_files"], 3);
         assert_eq!(after["known_policy_unknown_files"], 0);
+    }
+
+    #[test]
+    fn verification_reads_due_copies_oldest_first_and_all_copies_on_request() {
+        // A visible filesystem UUID lets the runner prove the Archive Root identity.
+        let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let content = temp.path().join("content/verify");
+        fs::create_dir_all(&content).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(content.join(name), name.as_bytes()).unwrap();
+        }
+        let path = content.to_str().unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            path,
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        success(archive(&temp).args(["collection", "add", path, "--collection", "Files"]));
+        success(archive(&temp).args([
+            "device",
+            "identity",
+            "Test Device",
+            "--kind",
+            "serial",
+            "--fingerprint",
+            "VERIFY-DEVICE-001",
+        ]));
+        let database_path = root(&temp).join("archive.db");
+        let verified_at = |name: &str| -> i64 {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT last_verified_time_utc_ms FROM copy_claims WHERE relative_path_display = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let age = |name: &str, time: i64| {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .execute(
+                    "UPDATE copy_claims SET last_verified_time_utc_ms = ?2 WHERE relative_path_display = ?1",
+                    rusqlite::params![name, time],
+                )
+                .unwrap();
+        };
+
+        // Freshly added copies are not due.
+        let idle = json(&success(archive(&temp).args(["--json", "verify"])));
+        assert_eq!(idle["status"], "idle");
+
+        // Presence stays fresh; only verification is old. Oldest verified goes first.
+        age("b.txt", 1_000);
+        age("a.txt", 2_000);
+        success(archive(&temp).args(["background", "enable", "--max-items", "1"]));
+        let status = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "status",
+        ])));
+        assert_eq!(status["pending_stale_presence"], 2);
+        let first = json(&success(archive(&temp).args([
+            "--json",
+            "background",
+            "run",
+        ])));
+        assert_eq!(first["summary"]["selected"], 1);
+        assert!(
+            verified_at("b.txt") > 2_000,
+            "oldest verified copy is read first"
+        );
+        assert_eq!(verified_at("a.txt"), 2_000);
+        let job_id = first["job_id"].as_str().unwrap().to_owned();
+        let resumed = json(&success(
+            archive(&temp).args(["--json", "job", "resume", &job_id]),
+        ));
+        assert_eq!(resumed["status"], "complete");
+        assert!(verified_at("a.txt") > 2_000);
+
+        // Foreground verify of one Location reads only what is due.
+        age("a.txt", 3_000);
+        let one = json(&success(archive(&temp).args([
+            "--json",
+            "verify",
+            "Files on Test Device",
+        ])));
+        assert_eq!(one["summary"]["selected"], 1);
+        assert_eq!(one["summary"]["verified_ok"], 1);
+
+        // Content replaced with the same size and mtime is not due, but --all reads it.
+        let original = fs::metadata(content.join("c.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::write(content.join("c.txt"), b"X.txt").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(content.join("c.txt"))
+            .unwrap()
+            .set_modified(original)
+            .unwrap();
+        let nothing_due = json(&success(archive(&temp).args(["--json", "verify"])));
+        assert_eq!(nothing_due["status"], "idle");
+        let partial = archive(&temp)
+            .args([
+                "--json",
+                "verify",
+                "Files on Test Device",
+                "--all",
+                "--max-items",
+                "1",
+            ])
+            .output()
+            .unwrap();
+        assert!(matches!(partial.status.code(), Some(0 | 10)));
+        let partial = json(&partial);
+        assert_eq!(partial["status"], "running");
+        let job_id = partial["job_id"].as_str().unwrap().to_owned();
+        let all = archive(&temp)
+            .args(["--json", "job", "resume", &job_id])
+            .output()
+            .unwrap();
+        assert_eq!(all.status.code(), Some(10));
+        let all = json(&all);
+        assert_eq!(all["status"], "complete");
+        assert_eq!(
+            all["summary"]["selected"], 3,
+            "each copy is read exactly once"
+        );
+        assert_eq!(all["summary"]["hash_mismatches"], 1);
+        success(archive(&temp).args(["fsck"]));
     }
 
     #[test]

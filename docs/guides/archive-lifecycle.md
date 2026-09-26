@@ -186,9 +186,11 @@ archive report stale-presence --locations
 `status` also points at unfinished jobs. `report stale-presence` says which Device to mount and
 refresh next.
 
-Re-read bytes to catch silent corruption. `verify` checks every current copy at one Location.
-Use `--fingerprint-status match` only after confirming that the mounted disk is the registered
-Device:
+Re-read bytes to catch silent corruption. `verify` reads only the copies that are due: never
+verified, failed their last check, or past their Policy's age or within 30 days of it. It starts
+with the least recently verified. Without a Location it covers every connected Location, and
+`--all` re-reads everything. Use `--fingerprint-status match` only after confirming that the
+mounted disk is the registered Device:
 
 ```bash
 archive verify "Documents on Backup disk" --path /media/backup-disk/Documents \

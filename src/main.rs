@@ -374,11 +374,17 @@ struct ScanArgs {
 
 #[derive(Debug, Args, Clone)]
 struct VerifyArgs {
-    /// Registered filesystem location whose current copies should be checked.
-    location: String,
-    /// Mounted path corresponding exactly to the registered location.
+    /// Location to verify; omit to verify every connected Location.
+    location: Option<String>,
+    /// Mounted path corresponding exactly to the Location; found from its recorded mount when omitted.
     #[arg(long)]
-    path: PathBuf,
+    path: Option<PathBuf>,
+    /// Re-read every current copy instead of only those that are due.
+    #[arg(long)]
+    all: bool,
+    /// Also re-read copies whose verification expires within this many days.
+    #[arg(long, default_value_t = DEFAULT_VERIFY_WINDOW_DAYS)]
+    verify_within: u64,
     /// Verify one claim instead of every current claim at the location.
     #[arg(long)]
     copy: Option<String>,
@@ -1860,15 +1866,6 @@ struct BackgroundTarget {
     external_identity_id: Option<String>,
     location_root: PathBuf,
     device_fingerprint_status: String,
-}
-
-#[derive(Debug)]
-struct BackgroundVerificationFailure<'a> {
-    result: &'a str,
-    observed_hash_hex: Option<&'a str>,
-    observed_size: Option<u64>,
-    duration_ms: u64,
-    detail: &'a str,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3592,8 +3589,10 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
                         cli,
                         database,
                         &VerifyArgs {
-                            location: json_string(params, "location_id")?,
-                            path: PathBuf::from(json_string(params, "root_path")?),
+                            location: Some(json_string(params, "location_id")?),
+                            path: Some(PathBuf::from(json_string(params, "root_path")?)),
+                            all: false,
+                            verify_within: DEFAULT_VERIFY_WINDOW_DAYS,
                             copy: params["copy_claim_id"].as_str().map(str::to_owned),
                             fingerprint_status: params["fingerprint_status"]
                                 .as_str()
@@ -3691,6 +3690,13 @@ fn print_jobs(as_json: bool, jobs: &[LocalJob]) -> Result<(), AppError> {
 }
 
 fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Result<u8, AppError> {
+    let location = args.location.as_deref().ok_or_else(|| {
+        AppError::Input("this Archive version requires verify LOCATION".to_owned())
+    })?;
+    let verification_path = args
+        .path
+        .as_deref()
+        .ok_or_else(|| AppError::Input("this Archive version requires verify --path".to_owned()))?;
     if args.batch_entries == 0 {
         return Err(AppError::Input(
             "--batch-entries must be greater than zero".to_owned(),
@@ -3704,24 +3710,24 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
             "--fingerprint-status must be match, unavailable, or mismatch".to_owned(),
         ));
     }
-    let root_path = std::fs::canonicalize(&args.path).map_err(|error| {
+    let root_path = std::fs::canonicalize(verification_path).map_err(|error| {
         AppError::Input(format!(
             "cannot resolve verification path {}: {error}",
-            args.path.display()
+            verification_path.display()
         ))
     })?;
     let location_valid: bool = cli_connection(database)?
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM locations
                             WHERE location_id = ?1 AND kind = 'filesystem' AND status = 'active')",
-            [&args.location],
+            [location],
             |row| row.get(0),
         )
         .map_err(|source| cli_sql_error(database, source))?;
     if !location_valid {
         return Err(AppError::Input(format!(
             "active filesystem location not found: {}",
-            args.location
+            location
         )));
     }
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
@@ -3732,13 +3738,13 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
     let input_version = stable_id(
         "verify_input",
         &[
-            args.location.as_bytes(),
+            location.as_bytes(),
             root_path.to_string_lossy().as_bytes(),
             args.copy.as_deref().unwrap_or("").as_bytes(),
         ],
     );
     let params_value = json!({
-        "location_id": args.location,
+        "location_id": location,
         "root_path": root_path,
         "copy_claim_id": args.copy,
         "fingerprint_status": args.fingerprint_status,
@@ -3770,7 +3776,7 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
     loop {
         let targets = verification_targets(
             database,
-            &args.location,
+            location,
             args.copy.as_deref(),
             after.as_deref(),
             args.batch_entries,
@@ -4022,7 +4028,7 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
                     object_id: resolved_object_id,
                     file_ref_id: target.file_ref_id,
                     copy_claim_id: Some(target.copy_claim_id),
-                    location_id: Some(args.location.clone()),
+                    location_id: Some(location.to_owned()),
                     ..EventReferences::default()
                 }),
             );
@@ -4044,7 +4050,7 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
     if args.copy.is_some() && !matched_target {
         return Err(AppError::Input(format!(
             "current verifiable copy not found at location {}: {}",
-            args.location,
+            location,
             args.copy.as_deref().unwrap_or_default()
         )));
     }
@@ -7855,20 +7861,7 @@ fn execute_v2_registry_command(
                         .to_owned(),
                 ));
             }
-            execute_v2_location_scan(
-                cli,
-                database,
-                &LocationScanArgs {
-                    location: Some(args.location.clone()),
-                    path: Some(args.path.clone()),
-                    collection: None,
-                    exclusions: Vec::new(),
-                    job_id: args.job_id.clone(),
-                    scan_id: None,
-                    batch_entries: args.batch_entries,
-                    max_items: args.max_items,
-                },
-            )?
+            execute_v2_verify(cli, database, args, None)?
         }
         Command::Copy(args) => {
             if args.command.is_some() {
@@ -9283,6 +9276,24 @@ fn execute_v2_job(
                 "background_stale" => {
                     execute_v2_background_run(cli, database, Some(job_id.clone()), *max_items)?;
                 }
+                "verify" => {
+                    return execute_v2_verify(
+                        cli,
+                        database,
+                        &VerifyArgs {
+                            location: None,
+                            path: None,
+                            all: false,
+                            verify_within: DEFAULT_VERIFY_WINDOW_DAYS,
+                            copy: None,
+                            fingerprint_status: "unavailable".to_owned(),
+                            job_id: Some(job_id.clone()),
+                            batch_entries: VERIFY_BATCH_COPIES,
+                            max_items: *max_items,
+                        },
+                        Some(job_params),
+                    );
+                }
                 other => {
                     return Err(AppError::Input(format!(
                         "resume is not yet implemented for v2 job type {other}"
@@ -9413,6 +9424,9 @@ fn print_background_status(
                 "enabled": config.enabled,
                 "paused": config.paused,
                 "max_items": config.max_items,
+                "pending_due": pending,
+                // Earlier name, kept for existing consumers; the count now includes
+                // copies due for verification, not only stale presence.
                 "pending_stale_presence": pending,
                 "running_job_id": running,
                 "execution_model": "external_scheduler_one_shot",
@@ -9429,7 +9443,7 @@ fn print_background_status(
             if config.paused { " (paused)" } else { "" }
         );
         println!("Bound per run: {} Copy claims", config.max_items);
-        println!("Stale presence pending: {pending}");
+        println!("Copies due for verification: {pending}");
         if let Some(job_id) = running {
             println!("Running/resumable job: {job_id}");
         }
@@ -9440,21 +9454,14 @@ fn print_background_status(
 
 fn count_background_stale(database: &V2ProjectionDb) -> Result<u64, AppError> {
     let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
-    let count: i64 = v2_cli_connection(database)?
-        .query_row(
-            "SELECT COUNT(DISTINCT cc.copy_claim_id)
-             FROM copy_claims cc
-             JOIN file_refs f ON f.object_id = cc.object_id AND f.path_state = 'active'
-             JOIN collections c ON c.collection_id = f.collection_id AND c.status = 'active'
-             JOIN policies p ON p.policy_id = c.policy_id AND p.status = 'active' AND p.enabled = 1
-             WHERE cc.state = 'present'
-               AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
-                    ?1 - CAST(json_extract(p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000)",
-            [now],
-            |row| row.get(0),
-        )
-        .map_err(|source| v2_cli_sql_error(database, source))?;
-    nonnegative_sql_count(count)
+    count_due_copies(
+        database,
+        None,
+        VerifySelection::Due {
+            window_days: DEFAULT_VERIFY_WINDOW_DAYS,
+        },
+        now,
+    )
 }
 
 fn running_background_job(
@@ -9487,25 +9494,222 @@ fn background_job_host(
         .map_err(|source| v2_cli_sql_error(database, source))
 }
 
-fn background_targets(
+const DEFAULT_VERIFY_WINDOW_DAYS: u64 = 30;
+/// Outcomes per canonical append; also the placement batch limit.
+const VERIFY_BATCH_COPIES: usize = 1_000;
+
+/// Which copies a verification job reads. The job fixes `as_of_ms` when it
+/// starts: only copies last verified before then are selected, so a resumed
+/// job continues the same selection and reads each copy at most once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifySelection {
+    /// Copies never verified, whose last check failed, whose verification is past
+    /// due or due within `window_days`, or whose presence is past its limit.
+    Due { window_days: u64 },
+    /// Every current copy.
+    All,
+}
+
+#[derive(Debug, Clone)]
+struct VerifyLocation {
+    location_id: String,
+    root: PathBuf,
+    fingerprint_status: String,
+}
+
+/// Shared eligibility for verify and the background runner. `?1` is a JSON array
+/// of Location IDs (NULL for all), `?2` the selection time, `?3` 1 for all
+/// copies, and `?4` the due window in days.
+const DUE_COPIES_SQL: &str = "
+    FROM copy_claims cc
+    JOIN objects o ON o.object_id = cc.object_id
+    WHERE (?1 IS NULL OR cc.location_id IN (SELECT value FROM json_each(?1)))
+      AND cc.state IN ('present', 'corrupt', 'unknown')
+      AND (cc.last_verified_time_utc_ms IS NULL OR cc.last_verified_time_utc_ms < ?2)
+      AND EXISTS (
+        SELECT 1 FROM file_refs due_file
+        JOIN collections due_collection ON due_collection.collection_id = due_file.collection_id
+                                       AND due_collection.status = 'active'
+        LEFT JOIN policies p ON p.policy_id = due_collection.policy_id
+                            AND p.status = 'active' AND p.enabled = 1
+        WHERE due_file.object_id = cc.object_id AND due_file.path_state = 'active'
+          AND (?3 = 1 OR (p.policy_id IS NOT NULL AND (
+                cc.last_verified_time_utc_ms IS NULL
+             OR cc.last_verification_result IS NOT 'ok'
+             OR cc.last_verified_time_utc_ms < ?2 - MAX(0, CAST(json_extract(
+                    p.requirements_json, '$.max_verification_age_days') AS INTEGER) - ?4) * 86400000
+             OR cc.last_seen_time_utc_ms IS NULL
+             OR cc.last_seen_time_utc_ms < ?2 - CAST(json_extract(
+                    p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000))))";
+
+fn verify_selection_params(
+    locations: Option<&[VerifyLocation]>,
+    selection: VerifySelection,
+    as_of_ms: i64,
+) -> Result<(Option<String>, i64, i64, i64), AppError> {
+    let ids = locations
+        .map(|locations| {
+            serde_json::to_string(
+                &locations
+                    .iter()
+                    .map(|location| location.location_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()?;
+    let (all, window) = match selection {
+        VerifySelection::All => (1, 0),
+        VerifySelection::Due { window_days } => (0, i64::try_from(window_days).unwrap_or(i64::MAX)),
+    };
+    Ok((ids, as_of_ms, all, window))
+}
+
+/// Due copies anywhere (or at `locations`) as of `as_of_ms`.
+fn count_due_copies(
+    database: &V2ProjectionDb,
+    locations: Option<&[VerifyLocation]>,
+    selection: VerifySelection,
+    as_of_ms: i64,
+) -> Result<u64, AppError> {
+    let (ids, as_of, all, window) = verify_selection_params(locations, selection, as_of_ms)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            &format!("SELECT COUNT(*) {DUE_COPIES_SQL}"),
+            params![ids, as_of, all, window],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+/// Current copies with no content identity yet, e.g. after an inventory-only annex
+/// import. Only a scan can read them, because verification needs a known Object.
+fn count_unidentified_copies(
+    database: &V2ProjectionDb,
+    locations: &[VerifyLocation],
+) -> Result<u64, AppError> {
+    let (ids, _, _, _) = verify_selection_params(Some(locations), VerifySelection::All, 0)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            "SELECT COUNT(*) FROM copy_claims
+             WHERE location_id IN (SELECT value FROM json_each(?1))
+               AND state IN ('present', 'unknown') AND object_id IS NULL",
+            [ids],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+/// Least recently verified first across all given Locations (never verified first).
+fn due_verification_targets(
+    database: &V2ProjectionDb,
+    locations: &[VerifyLocation],
+    selection: VerifySelection,
+    as_of_ms: i64,
+    limit: usize,
+) -> Result<Vec<BackgroundTarget>, AppError> {
+    if locations.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (ids, as_of, all, window) = verify_selection_params(Some(locations), selection, as_of_ms)?;
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
+                    cc.object_id, o.canonical_hash_hex, o.size_bytes,
+                    f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
+                    cc.relative_path_encoding, cc.relative_path_bytes,
+                    cc.relative_path_display, cc.external_identity_id
+             {}
+             ORDER BY COALESCE(cc.last_verified_time_utc_ms, -1), cc.copy_claim_id
+             LIMIT ?5",
+            DUE_COPIES_SQL.replace(
+                "JOIN objects o ON o.object_id = cc.object_id",
+                "JOIN objects o ON o.object_id = cc.object_id
+                 JOIN file_refs f ON f.file_ref_id = (
+                     SELECT candidate.file_ref_id FROM file_refs candidate
+                     JOIN collections c ON c.collection_id = candidate.collection_id
+                                         AND c.status = 'active'
+                     WHERE candidate.object_id = cc.object_id AND candidate.path_state = 'active'
+                     ORDER BY candidate.collection_id, candidate.logical_path_encoding,
+                              candidate.logical_path_bytes, candidate.file_ref_id
+                     LIMIT 1)",
+            )
+        ))
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map(
+            params![
+                ids,
+                as_of,
+                all,
+                window,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let size: i64 = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    u64::try_from(size)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            },
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    rows.into_iter()
+        .map(|row| {
+            let location = locations
+                .iter()
+                .find(|location| location.location_id == row.2)
+                .expect("selected from these Locations");
+            Ok(BackgroundTarget {
+                copy_claim_id: row.0,
+                collection_id: row.1,
+                location_id: row.2,
+                file_ref_id: row.3,
+                object_id: row.4,
+                blake3_hex: row.5,
+                size_bytes: row.6,
+                logical_path: registry_path_from_sql(&row.7, &row.8, &row.9)?,
+                copy_path: registry_path_from_sql(&row.10, &row.11, &row.12)?,
+                external_identity_id: row.13,
+                location_root: location.root.clone(),
+                device_fingerprint_status: location.fingerprint_status.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Mounted filesystem Locations on recognized, confirmed Devices whose identity
+/// currently matches, plus the number of Devices skipped.
+fn background_locations(
     cli: &Cli,
     database: &V2ProjectionDb,
-    limit: usize,
-) -> Result<(Vec<BackgroundTarget>, u64), AppError> {
+) -> Result<(Vec<VerifyLocation>, u64), AppError> {
     let state = database.registry_state(false)?;
-    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
     let connection = v2_cli_connection(database)?;
-    let mut targets = Vec::new();
+    let mut locations = Vec::new();
     let mut skipped_devices = BTreeSet::new();
-
     for location in state
         .locations
         .iter()
         .filter(|location| location.status == "active" && location.kind == "filesystem")
     {
-        if targets.len() >= limit {
-            break;
-        }
         let Some(device_id) = location.device_id.as_deref() else {
             continue;
         };
@@ -9525,103 +9729,21 @@ fn background_targets(
             skipped_devices.insert(device_id.to_owned());
             continue;
         }
-        let (mounted_location, location_root, fingerprint_status) =
-            match v2_mounted_location_by_selector(cli, database, &state, &location.location_id) {
-                Ok(value) => value,
-                Err(AppError::Input(_)) => {
-                    skipped_devices.insert(device_id.to_owned());
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-        if fingerprint_status != "match" {
-            skipped_devices.insert(device_id.to_owned());
-            continue;
-        }
-
-        let remaining = limit.saturating_sub(targets.len());
-        let mut statement = connection
-            .prepare(
-                "SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
-                        cc.object_id, o.canonical_hash_hex, o.size_bytes,
-                        f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
-                        cc.relative_path_encoding, cc.relative_path_bytes,
-                        cc.relative_path_display, cc.external_identity_id
-                 FROM copy_claims cc
-                 JOIN objects o ON o.object_id = cc.object_id
-                 JOIN file_refs f ON f.file_ref_id = (
-                     SELECT candidate.file_ref_id
-                     FROM file_refs candidate
-                     JOIN collections c ON c.collection_id = candidate.collection_id
-                                         AND c.status = 'active'
-                     JOIN policies p ON p.policy_id = c.policy_id
-                                    AND p.status = 'active' AND p.enabled = 1
-                     WHERE candidate.object_id = cc.object_id
-                       AND candidate.path_state = 'active'
-                       AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
-                            ?2 - CAST(json_extract(
-                                p.requirements_json,
-                                '$.max_observation_age_days'
-                            ) AS INTEGER) * 86400000)
-                     ORDER BY candidate.collection_id, candidate.logical_path_encoding,
-                              candidate.logical_path_bytes, candidate.file_ref_id
-                     LIMIT 1
-                 )
-                 WHERE cc.location_id = ?1 AND cc.state = 'present'
-                 ORDER BY COALESCE(cc.last_seen_time_utc_ms, -1), cc.copy_claim_id
-                 LIMIT ?3",
-            )
-            .map_err(|source| v2_cli_sql_error(database, source))?;
-        let rows = statement
-            .query_map(
-                params![
-                    mounted_location.location_id,
-                    now,
-                    i64::try_from(remaining).unwrap_or(i64::MAX)
-                ],
-                |row| {
-                    let size: i64 = row.get(6)?;
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        u64::try_from(size)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, Vec<u8>>(11)?,
-                        row.get::<_, String>(12)?,
-                        row.get::<_, Option<String>>(13)?,
-                    ))
-                },
-            )
-            .map_err(|source| v2_cli_sql_error(database, source))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|source| v2_cli_sql_error(database, source))?;
-        for row in rows {
-            targets.push(BackgroundTarget {
-                copy_claim_id: row.0,
-                collection_id: row.1,
-                location_id: row.2,
-                file_ref_id: row.3,
-                object_id: row.4,
-                blake3_hex: row.5,
-                size_bytes: row.6,
-                logical_path: registry_path_from_sql(&row.7, &row.8, &row.9)?,
-                copy_path: registry_path_from_sql(&row.10, &row.11, &row.12)?,
-                external_identity_id: row.13,
-                location_root: location_root.clone(),
-                device_fingerprint_status: fingerprint_status.clone(),
-            });
+        match v2_mounted_location_by_selector(cli, database, &state, &location.location_id) {
+            Ok((mounted, root, fingerprint_status)) if fingerprint_status == "match" => locations
+                .push(VerifyLocation {
+                    location_id: mounted.location_id,
+                    root,
+                    fingerprint_status,
+                }),
+            Ok(_) | Err(AppError::Input(_)) => {
+                skipped_devices.insert(device_id.to_owned());
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok((
-        targets,
+        locations,
         u64::try_from(skipped_devices.len()).unwrap_or(u64::MAX),
     ))
 }
@@ -9782,152 +9904,420 @@ fn hash_background_file(path: &Path) -> Result<(u64, String, u64, Option<u64>), 
     ))
 }
 
-fn append_background_verification_failure(
+/// Reads each target and records every outcome in at most two canonical
+/// appends: successful observations, then failures. Callers pass at most
+/// `VERIFY_BATCH_COPIES` targets. Operation keys make a repeated batch a no-op.
+fn verify_copy_batch(
     database: &V2ProjectionDb,
     store: &V2OriginStore,
     job_id: &str,
+    job_type: &str,
     input_version: &str,
-    target: &BackgroundTarget,
-    failure: &BackgroundVerificationFailure<'_>,
+    targets: &[BackgroundTarget],
+    summary: &mut BackgroundRunSummary,
 ) -> Result<(), AppError> {
-    let operation_key = stable_id(
-        "op",
-        &[
-            job_id.as_bytes(),
-            input_version.as_bytes(),
-            target.copy_claim_id.as_bytes(),
-            failure.result.as_bytes(),
-        ],
-    );
-    store.append_batch(
-        "background_verify",
-        1,
-        json!({"job_id": job_id, "job_type": "background_stale"}),
-        json!({}),
-        vec![json!({
-            "kind": "copy_verification_failed",
-            "copy_claim_id": target.copy_claim_id,
-            "object_id": target.object_id,
-            "location_id": target.location_id,
-            "logical_path": target.logical_path,
-            "copy_path": target.copy_path,
-            "result": failure.result,
-            "expected_hash_algo": "blake3",
-            "expected_hash_hex": target.blake3_hex,
-            "observed_hash_hex": failure.observed_hash_hex,
-            "size_bytes": failure.observed_size,
-            "duration_ms": failure.duration_ms,
-            "verified_time_utc_ms": now_utc_ms()?,
-            "device_fingerprint_status": target.device_fingerprint_status,
-            "error_detail": failure.detail,
-            "job_id": job_id,
-            "job_type": "background_stale",
-            "item_type": "copy_claim",
-            "item_key": target.copy_claim_id,
-            "outcome_kind": failure.result,
-            "operation_key": operation_key,
-        })],
-    )?;
-    database.apply(store)?;
+    let mut placements = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        let outcome = background_content_path(target)
+            .map_err(|error| error.to_string())
+            .and_then(|path| hash_background_file(&path));
+        match outcome {
+            Ok((size, hash, _, modified_time))
+                if size == target.size_bytes && hash == target.blake3_hex =>
+            {
+                summary.bytes_read = summary.bytes_read.saturating_add(size);
+                summary.verified_ok = summary.verified_ok.saturating_add(1);
+                placements.push(archive_ledger::V2Placement {
+                    collection_id: target.collection_id.clone(),
+                    location_id: target.location_id.clone(),
+                    file_ref_id: target.file_ref_id.clone(),
+                    logical_path: target.logical_path.clone(),
+                    copy_path: target.copy_path.clone(),
+                    object_id: target.object_id.clone(),
+                    blake3_hex: target.blake3_hex.clone(),
+                    size_bytes: target.size_bytes,
+                    modified_time_utc_ms: modified_time,
+                    representation: if target.external_identity_id.is_some() {
+                        "annex_locked_symlink".to_owned()
+                    } else {
+                        "ordinary_file".to_owned()
+                    },
+                    external_identity_id: target.external_identity_id.clone(),
+                    device_fingerprint_status: target.device_fingerprint_status.clone(),
+                    job_id: job_id.to_owned(),
+                    job_type: job_type.to_owned(),
+                    input_version: input_version.to_owned(),
+                });
+            }
+            Ok((size, hash, duration_ms, _)) => {
+                summary.bytes_read = summary.bytes_read.saturating_add(size);
+                summary.hash_mismatches = summary.hash_mismatches.saturating_add(1);
+                failures.push(verification_failure_item(
+                    job_id,
+                    job_type,
+                    input_version,
+                    target,
+                    "hash_mismatch",
+                    Some(&hash),
+                    Some(size),
+                    duration_ms,
+                    "file content does not match the recorded Object",
+                )?);
+            }
+            Err(detail) => {
+                summary.read_errors = summary.read_errors.saturating_add(1);
+                failures.push(verification_failure_item(
+                    job_id,
+                    job_type,
+                    input_version,
+                    target,
+                    "read_error",
+                    None,
+                    None,
+                    0,
+                    &detail,
+                )?);
+            }
+        }
+    }
+    archive_ledger::v2_record_placements(store, database, &placements)?;
+    let connection = v2_cli_connection(database)?;
+    let mut pending = Vec::new();
+    for item in failures {
+        let recorded: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_outcomes WHERE operation_key = ?1)",
+                [item["operation_key"].as_str().unwrap_or_default()],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if !recorded {
+            pending.push(item);
+        }
+    }
+    if !pending.is_empty() {
+        store.append_batch(
+            "background_verify",
+            1,
+            json!({"job_id": job_id, "job_type": job_type}),
+            json!({}),
+            pending,
+        )?;
+        database.apply(store)?;
+    }
     Ok(())
 }
 
-fn verify_background_target(
-    database: &V2ProjectionDb,
-    store: &V2OriginStore,
+#[allow(clippy::too_many_arguments)]
+fn verification_failure_item(
     job_id: &str,
+    job_type: &str,
     input_version: &str,
     target: &BackgroundTarget,
-    summary: &mut BackgroundRunSummary,
-) -> Result<(), AppError> {
-    let path = match background_content_path(target) {
-        Ok(path) => path,
-        Err(error) => {
-            append_background_verification_failure(
-                database,
-                store,
-                job_id,
-                input_version,
-                target,
-                &BackgroundVerificationFailure {
-                    result: "read_error",
-                    observed_hash_hex: None,
-                    observed_size: None,
-                    duration_ms: 0,
-                    detail: &error.to_string(),
-                },
-            )?;
-            summary.read_errors = summary.read_errors.saturating_add(1);
-            return Ok(());
+    result: &str,
+    observed_hash_hex: Option<&str>,
+    observed_size: Option<u64>,
+    duration_ms: u64,
+    detail: &str,
+) -> Result<serde_json::Value, AppError> {
+    Ok(json!({
+        "kind": "copy_verification_failed",
+        "copy_claim_id": target.copy_claim_id,
+        "object_id": target.object_id,
+        "location_id": target.location_id,
+        "logical_path": target.logical_path,
+        "copy_path": target.copy_path,
+        "result": result,
+        "expected_hash_algo": "blake3",
+        "expected_hash_hex": target.blake3_hex,
+        "observed_hash_hex": observed_hash_hex,
+        "size_bytes": observed_size,
+        "duration_ms": duration_ms,
+        "verified_time_utc_ms": now_utc_ms()?,
+        "device_fingerprint_status": target.device_fingerprint_status,
+        "error_detail": detail,
+        "job_id": job_id,
+        "job_type": job_type,
+        "item_type": "copy_claim",
+        "item_key": target.copy_claim_id,
+        "outcome_kind": result,
+        "operation_key": stable_id(
+            "op",
+            &[
+                job_id.as_bytes(),
+                input_version.as_bytes(),
+                target.copy_claim_id.as_bytes(),
+                result.as_bytes(),
+            ],
+        ),
+    }))
+}
+
+/// Resolves the Locations a verify job reads. An explicit `--path` must be the
+/// Location root; otherwise the recorded mount is used. Without a Location,
+/// every mounted filesystem Location whose identity does not mismatch is used.
+fn verify_locations(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    location: Option<&str>,
+    path: Option<&Path>,
+) -> Result<(Vec<VerifyLocation>, u64), AppError> {
+    let state = database.registry_state(false)?;
+    let checked = |selected: LocationSnapshot, root: PathBuf, fingerprint_status: String| {
+        if fingerprint_status == "mismatch" {
+            return Err(AppError::Input(format!(
+                "the mounted filesystem does not match {}; verification refuses to read it",
+                selected.display_name
+            )));
         }
+        Ok(VerifyLocation {
+            location_id: selected.location_id,
+            root,
+            fingerprint_status,
+        })
     };
-    match hash_background_file(&path) {
-        Ok((size, hash, duration_ms, modified_time)) => {
-            summary.bytes_read = summary.bytes_read.saturating_add(size);
-            if size == target.size_bytes && hash == target.blake3_hex {
-                archive_ledger::v2_record_placements(
-                    store,
-                    database,
-                    &[archive_ledger::V2Placement {
-                        collection_id: target.collection_id.clone(),
-                        location_id: target.location_id.clone(),
-                        file_ref_id: target.file_ref_id.clone(),
-                        logical_path: target.logical_path.clone(),
-                        copy_path: target.copy_path.clone(),
-                        object_id: target.object_id.clone(),
-                        blake3_hex: target.blake3_hex.clone(),
-                        size_bytes: target.size_bytes,
-                        modified_time_utc_ms: modified_time,
-                        representation: if target.external_identity_id.is_some() {
-                            "annex_locked_symlink".to_owned()
-                        } else {
-                            "ordinary_file".to_owned()
-                        },
-                        external_identity_id: target.external_identity_id.clone(),
-                        device_fingerprint_status: target.device_fingerprint_status.clone(),
-                        job_id: job_id.to_owned(),
-                        job_type: "background_stale".to_owned(),
-                        input_version: input_version.to_owned(),
-                    }],
-                )?;
-                summary.verified_ok = summary.verified_ok.saturating_add(1);
-            } else {
-                append_background_verification_failure(
-                    database,
-                    store,
-                    job_id,
-                    input_version,
-                    target,
-                    &BackgroundVerificationFailure {
-                        result: "hash_mismatch",
-                        observed_hash_hex: Some(&hash),
-                        observed_size: Some(size),
-                        duration_ms,
-                        detail: "file content does not match the recorded Object",
-                    },
-                )?;
-                summary.hash_mismatches = summary.hash_mismatches.saturating_add(1);
+    match (location, path) {
+        (selector, Some(path)) => {
+            let hint = std::fs::canonicalize(path)
+                .map_err(|error| AppError::Input(format!("cannot resolve verify path: {error}")))?;
+            let (selected, root, status) =
+                v2_inventory_location_scope(cli, database, &state, &hint, selector)?;
+            if root != hint {
+                return Err(AppError::Input(
+                    "verify --path must be exactly the registered Location root".to_owned(),
+                ));
             }
+            Ok((vec![checked(selected, root, status)?], 0))
         }
-        Err(detail) => {
-            append_background_verification_failure(
-                database,
-                store,
-                job_id,
-                input_version,
-                target,
-                &BackgroundVerificationFailure {
-                    result: "read_error",
-                    observed_hash_hex: None,
-                    observed_size: None,
-                    duration_ms: 0,
-                    detail: &detail,
-                },
-            )?;
-            summary.read_errors = summary.read_errors.saturating_add(1);
+        (Some(selector), None) => {
+            let (selected, root, status) =
+                v2_mounted_location_by_selector(cli, database, &state, selector)?;
+            Ok((vec![checked(selected, root, status)?], 0))
+        }
+        (None, None) => {
+            let mut locations = Vec::new();
+            let mut skipped = 0_u64;
+            for candidate in state
+                .locations
+                .iter()
+                .filter(|location| location.status == "active" && location.kind == "filesystem")
+            {
+                match v2_mounted_location_by_selector(cli, database, &state, &candidate.location_id)
+                {
+                    Ok((selected, root, status)) if status != "mismatch" => {
+                        locations.push(checked(selected, root, status)?)
+                    }
+                    Ok(_) | Err(AppError::Input(_)) => skipped = skipped.saturating_add(1),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((locations, skipped))
         }
     }
-    Ok(())
+}
+
+/// Re-reads due copies (or every copy with `--all`) at one or all connected
+/// Locations, least recently verified first, in batched appends.
+fn execute_v2_verify(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    args: &VerifyArgs,
+    resumed_params: Option<serde_json::Value>,
+) -> Result<u8, AppError> {
+    if args.batch_entries == 0 {
+        return Err(AppError::Input(
+            "--batch-entries must be greater than zero".to_owned(),
+        ));
+    }
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let (params, locations, skipped) = match resumed_params {
+        // Resume re-resolves the same Locations from their recorded roots.
+        Some(params) => {
+            let mut locations = Vec::new();
+            for location in params["locations"].as_array().into_iter().flatten() {
+                let (mut resolved, _) = verify_locations(
+                    cli,
+                    database,
+                    location["location_id"].as_str(),
+                    location["root_path"].as_str().map(Path::new),
+                )?;
+                locations.append(&mut resolved);
+            }
+            (params, locations, 0)
+        }
+        None => {
+            let (locations, skipped) = verify_locations(
+                cli,
+                database,
+                args.location.as_deref(),
+                args.path.as_deref(),
+            )?;
+            let params = json!({
+                "mode": if args.all { "all" } else { "due" },
+                "window_days": args.verify_within,
+                "as_of_ms": now,
+                "locations": locations.iter().map(|location| json!({
+                    "location_id": location.location_id,
+                    "root_path": location.root,
+                })).collect::<Vec<_>>(),
+            });
+            (params, locations, skipped)
+        }
+    };
+    let selection = if params["mode"] == "all" {
+        VerifySelection::All
+    } else {
+        VerifySelection::Due {
+            window_days: params["window_days"]
+                .as_u64()
+                .unwrap_or(DEFAULT_VERIFY_WINDOW_DAYS),
+        }
+    };
+    let as_of = params["as_of_ms"].as_i64().unwrap_or(now);
+    let due = count_due_copies(database, Some(&locations), selection, as_of)?;
+    let unidentified = count_unidentified_copies(database, &locations)?;
+    let unidentified_hint = || {
+        if unidentified > 0 {
+            println!(
+                "{unidentified} copies have no verified content identity yet (for example after an inventory-only annex import); run archive location scan to read them."
+            );
+        }
+    };
+    let scope = match locations.len() {
+        0 => "no connected Location".to_owned(),
+        1 => "1 Location".to_owned(),
+        count => format!("{count} Locations"),
+    };
+    if due == 0 && args.job_id.is_none() {
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "version": 2, "status": "idle", "job_id": null, "due": 0,
+                    "locations": locations.len(), "skipped_locations": skipped,
+                    "unidentified_copies": unidentified,
+                }))?
+            );
+        } else {
+            println!("Nothing to verify at {scope}: no copies are due.");
+            unidentified_hint();
+        }
+        return Ok(EXIT_OK);
+    }
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let input_version = v2_local_job(database, &job_id)?
+        .map(|job| job.input_version)
+        .unwrap_or_else(|| format!("verify_{suffix}"));
+    let store = V2OriginStore::open(cli.events_path())?;
+    ensure_v2_job_started(
+        cli,
+        database,
+        &store,
+        &job_id,
+        "verify",
+        &input_version,
+        &params,
+    )?;
+    if !cli.json {
+        eprintln!(
+            "Verify job {job_id}: {due} copies to read. If interrupted, resume with: archive job resume {job_id}"
+        );
+    }
+    let mut summary: BackgroundRunSummary = v2_local_job(database, &job_id)?
+        .and_then(|job| job.progress)
+        .and_then(|progress| serde_json::from_value(progress).ok())
+        .unwrap_or_default();
+    summary.skipped_devices = summary.skipped_devices.max(skipped);
+    let mut read_this_run = 0_usize;
+    let paused = loop {
+        let budget = args
+            .max_items
+            .map_or(usize::MAX, |limit| limit.saturating_sub(read_this_run));
+        if budget == 0 {
+            break count_due_copies(database, Some(&locations), selection, as_of)? > 0;
+        }
+        let targets = due_verification_targets(
+            database,
+            &locations,
+            selection,
+            as_of,
+            args.batch_entries.min(VERIFY_BATCH_COPIES).min(budget),
+        )?;
+        if targets.is_empty() {
+            break false;
+        }
+        summary.selected = summary
+            .selected
+            .saturating_add(u64::try_from(targets.len()).unwrap_or(u64::MAX));
+        read_this_run = read_this_run.saturating_add(targets.len());
+        verify_copy_batch(
+            database,
+            &store,
+            &job_id,
+            "verify",
+            &input_version,
+            &targets,
+            &mut summary,
+        )?;
+        update_v2_job_progress(database, &job_id, &serde_json::to_value(&summary)?)?;
+    };
+    summary.remaining_stale = count_background_stale(database)?;
+    let status = if paused { "running" } else { "complete" };
+    if !paused {
+        finish_v2_job(
+            database,
+            &store,
+            &job_id,
+            "verify",
+            &input_version,
+            "complete",
+            &serde_json::to_value(&summary)?,
+        )?;
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2, "status": status, "job_id": job_id, "summary": summary,
+                "unidentified_copies": unidentified,
+            }))?
+        );
+    } else {
+        println!(
+            "{} {} copies at {scope}: {} verified; {} mismatches; {} read errors.",
+            if paused {
+                "Verification paused after"
+            } else {
+                "Verified"
+            },
+            summary.selected,
+            summary.verified_ok,
+            summary.hash_mismatches,
+            summary.read_errors
+        );
+        if summary.read_errors > 0 {
+            println!(
+                "Unreadable copies may have been moved or removed; run archive location scan to reconcile the Location."
+            );
+        }
+        unidentified_hint();
+        if skipped > 0 {
+            println!("{skipped} Locations were not connected or did not match and were skipped.");
+        }
+        if paused {
+            println!("Resume with: archive job resume {job_id}");
+        }
+    }
+    Ok(if summary.hash_mismatches > 0 || summary.read_errors > 0 {
+        EXIT_FINDINGS
+    } else {
+        EXIT_OK
+    })
 }
 
 fn execute_v2_background_run(
@@ -9967,11 +10357,34 @@ fn execute_v2_background_run(
         .as_ref()
         .map(|job| job.input_version.clone())
         .unwrap_or_else(|| format!("background_{suffix}"));
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
     let job_params = existing_job
         .as_ref()
         .map(|job| job.params.clone())
-        .unwrap_or_else(|| json!({"max_items": config.max_items}));
-    let (mut targets, skipped_devices) = background_targets(cli, database, limit + 1)?;
+        .unwrap_or_else(|| {
+            json!({
+                "max_items": config.max_items,
+                "as_of_ms": now,
+                "window_days": DEFAULT_VERIFY_WINDOW_DAYS,
+            })
+        });
+    // Jobs started before the selection time was recorded use their start time.
+    let as_of = job_params["as_of_ms"]
+        .as_i64()
+        .or_else(|| {
+            existing_job.as_ref().map(|job| {
+                i64::try_from(job.started_time_utc_ms.unwrap_or(job.created_time_utc_ms))
+                    .unwrap_or(i64::MAX)
+            })
+        })
+        .unwrap_or(now);
+    let selection = VerifySelection::Due {
+        window_days: job_params["window_days"]
+            .as_u64()
+            .unwrap_or(DEFAULT_VERIFY_WINDOW_DAYS),
+    };
+    let (locations, skipped_devices) = background_locations(cli, database)?;
+    let mut targets = due_verification_targets(database, &locations, selection, as_of, limit + 1)?;
     let has_more = targets.len() > limit;
     targets.truncate(limit);
     let mut summary: BackgroundRunSummary = existing_job
@@ -9994,7 +10407,7 @@ fn execute_v2_background_run(
             );
         } else {
             println!(
-                "Background refresh idle: no stale files on recognized connected Devices; {} stale remain elsewhere.",
+                "Background verification idle: no copies due on recognized connected Devices; {} due elsewhere.",
                 summary.remaining_stale
             );
         }
@@ -10010,13 +10423,14 @@ fn execute_v2_background_run(
         &input_version,
         &job_params,
     )?;
-    for target in targets {
-        verify_background_target(
+    for batch in targets.chunks(VERIFY_BATCH_COPIES) {
+        verify_copy_batch(
             database,
             &store,
             &job_id,
+            "background_stale",
             &input_version,
-            &target,
+            batch,
             &mut summary,
         )?;
         update_v2_job_progress(database, &job_id, &serde_json::to_value(&summary)?)?;
@@ -10032,7 +10446,7 @@ fn execute_v2_background_run(
             );
         } else {
             println!(
-                "Background refresh paused after {} Copy claims; {} stale remain.",
+                "Background verification paused after {} Copy claims; {} due remain.",
                 summary.selected, summary.remaining_stale
             );
             println!("Resume with: archive job resume {job_id}");
@@ -10061,7 +10475,7 @@ fn execute_v2_background_run(
         );
     } else {
         println!(
-            "Background refresh complete: {} verified; {} mismatches; {} read errors; {} stale remain.",
+            "Background verification complete: {} verified; {} mismatches; {} read errors; {} due remain.",
             summary.verified_ok,
             summary.hash_mismatches,
             summary.read_errors,

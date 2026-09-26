@@ -553,7 +553,7 @@ completion time. JSON results remain on stdout.
 
 For SHA512 entries imported by an earlier version without their expected checksum metadata,
 rerun `location import-annex --reimport` on the same registered path with its existing
-Collection and Location settings, then run `verify`. Re-import preserves the Location and File
+Collection and Location settings, then run `location scan`. Re-import preserves the Location and File
 identities while learning the original checksum; a database rebuild alone does not discover missing
 hashes. See
 the [legacy annex guide](docs/guides/annex-workflows.md#2-create-a-collection-by-importing-git-annex)
@@ -707,13 +707,23 @@ conflicting, disconnected, or ambiguously mounted Device is skipped and its evid
 ## Verify bytes and resume work
 
 Adding or scanning content records the hashing read as baseline verification. Routine verification
-currently re-reads the selected Location:
+re-reads only the copies that are due: never verified, failed their last check, past their
+Policy's presence or verification age, or expiring within 30 days (`--verify-within DAYS`). It
+reads the least recently verified first and does not walk directories. Omit the Location to
+verify every connected Location; add `--all` to re-read every copy:
 
 ```bash
+archive verify
 archive verify <main-location-id> \
   --path /srv/archive/documents \
   --fingerprint-status match
+archive verify <main-location-id> --all
 ```
+
+Verification does not discover new files or mark files missing; use `location scan` for that. If
+a copy cannot be read because it was moved or removed, verify records a read error and suggests a
+scan. Copies whose content identity is not yet known, for example after an inventory-only annex
+import, are reported and need `location scan`.
 
 Use `match` only after confirming the mounted filesystem is the registered Device. A mismatch
 blocks reads. A hash mismatch marks that copy corrupt without redefining the expected Object; a

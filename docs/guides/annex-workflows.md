@@ -112,13 +112,13 @@ gap. Verification and finalization are named separately, so a full spool counter
 that the Git publication is already complete. There is no percentage or ETA.
 
 If an earlier Archive Ledger version imported SHA512 entries as unresolved or without their
-expected checksum metadata, explicitly re-import the same registered path, then verify:
+expected checksum metadata, explicitly re-import the same registered path, then scan it:
 
 ```bash
 archive-docker location import-annex /locations/source --reimport \
   --collection Media --location-name "Media source" \
   --device "Source disk" --site Home --non-interactive
-archive-docker verify "Media source" --path /locations/source
+archive-docker location scan "Media source" --path /locations/source
 ```
 
 Use the existing Collection and Location settings, including `--allow-unidentified-root` if that
@@ -133,13 +133,15 @@ command. `--reimport` does not bypass an unfinished job.
 ## 3. Verify presence and integrity throughout a Location
 
 ```bash
-archive-docker verify "Media source" --path /locations/source
+archive-docker verify "Media source" --path /locations/source --all
+archive-docker location scan "Media source" --path /locations/source
 archive-docker location status "Media source"
 ```
 
-In the current v2 implementation, `verify` runs a complete Location scan and reads content for
-integrity checking. It also discovers additions and reconciles absence; only complete traversal
-can publish missing facts. Partial traversal does not mark unvisited files absent. Review the
+`verify --all` re-reads every current copy at the Location and checks it against its content
+identity; plain `verify` reads only copies that are due. Verification does not discover additions
+or reconcile absence: `location scan` does, and only a complete traversal can publish missing
+facts. Partial traversal does not mark unvisited files absent. Review the
 reported integrity failures and coverage status: exit `10` signals findings, while exit `2`
 means a command error. The mounted path must correspond to the entire registered Location.
 
