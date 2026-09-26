@@ -130,6 +130,40 @@ avoid an accidental full rescan and duplicate import evidence. If an import is u
 setup names its job and refuses to start another; use the printed `archive job resume <job-id>`
 command. `--reimport` does not bypass an unfinished job.
 
+### If an import or scan is interrupted
+
+A long import or scan that stops (Ctrl-C, a crash, a stopped container, or a reboot) is
+recoverable. Both save local progress every 1,000 entries (`--batch-entries`), so an interruption
+costs at most the entries since the last checkpoint. Nothing reaches the catalog history until a
+run finishes, so there is no half-written import to repair. The saved progress lives in the
+Archive's `local/jobs/<job-id>/` directory on this installation. It is not synchronized to other
+installations.
+
+Find the unfinished job and resume it:
+
+```bash
+archive-docker job list
+archive-docker job show <job-id>
+archive-docker job resume <job-id>
+```
+
+`job list` shows unfinished jobs by default, including jobs whose progress survives only on disk
+(for example after `db rebuild`), and `archive-docker status` mentions them. `job resume` needs no
+other options: it takes the original repository, Collection, Location, and settings from the job.
+A resumed import repeats the repository metadata checks, which can take a while on a large
+repository, then continues from its last checkpoint.
+
+Do not re-run `collection init --import-annex` or `location import-annex` to continue. While the
+import is unfinished they refuse and name the job, and `--reimport` does not bypass it. A
+`location scan` prints its job ID when it starts. A new scan of the same Location is refused
+while that job is unfinished, and `archive-docker job cancel <job-id>` abandons an unfinished scan
+(preview with `--dry-run`).
+
+An interrupted import resumes only while the repository is unchanged: the same Git commit and the
+same worktree metadata. After a commit, `git annex get` or `drop`, or other changes, resume refuses
+with "belongs to a different repository snapshot or import". There is not yet a supported way to
+abandon an unfinished import, so leave the repository alone until the import finishes.
+
 ## 3. Verify presence and integrity throughout a Location
 
 ```bash
