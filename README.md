@@ -21,6 +21,11 @@ registered Locations. It does not move, delete, repair, or drop archive content.
 > an independent backup of each Archive's canonical event tree and do not rely on
 > this pre-production build as the only catalog for irreplaceable data.
 
+New to Archive Ledger? [From first Archive to routine maintenance](docs/guides/archive-lifecycle.md)
+walks through setup, protecting the catalog itself, adding copies, Policy, keeping the catalog
+current, and maintenance in order. A test script runs every command in it against a disposable
+Archive.
+
 See [Example workflows](docs/workflows.md) for task-oriented walkthroughs based on realistic
 Archive Ledger use.
 
