@@ -1042,8 +1042,9 @@ struct CollectionAddArgs {
     /// Repeat for multiple files; only these files are processed.
     #[arg(long, value_name = "FILE")]
     accept_changes: Vec<PathBuf>,
-    /// Hash the selected files and preview acceptance without recording changes.
-    #[arg(long, requires = "accept_changes")]
+    /// Preview without recording anything: with --accept-changes, hash the selected files and
+    /// show the acceptance; otherwise show how disk and catalog differ from metadata only.
+    #[arg(long)]
     dry_run: bool,
     /// Confirm acceptance of the explicitly selected files.
     #[arg(long, requires = "accept_changes")]
@@ -1082,6 +1083,9 @@ struct LocationScanArgs {
     batch_entries: usize,
     #[arg(long, hide = true)]
     max_items: Option<usize>,
+    /// Show how disk and catalog differ, from metadata only; read and record nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -9149,6 +9153,7 @@ fn execute_v2_job(
                             scan_id: Some(input_version),
                             batch_entries: inventory_job_batch_entries(&job_params)?,
                             max_items: *max_items,
+                            dry_run: false,
                         },
                     );
                 }
@@ -11368,6 +11373,18 @@ fn execute_v2_collection_add(
         batch_entries: args.batch_entries,
         max_items: args.max_items,
     };
+    // Without --accept-changes, --dry-run previews the add from metadata only.
+    if args.dry_run && args.accept_changes.is_empty() {
+        let preview = archive_ledger::v2_preview_scan(database, &config)?;
+        let next = format!(
+            "archive collection add {} --collection {} --location {}{}",
+            shell_quote(&config.root_path.to_string_lossy()),
+            shell_quote(&collection.display_name),
+            shell_quote(&location.location_id),
+            exclude_arguments(&args.exclusions)
+        );
+        return print_v2_scan_preview(cli, database, &preview, false, &location, &next);
+    }
     if !args.accept_changes.is_empty() {
         if args.dry_run {
             let preview = archive_ledger::v2_preview_changes(database, &config)?;
@@ -11614,6 +11631,149 @@ fn print_catalog_protection_warning(protection: &CatalogProtection) {
     }
 }
 
+/// Copies at a Location whose presence is past the strictest applicable Policy age.
+fn presence_stale_at(database: &V2ProjectionDb, location_id: &str) -> Result<u64, AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            "SELECT COUNT(*) FROM copy_claims cc
+             WHERE cc.location_id = ?1 AND cc.state IN ('present', 'corrupt', 'unknown')
+               AND EXISTS (
+                 SELECT 1 FROM file_refs f
+                 JOIN collections c ON c.collection_id = f.collection_id AND c.status = 'active'
+                 JOIN policies p ON p.policy_id = c.policy_id AND p.status = 'active' AND p.enabled = 1
+                 WHERE f.object_id = cc.object_id AND f.path_state = 'active'
+                   AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
+                        ?2 - CAST(json_extract(p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000))",
+            params![location_id, now],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+/// ` --exclude PATH` for each exclusion, so a suggested command covers the same files.
+fn exclude_arguments(exclusions: &[PathBuf]) -> String {
+    exclusions
+        .iter()
+        .map(|path| format!(" --exclude {}", shell_quote(&path.to_string_lossy())))
+        .collect()
+}
+
+/// Prints a read-only scan/add preview. Exit 10 means a real run would record
+/// something other than routine presence refresh.
+fn print_v2_scan_preview(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    preview: &archive_ledger::V2ScanPreview,
+    complete: bool,
+    location: &LocationSnapshot,
+    next: &str,
+) -> Result<u8, AppError> {
+    let presence_stale = presence_stale_at(database, &location.location_id)?;
+    let due = verification_due_at(database, &location.location_id)?;
+    let actionable = preview.actionable();
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "status": "planned",
+                "mode": if complete { "complete" } else { "add" },
+                "location_id": location.location_id,
+                "preview": preview,
+                "presence_stale": presence_stale,
+                "verification_due": {"due": due.0, "past_due": due.1},
+                "actionable": actionable,
+                "next": actionable.then_some(next),
+            }))?
+        );
+    } else {
+        println!(
+            "Dry run for \"{}\" ({}): no file content was read and nothing was recorded.",
+            location.display_name,
+            if complete { "complete scan" } else { "add" }
+        );
+        let category = |label: &str, item: &archive_ledger::V2PreviewCategory| {
+            if item.count == 0 {
+                return;
+            }
+            println!("  {label}: {} ({})", item.count, format_bytes(item.bytes));
+            for path in &item.paths {
+                println!("    {path}");
+            }
+            if item.truncated {
+                println!("    …and {} more", item.count - item.paths.len() as u64);
+            }
+        };
+        category("New files, would be added", &preview.new_files);
+        category(
+            "Known files not recorded at this Location, would be read and recorded",
+            &preview.new_at_location,
+        );
+        category(
+            "Size or modification time changed, would be read (an integrity finding unless the bytes match)",
+            &preview.changed,
+        );
+        category(
+            "Corrupt, unknown, or not yet verified here, would be read",
+            &preview.needs_reading,
+        );
+        category("Not on disk, would be marked missing", &preview.missing);
+        category(
+            "Annex content no longer present",
+            &preview.annex_content_absent,
+        );
+        category(
+            "Cannot tell without reading (small annex-tracked files)",
+            &preview.uncertain,
+        );
+        category(
+            "Annex links that cannot be resolved, would be recorded as read errors",
+            &preview.unreadable,
+        );
+        println!("  Unchanged, not read: {}", preview.unchanged);
+        if preview.recorded_absent > 0 {
+            println!(
+                "  Annex content absent and already recorded (or not recorded by add): {}",
+                preview.recorded_absent
+            );
+        }
+        if preview.without_identity > 0 {
+            println!(
+                "  Annex entries without a known content identity: {}",
+                preview.without_identity
+            );
+        }
+        if !preview.complete_coverage {
+            println!(
+                "  Traversal or read problems ({} traversal errors, {} concurrent changes, {} unresolvable links): a scan would be partial and mark nothing missing.",
+                preview.traversal_errors, preview.concurrent_changes, preview.unreadable.count
+            );
+        }
+        if presence_stale > 0 {
+            println!(
+                "  {presence_stale} copies here are past their presence age{}",
+                if complete {
+                    "; a complete scan refreshes those still on disk"
+                } else {
+                    "; add does not refresh presence, use location scan"
+                }
+            );
+        }
+        print_verification_due(&location.display_name, due);
+        if actionable {
+            println!("Next: {next}");
+            if !preview.new_at_location.paths.is_empty() {
+                println!("To create further copies, archive copy records them as it writes.");
+            }
+        } else {
+            println!("Nothing to record.");
+        }
+    }
+    Ok(if actionable { EXIT_FINDINGS } else { EXIT_OK })
+}
+
 /// Human mode only: announce the job before any long work so an interrupted
 /// scan can be resumed, and show live progress only on an interactive terminal.
 fn start_v2_inventory_progress(
@@ -11730,6 +11890,7 @@ fn execute_v2_location_scan(
                 .to_owned(),
         ));
     }
+    // A dry run refuses exactly as the real scan would, so its Next command works.
     refuse_unfinished_v2_scans(
         database,
         &location.display_name,
@@ -11737,6 +11898,34 @@ fn execute_v2_location_scan(
         &collection.collection_id,
         args.job_id.as_deref(),
     )?;
+    if args.dry_run {
+        let preview = archive_ledger::v2_preview_scan(
+            database,
+            &archive_ledger::V2InventoryConfig {
+                root_path: location_path.clone(),
+                location_prefix: None,
+                logical_prefix: None,
+                exclusions: args.exclusions.clone(),
+                accept_changes: Vec::new(),
+                collection_id: collection.collection_id.clone(),
+                location_id: location.location_id.clone(),
+                device_fingerprint_status: fingerprint_status.clone(),
+                job_id: "job_preview".to_owned(),
+                scan_id: "scan_preview".to_owned(),
+                scan_mode: ScanMode::Complete,
+                batch_entries: args.batch_entries,
+                max_items: None,
+            },
+        )?;
+        let next = format!(
+            "archive location scan {} --path {} --collection {}{}",
+            shell_quote(&location.display_name),
+            shell_quote(&location_path.to_string_lossy()),
+            shell_quote(&collection.display_name),
+            exclude_arguments(&args.exclusions)
+        );
+        return print_v2_scan_preview(cli, database, &preview, true, &location, &next);
+    }
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id

@@ -39,8 +39,10 @@ const INVENTORY_JOB_FILES: [&str; 8] = [
 ];
 
 mod acceptance;
+mod preview;
 pub use acceptance::{preview_changes, V2ChangePreview};
 use acceptance::{selected_files, validate_selected_path};
+pub use preview::{preview_scan, V2PreviewCategory, V2ScanPreview};
 
 #[cfg(test)]
 mod recovery_tests;
@@ -1943,6 +1945,65 @@ enum AnnexSymlinkObservation {
     },
 }
 
+enum AnnexContent {
+    Present {
+        path: PathBuf,
+        metadata: fs::Metadata,
+    },
+    Absent,
+    Error,
+}
+
+/// Resolves a registered annex symlink to its object file without reading it:
+/// the link must be relative and stay inside `.git/annex/objects`, at the
+/// recorded copy path when one is known.
+fn resolve_annex_content(
+    root: &Path,
+    logical_relative: &Path,
+    known: &KnownAnnexEntry,
+) -> Result<AnnexContent> {
+    let link = root.join(logical_relative);
+    let target = match fs::read_link(&link) {
+        Ok(target) => target,
+        Err(_) => return Ok(AnnexContent::Error),
+    };
+    if target.is_absolute() {
+        return Ok(AnnexContent::Error);
+    }
+    let unresolved = link.parent().unwrap_or(root).join(target);
+    let content = match fs::canonicalize(&unresolved) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AnnexContent::Absent)
+        }
+        Err(_) => return Ok(AnnexContent::Error),
+    };
+    let cas_root = match fs::canonicalize(root.join(".git/annex/objects")) {
+        Ok(path) => path,
+        Err(_) => return Ok(AnnexContent::Error),
+    };
+    if !content.starts_with(&cas_root) {
+        return Ok(AnnexContent::Error);
+    }
+    let copy_relative = content
+        .strip_prefix(root)
+        .map_err(|_| V2InventoryError::Invalid("annex content escaped its Location".to_owned()))?;
+    if known
+        .copy_path
+        .as_deref()
+        .is_some_and(|expected| expected != copy_relative)
+    {
+        return Ok(AnnexContent::Error);
+    }
+    match fs::metadata(&content) {
+        Ok(metadata) if metadata.is_file() => Ok(AnnexContent::Present {
+            path: content,
+            metadata,
+        }),
+        _ => Ok(AnnexContent::Error),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn observe_annex_symlink(
     root: &Path,
@@ -1954,44 +2015,14 @@ fn observe_annex_symlink(
     progress: Option<&Progress>,
     unchanged: &mut dyn FnMut(u64, Option<u64>) -> Result<bool>,
 ) -> Result<AnnexSymlinkObservation> {
-    let link = root.join(logical_relative);
-    let target = match fs::read_link(&link) {
-        Ok(target) => target,
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
+    let (content, metadata) = match resolve_annex_content(root, logical_relative, known)? {
+        AnnexContent::Present { path, metadata } => (path, metadata),
+        AnnexContent::Absent => return Ok(AnnexSymlinkObservation::Absent),
+        AnnexContent::Error => return Ok(AnnexSymlinkObservation::Error),
     };
-    if target.is_absolute() {
-        return Ok(AnnexSymlinkObservation::Error);
-    }
-    let unresolved = link.parent().unwrap_or(root).join(target);
-    let content = match fs::canonicalize(&unresolved) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AnnexSymlinkObservation::Absent)
-        }
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
-    };
-    let cas_root = match fs::canonicalize(root.join(".git/annex/objects")) {
-        Ok(path) => path,
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
-    };
-    if !content.starts_with(&cas_root) {
-        return Ok(AnnexSymlinkObservation::Error);
-    }
     let copy_relative = content
         .strip_prefix(root)
         .map_err(|_| V2InventoryError::Invalid("annex content escaped its Location".to_owned()))?;
-    if known
-        .copy_path
-        .as_deref()
-        .is_some_and(|expected| expected != copy_relative)
-    {
-        return Ok(AnnexSymlinkObservation::Error);
-    }
-    let metadata = match fs::metadata(&content) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return Ok(AnnexSymlinkObservation::Error),
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
-    };
     let discovered = DiscoveredFile {
         relative_path: logical_encoded.clone(),
         size_bytes: metadata.len(),

@@ -1932,6 +1932,136 @@ mod unix {
         );
     }
 
+    #[test]
+    fn scan_and_add_dry_runs_classify_differences_without_reading_or_writing() {
+        let (temp, content) = immutable_files_fixture();
+        let path = content.to_str().unwrap();
+        let database_path = root(&temp).join("archive.db");
+        let snapshot = || {
+            let records = json(&success(
+                archive(&temp).args(["--json", "events", "verify"]),
+            ))["records"]
+                .clone();
+            (fs::read(&database_path).unwrap(), records)
+        };
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute("UPDATE copy_claims SET last_seen_time_utc_ms = 1000 WHERE relative_path_display = 'c.txt'", [])
+            .unwrap();
+        for index in 0..25 {
+            fs::write(content.join(format!("new-{index:02}.txt")), b"n").unwrap();
+        }
+        fs::write(content.join("a.txt"), b"edited contents").unwrap();
+        fs::remove_file(content.join("b.txt")).unwrap();
+        // Unreadable files prove that no content is read.
+        for name in ["a.txt", "new-00.txt"] {
+            fs::set_permissions(content.join(name), fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let before = snapshot();
+        let scan = |extra: &[&str]| {
+            let mut command = archive(&temp);
+            command
+                .arg("--json")
+                .args([
+                    "location",
+                    "scan",
+                    "--path",
+                    path,
+                    "--collection",
+                    "Files",
+                    "--dry-run",
+                ])
+                .args(extra);
+            command.output().unwrap()
+        };
+        let planned = scan(&[]);
+        assert_eq!(planned.status.code(), Some(10));
+        let planned = json(&planned);
+        let preview = &planned["preview"];
+        assert_eq!(planned["status"], "planned");
+        assert_eq!(preview["new_files"]["count"], 25);
+        assert_eq!(preview["new_files"]["paths"].as_array().unwrap().len(), 20);
+        assert_eq!(preview["new_files"]["truncated"], true);
+        assert_eq!(preview["new_files"]["paths"][0], "new-00.txt");
+        assert_eq!(preview["changed"]["paths"], serde_json::json!(["a.txt"]));
+        assert_eq!(preview["missing"]["paths"], serde_json::json!(["b.txt"]));
+        assert_eq!(preview["unchanged"], 1);
+        assert_eq!(planned["presence_stale"], 1);
+        assert_eq!(planned["actionable"], true);
+        let added = archive(&temp)
+            .args([
+                "--json",
+                "collection",
+                "add",
+                path,
+                "--collection",
+                "Files",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(added.status.code(), Some(10));
+        let added = json(&added);
+        assert_eq!(added["mode"], "add");
+        assert_eq!(
+            added["preview"]["missing"]["count"], 0,
+            "add never marks missing"
+        );
+        assert_eq!(snapshot(), before, "a dry run records nothing");
+
+        // After the matching real run only persistent corruption remains actionable.
+        for name in ["a.txt", "new-00.txt"] {
+            fs::set_permissions(content.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::write(content.join("a.txt"), b"original a").unwrap();
+        success(archive(&temp).args(["location", "scan", "--path", path, "--collection", "Files"]));
+        let clean = scan(&[]);
+        assert_eq!(
+            clean.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&clean.stdout)
+        );
+        assert_eq!(json(&clean)["actionable"], false);
+
+        // The suggested command covers the same files as the preview.
+        fs::create_dir(content.join("cache")).unwrap();
+        fs::write(content.join("cache/tmp.bin"), b"t").unwrap();
+        fs::write(content.join("late.txt"), b"late").unwrap();
+        let excluded = json(&scan(&["--exclude", "cache"]));
+        assert_eq!(
+            excluded["preview"]["new_files"]["paths"],
+            serde_json::json!(["late.txt"])
+        );
+        assert!(
+            excluded["next"]
+                .as_str()
+                .unwrap()
+                .ends_with("--exclude 'cache'"),
+            "{excluded}"
+        );
+        let added = json(
+            &archive(&temp)
+                .args([
+                    "--json",
+                    "collection",
+                    "add",
+                    path,
+                    "--collection",
+                    "Files",
+                    "--dry-run",
+                    "--exclude",
+                    "cache",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert!(
+            added["next"].as_str().unwrap().contains("--location "),
+            "{added}"
+        );
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()
@@ -4127,6 +4257,56 @@ mod unix {
             )
         );
         assert!(!repo.join("30-missing").exists());
+
+        // The metadata-only reimport re-recorded path metadata, so the preview and the
+        // real scan agree that the three content files must be read again.
+        let planned = json(
+            &archive(&temp)
+                .args([
+                    "--json",
+                    "location",
+                    "scan",
+                    "Unlocked Annex",
+                    "--path",
+                    repo.to_str().unwrap(),
+                    "--dry-run",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(planned["preview"]["changed"]["count"], 3, "{planned}");
+        let scanned = json(&success(archive(&temp).args([
+            "--json",
+            "location",
+            "scan",
+            "Unlocked Annex",
+            "--path",
+            repo.to_str().unwrap(),
+        ])));
+        assert_eq!(scanned["summary"]["confirmed_good"], 3);
+        // Small unlocked annex content and already recorded absence need no read or record.
+        for extra in [&[][..], &["--collection", "Files"][..]] {
+            let mut command = archive(&temp);
+            command.arg("--json");
+            if extra.is_empty() {
+                command.args([
+                    "location",
+                    "scan",
+                    "Unlocked Annex",
+                    "--path",
+                    repo.to_str().unwrap(),
+                    "--dry-run",
+                ]);
+            } else {
+                command
+                    .args(["collection", "add", repo.to_str().unwrap(), "--dry-run"])
+                    .args(extra);
+            }
+            let output = command.output().unwrap();
+            let preview = json(&output);
+            assert_eq!(output.status.code(), Some(0), "{preview}");
+            assert_eq!(preview["preview"]["uncertain"]["count"], 0);
+        }
     }
 
     #[test]
@@ -4596,8 +4776,54 @@ mod unix {
         );
         drop(database);
 
+        let preview = |repo: &Path| {
+            let output = archive(&temp)
+                .args([
+                    "--json",
+                    "location",
+                    "scan",
+                    "--path",
+                    repo.to_str().unwrap(),
+                    "--collection",
+                    "Files",
+                    "--dry-run",
+                ])
+                .output()
+                .unwrap();
+            (output.status.code(), json(&output))
+        };
+        let (code, before_get) = preview(&repo);
+        assert_eq!(
+            code,
+            Some(0),
+            "an imported, scanned annex Location has nothing to record"
+        );
+        assert_eq!(before_get["actionable"], false);
+        // An unresolvable registered link makes the real scan partial, so the preview
+        // lists it as unreadable and predicts no missing files.
+        fs::remove_file(repo.join("present.txt")).unwrap();
+        symlink(repo.join(&present_target), repo.join("present.txt")).unwrap();
+        let (code, broken) = preview(&repo);
+        assert_eq!(code, Some(10));
+        assert_eq!(
+            broken["preview"]["unreadable"]["paths"],
+            serde_json::json!(["present.txt"])
+        );
+        assert_eq!(broken["preview"]["complete_coverage"], false);
+        assert_eq!(broken["preview"]["missing"]["count"], 0);
+        fs::remove_file(repo.join("present.txt")).unwrap();
+        symlink(&present_target, repo.join("present.txt")).unwrap();
+        assert_eq!(preview(&repo).0, Some(0));
         fs::create_dir_all(repo.join(&absent_target).parent().unwrap()).unwrap();
         fs::write(repo.join(&absent_target), absent_content).unwrap();
+        // Newly retrieved annex content is found from the object file's metadata.
+        let (code, retrieved) = preview(&repo);
+        assert_eq!(code, Some(10));
+        let read = ["new_files", "new_at_location", "changed", "needs_reading"]
+            .iter()
+            .map(|category| retrieved["preview"][category]["count"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(read, 1, "{retrieved}");
         let after_get = json(&success(archive(&temp).args([
             "--json",
             "location",
@@ -4610,6 +4836,11 @@ mod unix {
         // Only the newly retrieved content is read; already verified copies are skipped.
         assert_eq!(after_get["summary"]["confirmed_good"], 1);
         assert_eq!(after_get["summary"]["unchanged_files"], 2);
+        assert_eq!(
+            preview(&repo).1["actionable"],
+            false,
+            "clean after the matching real run"
+        );
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         assert_eq!(
             database

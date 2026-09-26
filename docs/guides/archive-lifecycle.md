@@ -172,12 +172,24 @@ While a Location has an unfinished scan, a new `location scan` of it is refused 
 so progress is never discarded silently. See
 [Verify bytes and resume work](../../README.md#verify-bytes-and-resume-work).
 
-Currently no command lists files in a directory that the Collection does not track. Scan and add
-have no dry run yet. Do not use a command that changes the catalog just to find out.
+To see what a scan or add would do before running it, add `--dry-run`. It lists new, changed,
+and missing files from metadata alone, reads no file content, and records nothing. It exits with
+code 10 when there is something to record:
+
+```bash
+cd ~/Documents
+archive location scan --dry-run
+archive collection add . --collection "Documents" --dry-run
+```
+
+Files copied into a Location by hand appear as new at that Location; add them with
+`collection add`, or use `archive copy` next time, which records copies as it writes them.
 
 ## 7. Routine maintenance
 
-Start with the summary views. They read the local SQLite catalog and do not touch storage:
+Start with the summary views. They read the local SQLite catalog and do not touch storage.
+`archive location scan --dry-run` (step 6) shows what has changed on a connected disk before you
+record it:
 
 ```bash
 archive status

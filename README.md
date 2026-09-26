@@ -333,8 +333,19 @@ A complete reconciliation is explicit:
 
 ```bash
 cd /srv/archive/documents
+archive location scan --dry-run
 archive location scan
 ```
+
+`--dry-run` on `location scan` or `collection add` previews the run from metadata alone. It
+lists new files, files known elsewhere but not recorded at this Location, size or time changes,
+corrupt or unverified copies that would be read, files that would be marked missing (complete
+scan only), and copies whose presence or verification is due. It reads no file content, writes
+nothing, and exits with code 10 when a real run would record something. It cannot predict
+integrity results. Unlocked annex pointer files are recognized from their size; a small
+annex-tracked file that is neither unchanged, its recorded content size, nor a pointer's size is
+listed as uncertain, because telling requires reading it. Like a scan, the preview refuses while
+the Location has an unfinished scan job.
 
 On a terminal, `location scan` and `collection add` show live progress on stderr. Each first
 prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
