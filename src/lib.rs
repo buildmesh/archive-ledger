@@ -128,6 +128,7 @@ pub use v2_snapshot::{
 pub use v2_store::{
     initialize_v2_archive, is_v2_event_tree, EnrollmentRequestBody, PortableSnapshotManifestBody,
     SignedEnrollmentRequest, SignedPortableSnapshotManifest, V2AppendResult,
-    V2ArchiveInitialization, V2CanonicalCursor, V2CoordinationLease, V2OriginCursor, V2OriginStore,
-    V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport, VerifiedV2Client,
+    V2ArchiveInitialization, V2CanonicalCursor, V2CatalogProtection, V2CoordinationLease,
+    V2OriginCursor, V2OriginStore, V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport,
+    VerifiedV2Client,
 };

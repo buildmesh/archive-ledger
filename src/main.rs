@@ -2399,6 +2399,8 @@ fn execute_v2_clone(
         }
         let store = V2OriginStore::open(&canonical)?;
         let verified = store.verification_report()?;
+        // The verified clone is exactly the remote's history; git clone names it origin.
+        let _ = store.record_synced_head("origin");
         let archive_name = store.verify()?.genesis.body.archive_display_name;
         let known = central_archive(&verified.archive_id, &archive_name)?;
         if known.root.exists() {
@@ -5025,12 +5027,14 @@ fn execute_v2_status(cli: &Cli) -> Result<u8, AppError> {
         .any(|(_, summary)| summary.files_at_risk > 0 || summary.files_uncertain > 0)
         || status.unresolved_conflicts > 0;
     let (unfinished_jobs, local_jobs_error) = unfinished_v2_job_ids(&database)?;
+    let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
                 "unfinished_jobs": unfinished_jobs.len(),
+                "catalog_protection": catalog_protection_json(&protection),
                 "local_jobs_error": local_jobs_error,
                 "archive_id": status.archive_id,
                 "archive_name": status.archive_name,
@@ -5084,6 +5088,7 @@ fn execute_v2_status(cli: &Cli) -> Result<u8, AppError> {
         if let Some(error) = local_jobs_error {
             println!("WARNING: cannot inspect local job directories: {error}");
         }
+        print_catalog_protection_warning(&protection);
     }
     Ok(if has_findings { EXIT_FINDINGS } else { EXIT_OK })
 }
@@ -7058,11 +7063,13 @@ fn execute_v2_init(
     let mut registry = CatalogRegistry::load()?;
     let became_default = registry.archives().is_empty() || make_default;
     registry.register(known_archive.clone(), make_default)?;
+    let protection = v2_catalog_protection(&known_archive.root.join("canonical"));
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
+                "catalog_protection": catalog_protection_json(&protection),
                 "archive_id": initialized.archive_id,
                 "archive_name": initialized.archive_name,
                 "origin_id": initialized.origin_id,
@@ -7081,6 +7088,7 @@ fn execute_v2_init(
         println!();
         println!("Next: go to the directory containing your files and run:");
         println!("  archive collection init --name <name>");
+        print_catalog_protection_warning(&protection);
     }
     Ok(EXIT_OK)
 }
@@ -10957,8 +10965,11 @@ fn execute_v2_collection_add(
             EXIT_OK
         });
     }
+    let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        let mut output = serde_json::to_value(&result)?;
+        output["catalog_protection"] = catalog_protection_json(&protection);
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Added files to Collection \"{}\".", collection.display_name);
         println!(
@@ -10989,6 +11000,7 @@ fn execute_v2_collection_add(
     }
     if !cli.json {
         print_v2_inventory_findings(&result.summary);
+        print_catalog_protection_warning(&protection);
     }
     Ok(
         if result.summary.read_errors > 0
@@ -11049,6 +11061,64 @@ fn refuse_unfinished_v2_scans(
         location: format!("Location \"{location_name}\""),
         jobs,
     })
+}
+
+/// After a successful command, failing to inspect protection must not turn completed
+/// work into an error; the failure is reported instead of being silent.
+type CatalogProtection = Result<archive_ledger::V2CatalogProtection, String>;
+
+fn v2_catalog_protection(events: &Path) -> CatalogProtection {
+    V2OriginStore::open(events)
+        .and_then(|store| store.catalog_protection())
+        .map_err(|error| error.to_string())
+}
+
+fn catalog_protection_json(protection: &CatalogProtection) -> serde_json::Value {
+    match protection {
+        Ok(protection) => json!({
+            "sync_remotes": protection.sync_remotes,
+            "unsynced_commits": protection.unsynced_commits,
+            "next": catalog_protection_next(*protection),
+            "error": null,
+        }),
+        Err(error) => json!({
+            "sync_remotes": null,
+            "unsynced_commits": null,
+            "next": null,
+            "error": error,
+        }),
+    }
+}
+
+fn catalog_protection_next(
+    protection: archive_ledger::V2CatalogProtection,
+) -> Option<&'static str> {
+    match (protection.unsynced_commits, protection.sync_remotes) {
+        (0, _) => None,
+        (_, 0) => Some("archive sync remote add <name> <locator>, then archive sync"),
+        _ => Some("archive sync"),
+    }
+}
+
+/// One line, only while local catalog history is not known to be on a sync remote
+/// or when that cannot be checked.
+fn print_catalog_protection_warning(protection: &CatalogProtection) {
+    let protection = match protection {
+        Ok(protection) => *protection,
+        Err(error) => {
+            println!("WARNING: cannot check whether catalog history is on a sync remote: {error}");
+            return;
+        }
+    };
+    if let Some(next) = catalog_protection_next(protection) {
+        let commits = match protection.unsynced_commits {
+            1 => "1 catalog commit is".to_owned(),
+            count => format!("{count} catalog commits are"),
+        };
+        println!(
+            "WARNING: {commits} not yet on a sync remote; a local Git commit is not a backup. Next: {next}"
+        );
+    }
 }
 
 /// Human mode only: announce the job before any long work so an interrupted
@@ -11224,8 +11294,11 @@ fn execute_v2_location_scan(
             EXIT_OK
         });
     }
+    let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        let mut output = serde_json::to_value(&result)?;
+        output["catalog_protection"] = catalog_protection_json(&protection);
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Location scan complete for \"{}\".", location.display_name);
         println!(
@@ -11247,6 +11320,7 @@ fn execute_v2_location_scan(
     }
     if !cli.json {
         print_v2_inventory_findings(&result.summary);
+        print_catalog_protection_warning(&protection);
     }
     Ok(
         if result.summary.read_errors > 0
@@ -13141,11 +13215,13 @@ fn prepare_v2_filesystem_setup(
 }
 
 fn print_v2_filesystem_setup(cli: &Cli, setup: &V2FilesystemSetup) -> Result<(), AppError> {
+    let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
+                "catalog_protection": catalog_protection_json(&protection),
                 "collection": setup.collection,
                 "location": setup.location,
                 "device": setup.device,
@@ -13179,6 +13255,7 @@ fn print_v2_filesystem_setup(cli: &Cli, setup: &V2FilesystemSetup) -> Result<(),
             "Next: archive collection add . --collection {}",
             shell_quote(&setup.collection.display_name)
         );
+        print_catalog_protection_warning(&protection);
     }
     Ok(())
 }
@@ -13247,11 +13324,12 @@ fn execute_v2_annex_setup(
     } else {
         "Paused"
     });
+    // A paused import has published nothing, so protection is not reported.
+    let protection = (result.status == AnnexImportStatus::Complete)
+        .then(|| v2_catalog_protection(cli.events_path()));
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "version": 2,
+        let mut output = json!({
+            "version": 2,
                 "collection": setup.collection,
                 "location": setup.location,
                 "device": setup.device,
@@ -13265,8 +13343,11 @@ fn execute_v2_annex_setup(
                     "git_head_commit": result.git_head_commit,
                     "summary": result.summary,
                 }
-            }))?
-        );
+        });
+        if let Some(protection) = &protection {
+            output["catalog_protection"] = catalog_protection_json(protection);
+        }
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         if result.status == AnnexImportStatus::Interrupted {
             println!(
@@ -13300,6 +13381,9 @@ fn execute_v2_annex_setup(
                 "  Integrity findings: {} mismatched; {} read errors",
                 result.summary.mismatched, result.summary.read_errors
             );
+        }
+        if let Some(protection) = &protection {
+            print_catalog_protection_warning(protection);
         }
     }
     Ok(

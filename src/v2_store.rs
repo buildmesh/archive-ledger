@@ -449,6 +449,17 @@ pub struct V2SyncResult {
     pub merged: bool,
 }
 
+/// Whether local catalog history is known to exist on a sync remote.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct V2CatalogProtection {
+    pub sync_remotes: usize,
+    /// Local canonical commits not known to be on any configured sync remote.
+    pub unsynced_commits: u64,
+}
+
+const SYNCED_REF_PREFIX: &str = "refs/archive-ledger/synced/";
+const FETCHED_REF_PREFIX: &str = "refs/archive-ledger/fetched/";
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct V2SyncRemote {
     pub name: String,
@@ -713,7 +724,9 @@ impl V2OriginStore {
             &self.root,
             "add synchronization remote",
             &["remote", "add", name, locator],
-        )
+        )?;
+        // A reused name may point somewhere new; earlier knowledge must not count.
+        self.forget_remote_state(name)
     }
 
     pub fn remove_sync_remote(&self, name: &str) -> Result<()> {
@@ -722,6 +735,40 @@ impl V2OriginStore {
             &self.root,
             "remove synchronization remote",
             &["remote", "remove", name],
+        )?;
+        self.forget_remote_state(name)
+    }
+
+    fn forget_remote_state(&self, name: &str) -> Result<()> {
+        for prefix in [SYNCED_REF_PREFIX, FETCHED_REF_PREFIX] {
+            let reference = format!("{prefix}{name}");
+            let listed = git_stdout(
+                &self.root,
+                "list synchronization refs",
+                &["for-each-ref", "--format=%(refname)", &reference],
+            )?;
+            if listed.lines().any(|line| line == reference) {
+                run_git(
+                    &self.root,
+                    "forget synchronization ref",
+                    &["update-ref", "-d", &reference],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Records that `remote` holds the current local commit, e.g. right after cloning from it.
+    pub fn record_synced_head(&self, remote: &str) -> Result<()> {
+        validate_remote_name(remote)?;
+        run_git(
+            &self.root,
+            "record synchronized commit",
+            &[
+                "update-ref",
+                &format!("{SYNCED_REF_PREFIX}{remote}"),
+                "HEAD",
+            ],
         )
     }
 
@@ -831,13 +878,64 @@ impl V2OriginStore {
         Ok(appended)
     }
 
+    /// Synchronizes with `remote`, then records the accepted commit, which every
+    /// successful path leaves on the remote, so protection can be reported offline.
     pub fn sync_remote(&self, remote: &str) -> Result<V2SyncResult> {
+        let result = self.sync_remote_unrecorded(remote)?;
+        // Advisory only: the sync already succeeded, and a missing record merely
+        // makes the protection warning more cautious.
+        let _ = run_git(
+            &self.root,
+            "record synchronized commit",
+            &[
+                "update-ref",
+                &format!("{SYNCED_REF_PREFIX}{remote}"),
+                &result.accepted_commit,
+            ],
+        );
+        Ok(result)
+    }
+
+    /// Local canonical commits not known to be on any configured sync remote.
+    /// Known means reachable from the commit recorded after a successful sync,
+    /// or from the remote state last fetched. Computed without network access.
+    pub fn catalog_protection(&self) -> Result<V2CatalogProtection> {
+        let remotes = self.sync_remotes()?;
+        let mut known = Vec::new();
+        for remote in &remotes {
+            for prefix in [SYNCED_REF_PREFIX, FETCHED_REF_PREFIX] {
+                let name = format!("{prefix}{}", remote.name);
+                let listed = git_stdout(
+                    &self.root,
+                    "list synchronization refs",
+                    &["for-each-ref", "--format=%(refname)", &name],
+                )?;
+                if listed.lines().any(|line| line == name) {
+                    known.push(name);
+                }
+            }
+        }
+        let mut args = vec!["rev-list", "--count", "HEAD"];
+        if !known.is_empty() {
+            args.push("--not");
+            args.extend(known.iter().map(String::as_str));
+        }
+        let count = git_stdout(&self.root, "count unsynchronized commits", &args)?;
+        Ok(V2CatalogProtection {
+            sync_remotes: remotes.len(),
+            unsynced_commits: count.trim().parse().map_err(|_| {
+                V2StoreError::Invalid("git rev-list returned an invalid count".to_owned())
+            })?,
+        })
+    }
+
+    fn sync_remote_unrecorded(&self, remote: &str) -> Result<V2SyncResult> {
         configured_remote_locator(&self.root, remote)?;
         ensure_git_clean(&self.root)?;
         let local_verified = self.verify_compact()?;
         let local_before =
             git_stdout(&self.root, "read local sync commit", &["rev-parse", "HEAD"])?;
-        let remote_ref = format!("refs/archive-ledger/fetched/{remote}");
+        let remote_ref = format!("{FETCHED_REF_PREFIX}{remote}");
         for _attempt in 0..4 {
             let remote_before = remote_archive_commit(&self.root, remote)?;
             let Some(remote_commit) = remote_before.clone() else {

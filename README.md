@@ -774,6 +774,13 @@ archive sync
 archive sync status
 ```
 
+Until catalog history is on a sync remote, `archive status` and commands that change the catalog
+(`init`, `collection init`, annex import, `collection add`, `location scan`) print one warning with
+the next step, for example `WARNING: 3 catalog commits are not yet on a sync remote; … Next:
+archive sync`. The warning stops once `archive sync` has sent the history to a configured
+remote. Put that remote on another device and site: Archive Ledger does not yet check whether it is
+independent.
+
 `archive sync [remote]` fetches and verifies both histories before changing accepted state. A
 fast-forward remains a fast-forward; compatible offline additions from different enrolled
 installations become one Git merge commit whose tree is the verified union of immutable origin

@@ -334,8 +334,14 @@ mod unix {
         let canonical = root(&temp).join("canonical");
         let unavailable = root(&temp).join("canonical-unavailable");
         fs::rename(&canonical, &unavailable).unwrap();
-        let cached = json(&success(archive(&temp).args(["--json", "status"])));
-        assert_eq!(before, cached, "normal status is served by SQLite");
+        let mut cached = json(&success(archive(&temp).args(["--json", "status"])));
+        // Protection is read from canonical Git and reports why it is unknown without it.
+        assert!(before["catalog_protection"]["error"].is_null());
+        assert!(cached["catalog_protection"]["error"].is_string());
+        let mut before_sqlite = before.clone();
+        before_sqlite["catalog_protection"] = Value::Null;
+        cached["catalog_protection"] = Value::Null;
+        assert_eq!(before_sqlite, cached, "normal status is served by SQLite");
         fs::rename(&unavailable, &canonical).unwrap();
 
         let verification = json(&success(
@@ -1696,6 +1702,96 @@ mod unix {
         assert!(!scan(&[]).status.success());
         success(archive(&temp).args(["job", "cancel", "job_second"]));
         assert!(scan(&[]).status.success());
+    }
+
+    #[test]
+    fn catalog_protection_warns_until_history_is_synced_to_a_remote() {
+        let (temp, content) = immutable_files_fixture();
+        let status = |temp: &TempDir| {
+            String::from_utf8(archive(temp).arg("status").output().unwrap().stdout).unwrap()
+        };
+        let protection = |temp: &TempDir| {
+            json(&archive(temp).args(["--json", "status"]).output().unwrap())["catalog_protection"]
+                .clone()
+        };
+        let unprotected = protection(&temp);
+        assert_eq!(unprotected["sync_remotes"], 0);
+        assert!(unprotected["unsynced_commits"].as_u64().unwrap() > 0);
+        assert!(status(&temp).contains(
+            "not yet on a sync remote; a local Git commit is not a backup. Next: archive sync remote add"
+        ));
+
+        let remote = temp.path().join("central.git");
+        fs::create_dir(&remote).unwrap();
+        git_success(&remote, &["init", "--bare", "--quiet"]);
+        success(archive(&temp).args([
+            "sync",
+            "remote",
+            "add",
+            "central",
+            remote.to_str().unwrap(),
+        ]));
+        assert_eq!(protection(&temp)["next"], "archive sync");
+        success(archive(&temp).args(["sync"]));
+        let synced = protection(&temp);
+        assert_eq!(synced["unsynced_commits"], 0);
+        assert!(synced["next"].is_null());
+        assert!(!status(&temp).contains("sync remote"));
+
+        // New catalog work is unprotected again until the next sync.
+        fs::write(content.join("d.txt"), b"d").unwrap();
+        let added = json(&success(archive(&temp).args([
+            "--json",
+            "collection",
+            "add",
+            content.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ])));
+        assert_eq!(added["catalog_protection"]["unsynced_commits"], 1);
+        let scanned = String::from_utf8(
+            success(archive(&temp).args([
+                "location",
+                "scan",
+                "--path",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ]))
+            .stdout,
+        )
+        .unwrap();
+        assert!(scanned.contains("WARNING: 2 catalog commits are not yet on a sync remote"));
+        success(archive(&temp).args(["sync"]));
+        assert_eq!(protection(&temp)["unsynced_commits"], 0);
+
+        // A clone holds exactly the remote's history.
+        let clone_env = TempDir::new().unwrap();
+        success(archive(&clone_env).args(["sync", "clone", remote.to_str().unwrap()]));
+        assert_eq!(protection(&clone_env)["unsynced_commits"], 0);
+
+        // Re-pointing a remote name at new storage must not inherit earlier knowledge.
+        let empty = temp.path().join("empty.git");
+        fs::create_dir(&empty).unwrap();
+        git_success(&empty, &["init", "--bare", "--quiet"]);
+        success(archive(&temp).args(["sync", "remote", "remove", "central", "--yes"]));
+        success(archive(&temp).args(["sync", "remote", "add", "central", empty.to_str().unwrap()]));
+        assert!(protection(&temp)["unsynced_commits"].as_u64().unwrap() > 0);
+        assert!(status(&temp).contains("not yet on a sync remote"));
+
+        // If protection cannot be checked, say so instead of looking protected.
+        git_success(
+            &root(&temp).join("canonical"),
+            &[
+                "remote",
+                "add",
+                "unsupported",
+                "https://user@example.invalid/x.git",
+            ],
+        );
+        assert!(protection(&temp)["error"].is_string());
+        assert!(status(&temp)
+            .contains("WARNING: cannot check whether catalog history is on a sync remote"));
     }
 
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
