@@ -1448,6 +1448,156 @@ mod unix {
         assert!(status["local_jobs_error"].is_string());
     }
 
+    #[test]
+    fn job_cancel_removes_only_the_unfinished_jobs_local_files() {
+        let (temp, content) = immutable_files_fixture();
+        fs::write(content.join("d.txt"), b"d").unwrap();
+        let path = content.to_str().unwrap();
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            path,
+            "--collection",
+            "Files",
+            "--job-id",
+            "job_scan",
+            "--max-items",
+            "1",
+        ]));
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            path,
+            "--collection",
+            "Files",
+            "--job-id",
+            "job_add",
+            "--max-items",
+            "1",
+        ]));
+        let jobs = root(&temp).join("local/jobs");
+        let other_before = fs::read_dir(jobs.join("job_add")).unwrap().count();
+
+        let planned = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "cancel",
+            "job_scan",
+            "--dry-run",
+        ])));
+        assert_eq!(planned["status"], "planned");
+        assert!(planned["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["name"] == "inventory-items.jsonl"));
+        assert!(jobs.join("job_scan/inventory-config.json").is_file());
+
+        // A live run holds the job lock; cancel must refuse and delete nothing.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root(&temp).join("local/job-locks/job_scan.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        let busy = archive(&temp)
+            .args(["job", "cancel", "job_scan"])
+            .output()
+            .unwrap();
+        assert!(!busy.status.success());
+        assert!(String::from_utf8_lossy(&busy.stderr).contains("job_busy"));
+        assert!(jobs.join("job_scan/inventory-config.json").is_file());
+        drop(lock);
+
+        let cancelled = json(&success(
+            archive(&temp).args(["--json", "job", "cancel", "job_scan"]),
+        ));
+        assert_eq!(cancelled["status"], "cancelled");
+        assert_eq!(cancelled["job_type"], "location_scan");
+        assert!(!jobs.join("job_scan").exists());
+        assert_eq!(
+            fs::read_dir(jobs.join("job_add")).unwrap().count(),
+            other_before
+        );
+        let shown = json(&success(
+            archive(&temp).args(["--json", "job", "show", "job_scan"]),
+        ));
+        assert_eq!(shown["status"], "cancelled");
+        for args in [
+            vec!["job", "resume", "job_scan"],
+            vec!["job", "cancel", "job_scan"],
+            vec![
+                "location",
+                "scan",
+                "--path",
+                path,
+                "--collection",
+                "Files",
+                "--job-id",
+                "job_scan",
+            ],
+        ] {
+            let refused = archive(&temp).args(&args).output().unwrap();
+            assert!(!refused.status.success(), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("cancelled"),
+                "{args:?}"
+            );
+        }
+        success(archive(&temp).args(["fsck"]));
+        // A cleanup interrupted after the row was marked cancelled can be finished.
+        fs::create_dir(jobs.join("job_scan")).unwrap();
+        fs::write(jobs.join("job_scan/inventory-items.jsonl"), b"{}").unwrap();
+        success(archive(&temp).args(["job", "cancel", "job_scan"]));
+        assert!(!jobs.join("job_scan").exists());
+
+        let resumed = json(&success(
+            archive(&temp).args(["--json", "job", "resume", "job_add"]),
+        ));
+        assert_eq!(resumed["status"], "complete");
+        let finished = archive(&temp)
+            .args(["job", "cancel", "job_add"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&finished.stderr).contains("already complete"));
+        assert!(
+            !String::from_utf8_lossy(&finished.stderr).contains("invalid inventory configuration")
+        );
+
+        // db rebuild drops the unpublished row; the local job is still cancellable.
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            path,
+            "--collection",
+            "Files",
+            "--job-id",
+            "job_local",
+            "--max-items",
+            "1",
+        ]));
+        success(archive(&temp).args(["db", "rebuild"]));
+        let planned = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "cancel",
+            "job_local",
+            "--dry-run",
+        ])));
+        assert_eq!(planned["job_type"], "location_scan");
+        assert!(jobs.join("job_local").is_dir());
+        success(archive(&temp).args(["job", "cancel", "job_local"]));
+        assert!(!jobs.join("job_local").exists());
+        let gone = archive(&temp)
+            .args(["job", "resume", "job_local"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&gone.stderr).contains("not found"));
+        success(archive(&temp).args(["fsck"]));
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()

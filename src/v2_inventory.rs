@@ -26,6 +26,18 @@ use crate::v2_store::{V2AppendResult, V2OriginStore, V2StoreError};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Every file an inventory job may leave in its local job directory.
+const INVENTORY_JOB_FILES: [&str; 8] = [
+    "inventory-config.json",
+    "inventory-items.jsonl",
+    "inventory-seen.sqlite3",
+    "inventory-seen.sqlite3-wal",
+    "inventory-seen.sqlite3-shm",
+    "inventory-seen.sqlite3-journal",
+    "inventory-summary.json",
+    "inventory-summary.json.tmp",
+];
+
 mod acceptance;
 pub use acceptance::{preview_changes, V2ChangePreview};
 use acceptance::{selected_files, validate_selected_path};
@@ -60,6 +72,8 @@ pub enum V2InventoryError {
     },
     #[error("invalid inventory configuration: {0}")]
     Invalid(String),
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl V2InventoryError {
@@ -72,6 +86,7 @@ impl V2InventoryError {
             Self::Io { .. } => "v2_inventory_io",
             Self::Sqlite { .. } => "v2_inventory_sqlite",
             Self::Invalid(_) => "v2_inventory_invalid",
+            Self::Refused(_) => "v2_inventory_refused",
         }
     }
 }
@@ -307,6 +322,12 @@ pub fn add_files(
             None
         };
     let initial_apply = apply_with_progress(store, projection, progress)?;
+    if job_status(projection.path(), &config.job_id)?.as_deref() == Some("cancelled") {
+        return Err(V2InventoryError::Refused(format!(
+            "job {} was cancelled; start a new scan with a different job ID",
+            config.job_id
+        )));
+    }
     validate_scope(projection.path(), config)?;
     let job_type = if config.scan_mode == ScanMode::Add {
         "inventory_add"
@@ -361,17 +382,9 @@ pub fn add_files(
         if let Some(progress) = progress {
             progress.scan_summary(&summary);
         }
-        job.cleanup(&[
-            "inventory-config.json",
-            "inventory-items.jsonl",
-            "inventory-seen.sqlite3",
-            "inventory-seen.sqlite3-wal",
-            "inventory-seen.sqlite3-shm",
-            "inventory-seen.sqlite3-journal",
-            "inventory-summary.json",
-            "inventory-summary.json.tmp",
-        ])
-        .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
+        job.cleanup(&INVENTORY_JOB_FILES).map_err(|source| {
+            io_error("remove completed inventory job files", &job_root, source)
+        })?;
         return Ok(V2InventoryResult {
             version: 2,
             status: "complete".to_owned(),
@@ -1312,17 +1325,8 @@ pub fn add_files(
         )?
     };
     let apply = apply_with_progress(store, projection, progress)?;
-    job.cleanup(&[
-        "inventory-config.json",
-        "inventory-items.jsonl",
-        "inventory-seen.sqlite3",
-        "inventory-seen.sqlite3-wal",
-        "inventory-seen.sqlite3-shm",
-        "inventory-seen.sqlite3-journal",
-        "inventory-summary.json",
-        "inventory-summary.json.tmp",
-    ])
-    .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
+    job.cleanup(&INVENTORY_JOB_FILES)
+        .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
     Ok(V2InventoryResult {
         version: 2,
         status: completion_status.to_owned(),
@@ -1332,6 +1336,167 @@ pub fn add_files(
         append: Some(append),
         apply: Some(apply),
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2CancelResult {
+    pub version: u32,
+    /// `cancelled`, or `planned` for a dry run.
+    pub status: String,
+    pub job_id: String,
+    pub job_type: String,
+    pub files: Vec<V2CancelledFile>,
+    pub bytes: u64,
+    /// Cancel first finished an interrupted catalog publication, as resume does.
+    pub finished_interrupted_publication: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2CancelledFile {
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+/// Abandons an unfinished location scan or inventory add job. An unfinished
+/// scan has published nothing canonical, so this marks the local job row
+/// cancelled and removes only that job's known local files. A dry run changes
+/// nothing. Rerunning on a cancelled job removes files a failed cleanup left.
+pub fn cancel_job(
+    store: &V2OriginStore,
+    projection: &V2ProjectionDb,
+    job_id: &str,
+    dry_run: bool,
+) -> Result<V2CancelResult> {
+    let archive_root = projection
+        .path()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let job = JobDirectory::new(archive_root, job_id)
+        .map_err(|source| io_error("prepare inventory job path", archive_root, source))?;
+    let _job_lock = job.try_lock().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            V2InventoryError::JobBusy(job_id.to_owned())
+        } else {
+            io_error("lock inventory job", job.path(), source)
+        }
+    })?;
+    let mut finished_interrupted_publication = false;
+    if !dry_run {
+        // A run interrupted after its batch reached canonical history but before
+        // its Git commit or projection is complete, not cancellable. Settle that
+        // first, as resume does, so the row reflects canonical completion.
+        finished_interrupted_publication = store.recover_pending_publication()?.is_some();
+        projection.apply(store)?;
+    }
+    let connection = Connection::open_with_flags(
+        projection.path(),
+        if dry_run {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            OpenFlags::default()
+        },
+    )
+    .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT job_type, status FROM jobs WHERE job_id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
+    let (job_type, status) = match row {
+        Some(row) => row,
+        // db rebuild drops unpublished job rows; the local configuration names the
+        // job type. Read it under the lock already held rather than re-locking.
+        None => {
+            let config = job
+                .read_optional("inventory-config.json")
+                .map_err(|source| io_error("read inventory job configuration", job.path(), source))?
+                .ok_or_else(|| {
+                    V2InventoryError::Refused(format!(
+                        "job {job_id} is not in the catalog database and has no local scan configuration"
+                    ))
+                })?;
+            let config: serde_json::Value = serde_json::from_slice(&config).map_err(|error| {
+                V2InventoryError::Invalid(format!(
+                    "inventory job configuration is invalid: {error}"
+                ))
+            })?;
+            let job_type = match config["scan_mode"].as_str() {
+                Some("add") => "inventory_add",
+                Some("complete") => "location_scan",
+                _ => {
+                    return Err(V2InventoryError::Invalid(
+                        "inventory job configuration has an invalid scan mode".to_owned(),
+                    ))
+                }
+            };
+            (job_type.to_owned(), "local_only".to_owned())
+        }
+    };
+    if !matches!(job_type.as_str(), "location_scan" | "inventory_add") {
+        return Err(V2InventoryError::Refused(format!(
+            "job cancel supports location scan and collection add jobs; {job_id} is {job_type}"
+        )));
+    }
+    let files = job
+        .existing_file_sizes(&INVENTORY_JOB_FILES)
+        .map_err(|source| io_error("inspect inventory job files", job.path(), source))?;
+    match status.as_str() {
+        "running" | "local_only" => {}
+        "cancelled" if !files.is_empty() => {}
+        other => {
+            return Err(V2InventoryError::Refused(format!(
+                "job {job_id} is already {other}"
+            )))
+        }
+    }
+    // A local-only job has no row to mark; removing its files is the whole cancel.
+    if !dry_run && status != "local_only" {
+        let finished = i64::try_from(now_utc_ms()?).map_err(|_| {
+            V2InventoryError::Invalid("system time exceeds SQLite range".to_owned())
+        })?;
+        connection
+            .execute(
+                "UPDATE jobs SET status = 'cancelled', finished_time_utc_ms = COALESCE(finished_time_utc_ms, ?2)
+                 WHERE job_id = ?1 AND status IN ('running', 'cancelled')",
+                params![job_id, finished],
+            )
+            .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
+    }
+    if !dry_run {
+        job.cleanup(&INVENTORY_JOB_FILES).map_err(|source| {
+            io_error("remove cancelled inventory job files", job.path(), source)
+        })?;
+    }
+    Ok(V2CancelResult {
+        version: 2,
+        status: if dry_run { "planned" } else { "cancelled" }.to_owned(),
+        job_id: job_id.to_owned(),
+        job_type,
+        bytes: files.iter().map(|(_, size)| size).sum(),
+        files: files
+            .into_iter()
+            .map(|(name, size_bytes)| V2CancelledFile { name, size_bytes })
+            .collect(),
+        finished_interrupted_publication,
+    })
+}
+
+fn job_status(database: &Path, job_id: &str) -> Result<Option<String>> {
+    Connection::open(database)
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT status FROM jobs WHERE job_id = ?1",
+                    [job_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .map_err(|source| inventory_sqlite_error(database, source))
 }
 
 fn apply_with_progress(

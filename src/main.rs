@@ -530,6 +530,13 @@ enum JobCommand {
         #[arg(long, hide = true)]
         max_items: Option<usize>,
     },
+    /// Abandon an unfinished location scan or collection add job and remove its local files.
+    Cancel {
+        job_id: String,
+        /// Show what would be removed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3465,6 +3472,11 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
             let job = local_job(database, job_id)?
                 .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
             print_jobs(cli.json, &[job])?;
+        }
+        JobCommand::Cancel { .. } => {
+            return Err(AppError::Input(
+                "job cancel requires a version 2 Archive".to_owned(),
+            ))
         }
         JobCommand::Resume { job_id, max_items } => {
             let job = local_job(database, job_id)?
@@ -8991,6 +9003,43 @@ fn execute_v2_job(
                 }
                 if job.status == "running" {
                     println!("Resume with: archive job resume {}", job.job_id);
+                }
+            }
+        }
+        JobCommand::Cancel { job_id, dry_run } => {
+            let store = V2OriginStore::open(cli.events_path())?;
+            let result = archive_ledger::v2_cancel_job(&store, database, job_id, *dry_run)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let size = format_bytes(result.bytes);
+                if *dry_run {
+                    println!(
+                        "Would cancel job {} ({}) and remove {} local files ({size}):",
+                        result.job_id,
+                        result.job_type,
+                        result.files.len()
+                    );
+                } else {
+                    println!(
+                        "Cancelled job {} ({}); removed {} local files ({size}).",
+                        result.job_id,
+                        result.job_type,
+                        result.files.len()
+                    );
+                }
+                if *dry_run {
+                    for file in &result.files {
+                        println!("  {} ({})", file.name, format_bytes(file.size_bytes));
+                    }
+                    println!(
+                        "Dry run: nothing changed. The preview does not finish an interrupted catalog publication; if one is pending, cancel may report the job already complete."
+                    );
+                } else {
+                    if result.finished_interrupted_publication {
+                        println!("Finished an interrupted catalog publication first.");
+                    }
+                    println!("This job had published nothing to catalog history.");
                 }
             }
         }

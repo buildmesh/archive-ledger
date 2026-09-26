@@ -379,6 +379,34 @@ impl JobDirectory {
         Err(unsupported_job_files())
     }
 
+    /// Sizes of the named regular files that exist; empty when the directory is absent.
+    #[cfg(unix)]
+    pub(crate) fn existing_file_sizes(&self, names: &[&str]) -> io::Result<Vec<(String, u64)>> {
+        let directory = match self.open_directory() {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut sizes = Vec::new();
+        for name in names {
+            validate_leaf_name(name)?;
+            match stat_at(&directory, name) {
+                Ok(stat) => {
+                    require_safe_regular_stat(&stat)?;
+                    sizes.push(((*name).to_owned(), stat.st_size as u64));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(sizes)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn existing_file_sizes(&self, _names: &[&str]) -> io::Result<Vec<(String, u64)>> {
+        Err(unsupported_job_files())
+    }
+
     /// Removes only known regular files, then removes the now-empty job directory.
     ///
     /// This deliberately avoids recursive deletion. An unexpected entry leaves the directory in

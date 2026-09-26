@@ -718,6 +718,7 @@ Long operations print durable job IDs:
 archive job list
 archive job show <job-id>
 archive job resume <job-id>
+archive job cancel <job-id> --dry-run
 ```
 
 `job list` shows unfinished jobs with their type, age and last recorded progress; add `--all` to
@@ -728,6 +729,11 @@ An unrecognized directory has no readable configuration and is kept for inspecti
 explains where an unfinished job stopped. After `db rebuild`, `job resume <job-id>` can recover
 annex and inventory work from this installation’s local checkpoint. Existing terminal job status
 still takes precedence; local checkpoints are not transferred by sync or portable snapshots.
+
+To abandon an unfinished location scan or collection add, run `archive job cancel <job-id>`.
+Preview it first with `--dry-run`. Cancel removes only that job's local checkpoint files,
+including jobs left only on disk after `db rebuild`. Its unpublished progress is lost; the job had
+published nothing to catalog history. A job that is still running elsewhere is refused.
 
 Resume first finishes a verified local publication interrupted between frontier advancement and
 its Git commit, then applies canonical events and reconciles deterministic outcomes. It does not
