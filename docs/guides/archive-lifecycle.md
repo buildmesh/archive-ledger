@@ -227,9 +227,9 @@ archive background run
 
 When a Policy report shows under-replicated Files, make another verified copy (step 4).
 `report integrity` lists corrupt copies and, for each, where verified copies of the same content
-are and whether they are connected. To repair one, copy a good file back over it (keep the corrupt
-bytes aside if unsure) and run `archive verify` on that Location to confirm. `copy` never
-overwrites an existing file, so it cannot do this for you. Check the catalog's own consistency
+are and whether they are connected. With a good copy connected, `archive repair <Location>
+--dry-run` shows the plan and `--yes` performs it. The corrupt bytes are kept in the Location's
+`.archive-ledger/quarantine` until you delete them. Check the catalog's own consistency
 occasionally:
 
 ```bash

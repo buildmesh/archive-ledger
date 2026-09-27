@@ -680,6 +680,23 @@ repair one by hand, copy a good file back over the corrupt one, keeping the corr
 if you are unsure, then run `archive verify` on that Location: corrupt copies are always
 re-read, and a matching read marks the copy good again.
 
+`archive repair` does that for you when a verified copy is connected:
+
+```bash
+archive repair "Photos on Blue disk" --dry-run
+archive repair "Photos on Blue disk" --yes
+```
+
+For each corrupt copy it re-reads the most recently verified connected copy of the same content
+while copying it, moves the corrupt file into `.archive-ledger/quarantine/<job-id>/` in the same
+Location, places the verified replacement with its original modification time and permissions,
+reads it back, and records it as verified. Scans ignore the quarantine; delete it when you are
+satisfied. A copy whose size or modification time changed may be an intentional edit, so it is
+skipped unless you pass `--include-changed` (accept a real edit with
+`collection add --accept-changes` instead). Without a connected verified copy it says so and
+changes nothing. Omit the Location to repair every connected Location with matching identity.
+It is resumable with `archive job resume`, and requires `--yes` when not interactive.
+
 The starter Policy requires two qualifying copies on two Devices at two Sites, including one
 offsite copy, with verification, presence, and Device check-in evidence no more than 365 days old.
 Update only the settings that should change, for example:
@@ -990,8 +1007,9 @@ fail closed if SQLite advances between pages.
   and refuses overwrite.
 - `copy` is an explicit mutation that creates only verified files at a registered destination
   Location. It refuses overwrite and never changes or deletes its source.
-- Generic traversal excludes every `.git` path, does not follow symlinks as ordinary files, and
-  does not cross filesystems.
+- Generic traversal excludes every `.git` path and every `.archive-ledger` path (repair's
+  quarantine) at any depth, does not follow symlinks as ordinary files, and does not cross
+  filesystems. Do not keep archive content in directories with either name.
 - A git-annex repository requires one successful import. Later add and scan operations use the
   imported catalog facts and direct filesystem reads without depending on Git or git-annex.
 - Imported annex symlinks are read only when both lexical and canonical checks keep the target
@@ -1002,7 +1020,11 @@ fail closed if SQLite advances between pages.
 - Positive-only add and every partial scan are incapable of publishing missing facts.
 - Complete missing activation is atomic and follows only confirmed complete coverage.
 - Registry changes and renames append canonical events; history is not rewritten.
-- No command deletes, drops, repairs, quarantines, or rewrites existing archive content.
+- `repair` is the one explicit command that replaces existing archive content: only a copy whose
+  bytes no longer match the catalog, only from a verified copy re-read during the repair, never
+  by overwriting (the corrupt file is moved into the Location's `.archive-ledger/quarantine`
+  first), and never automatically. No command deletes, drops, or otherwise rewrites existing
+  archive content.
 
 Background scanning of connected Devices and destructive Location-to-Location operations remain
 future work. Verified copy is available as both `archive copy` and the equivalent

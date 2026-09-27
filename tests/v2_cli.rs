@@ -2177,6 +2177,303 @@ mod unix {
         assert!(human.contains("then run archive verify"), "{human}");
     }
 
+    #[test]
+    fn repair_replaces_corrupt_copies_from_verified_sources_and_keeps_the_bytes() {
+        let (temp, content) = immutable_files_fixture();
+        let main = content.to_str().unwrap();
+        let backup = temp.path().join("backup");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("a.txt"), b"original a").unwrap();
+        fs::write(backup.join("b.txt"), b"original b").unwrap();
+        // A read-only directory, as git-annex object directories are.
+        for root in [&content, &backup] {
+            fs::create_dir(root.join("locked")).unwrap();
+            fs::write(root.join("locked/d.txt"), b"original d").unwrap();
+        }
+        success(archive(&temp).args(["collection", "add", main, "--collection", "Files"]));
+        success(archive(&temp).args([
+            "location",
+            "init",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Backup",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let backup_path = backup.to_str().unwrap();
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            backup_path,
+            "--collection",
+            "Files",
+        ]));
+        // Bit rot keeps size and modification time.
+        let rot = |path: &Path, bytes: &[u8]| {
+            let modified = fs::metadata(path).unwrap().modified().unwrap();
+            fs::write(path, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            modified
+        };
+        let a_modified = rot(&backup.join("a.txt"), b"original X");
+        rot(&backup.join("locked/d.txt"), b"original Q");
+        fs::set_permissions(backup.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        rot(&content.join("c.txt"), b"original Z");
+        // An edit changes size and modification time.
+        fs::write(backup.join("b.txt"), b"edited b, longer").unwrap();
+        for (location, path) in [("Backup", backup_path), ("Files on Test Device", main)] {
+            let _ = archive(&temp)
+                .args(["verify", location, "--path", path, "--all"])
+                .output()
+                .unwrap();
+        }
+        let _ = archive(&temp)
+            .args([
+                "location",
+                "scan",
+                "--path",
+                backup_path,
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        let repair = |extra: &[&str]| {
+            let mut command = archive(&temp);
+            command.arg("--json").arg("repair").args(extra);
+            command.output().unwrap()
+        };
+        let status = |report: &Value, logical: &str| {
+            report["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["logical_path"] == logical)
+                .unwrap()["status"]
+                .clone()
+        };
+
+        let before = fs::read(backup.join("a.txt")).unwrap();
+        let planned = repair(&["Backup", "--path", backup_path, "--dry-run"]);
+        assert_eq!(planned.status.code(), Some(10));
+        let planned = json(&planned);
+        assert_eq!(status(&planned, "a.txt"), "planned");
+        assert_eq!(
+            planned["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["logical_path"] == "a.txt")
+                .unwrap()["source"]["path"],
+            "a.txt"
+        );
+        assert_eq!(status(&planned, "b.txt"), "skipped_changed");
+        assert_eq!(
+            fs::read(backup.join("a.txt")).unwrap(),
+            before,
+            "a dry run changes nothing"
+        );
+        let main_plan = json(&repair(&[
+            "Files on Test Device",
+            "--path",
+            main,
+            "--dry-run",
+        ]));
+        assert_eq!(status(&main_plan, "c.txt"), "no_source");
+        let refused = repair(&["Backup", "--path", backup_path, "--non-interactive"]);
+        assert!(!refused.status.success());
+
+        let repaired = repair(&[
+            "Backup",
+            "--path",
+            backup_path,
+            "--yes",
+            "--job-id",
+            "job_repair",
+        ]);
+        assert_eq!(repaired.status.code(), Some(10), "b.txt remains unresolved");
+        let repaired = json(&repaired);
+        assert_eq!(status(&repaired, "a.txt"), "repaired");
+        assert_eq!(status(&repaired, "locked/d.txt"), "repaired");
+        assert_eq!(
+            fs::read(backup.join("locked/d.txt")).unwrap(),
+            b"original d"
+        );
+        assert_eq!(
+            fs::metadata(backup.join("locked"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o555,
+            "a read-only directory is restored"
+        );
+        assert_eq!(fs::read(backup.join("a.txt")).unwrap(), b"original a");
+        assert_eq!(
+            fs::metadata(backup.join("a.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            a_modified
+        );
+        let kept = backup.join(".archive-ledger/quarantine/job_repair/a.txt");
+        assert_eq!(
+            fs::read(&kept).unwrap(),
+            b"original X",
+            "the corrupt bytes are preserved"
+        );
+        assert_eq!(
+            fs::read(backup.join("b.txt")).unwrap(),
+            b"edited b, longer",
+            "an edit is left alone"
+        );
+        let rescanned = archive(&temp)
+            .args([
+                "--json",
+                "location",
+                "scan",
+                "--path",
+                backup_path,
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(rescanned.status.code(), Some(10), "b.txt is still corrupt");
+        let rescanned = json(&rescanned);
+        assert_eq!(
+            rescanned["summary"]["new_paths"], 0,
+            "scans ignore the quarantine"
+        );
+        let integrity = json(
+            &archive(&temp)
+                .args(["--json", "report", "integrity"])
+                .output()
+                .unwrap(),
+        );
+        assert!(integrity["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["logical_path"] != "a.txt"));
+
+        let changed = json(&success(archive(&temp).args([
+            "--json",
+            "repair",
+            "Backup",
+            "--path",
+            backup_path,
+            "--yes",
+            "--include-changed",
+        ])));
+        assert_eq!(status(&changed, "b.txt"), "repaired");
+        assert_eq!(fs::read(backup.join("b.txt")).unwrap(), b"original b");
+
+        // Resume after a crash between quarantining the corrupt file and placing the replacement.
+        rot(&backup.join("a.txt"), b"original Y");
+        let _ = archive(&temp)
+            .args(["verify", "Backup", "--path", backup_path, "--all"])
+            .output()
+            .unwrap();
+        let area = backup.join(".archive-ledger/quarantine/job_resume");
+        fs::create_dir_all(area.join(".staged")).unwrap();
+        fs::rename(backup.join("a.txt"), area.join("a.txt")).unwrap();
+        fs::write(area.join(".staged/a.txt"), b"original a").unwrap();
+        let resumed = json(&success(archive(&temp).args([
+            "--json",
+            "repair",
+            "Backup",
+            "--path",
+            backup_path,
+            "--yes",
+            "--job-id",
+            "job_resume",
+        ])));
+        assert_eq!(status(&resumed, "a.txt"), "repaired");
+        assert_eq!(fs::read(backup.join("a.txt")).unwrap(), b"original a");
+        assert_eq!(fs::read(area.join("a.txt")).unwrap(), b"original Y");
+        // A two-step no-replace move (link, then unlink) interrupted after the link
+        // leaves the corrupt file at both paths; resume removes only the extra link.
+        rot(&backup.join("a.txt"), b"original W");
+        let _ = archive(&temp)
+            .args(["verify", "Backup", "--path", backup_path, "--all"])
+            .output()
+            .unwrap();
+        let area = backup.join(".archive-ledger/quarantine/job_linked");
+        fs::create_dir_all(area.join(".staged")).unwrap();
+        fs::hard_link(backup.join("a.txt"), area.join("a.txt")).unwrap();
+        fs::write(area.join(".staged/a.txt"), b"original a").unwrap();
+        let linked = json(&success(archive(&temp).args([
+            "--json",
+            "repair",
+            "Backup",
+            "--path",
+            backup_path,
+            "--yes",
+            "--job-id",
+            "job_linked",
+        ])));
+        assert_eq!(status(&linked, "a.txt"), "repaired");
+        assert_eq!(fs::read(backup.join("a.txt")).unwrap(), b"original a");
+        assert_eq!(fs::read(area.join("a.txt")).unwrap(), b"original W");
+
+        // Good bytes already in place but not yet recorded: record without moving anything.
+        let modified = rot(&backup.join("a.txt"), b"original V");
+        let _ = archive(&temp)
+            .args(["verify", "Backup", "--path", backup_path, "--all"])
+            .output()
+            .unwrap();
+        fs::write(backup.join("a.txt"), b"original a").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(backup.join("a.txt"))
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let recorded = json(&success(archive(&temp).args([
+            "--json",
+            "repair",
+            "Backup",
+            "--path",
+            backup_path,
+            "--yes",
+            "--job-id",
+            "job_recorded",
+        ])));
+        assert_eq!(status(&recorded, "a.txt"), "repaired");
+        assert!(
+            !backup
+                .join(".archive-ledger/quarantine/job_recorded/a.txt")
+                .exists(),
+            "good bytes are not quarantined"
+        );
+        let integrity = json(
+            &archive(&temp)
+                .args(["--json", "report", "integrity"])
+                .output()
+                .unwrap(),
+        );
+        assert!(integrity["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["logical_path"] != "a.txt"));
+        success(archive(&temp).args(["fsck"]));
+        fs::set_permissions(backup.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()

@@ -148,6 +148,17 @@ pub fn place_directory_no_replace(source: &Path, destination: &Path) -> Result<(
     sync_parent_directory(destination)
 }
 
+/// Moves one regular file to a path that must not exist yet, then syncs the parent.
+pub fn place_file_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| io_error("inspect prepared file", source, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(SafeCopyError::SourceNotRegular(source.to_path_buf()));
+    }
+    place_no_replace(source, destination)?;
+    sync_parent_directory(destination)
+}
+
 /// Reads an existing regular file and requires the reviewed checksum.
 pub fn verify_existing_file(path: &Path, expected_blake3_hex: &str) -> Result<VerifiedCopy> {
     let metadata = fs::symlink_metadata(path)

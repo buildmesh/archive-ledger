@@ -226,6 +226,8 @@ enum Command {
     Scan(ScanArgs),
     /// Verify the bytes behind current copy claims.
     Verify(VerifyArgs),
+    /// Replace corrupt copies with verified bytes from a connected good copy.
+    Repair(RepairArgs),
     /// Import source-specific inventories.
     Import {
         #[command(subcommand)]
@@ -397,6 +399,28 @@ struct VerifyArgs {
     /// Stop cleanly after this many claims; useful for testing resume.
     #[arg(long, hide = true)]
     max_items: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct RepairArgs {
+    /// Location to repair; omit to repair every connected Location.
+    location: Option<String>,
+    /// Mounted path corresponding exactly to the Location; found from its recorded mount when omitted.
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Show every planned replacement and its source without changing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm the repair; required when not interactive.
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    non_interactive: bool,
+    /// Also repair copies whose size or modification time changed (likely edited).
+    #[arg(long)]
+    include_changed: bool,
+    #[arg(long)]
+    job_id: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2183,6 +2207,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             },
             Command::AnnexRemote { command } => execute_annex_remote(cli, &database, command),
             Command::Job { command } => execute_job(cli, &database, command),
+            Command::Repair(_) => Err(AppError::Input(
+                "archive repair requires a version 2 Archive".to_owned(),
+            )),
             Command::Background { .. } => Err(AppError::Input(
                 "background work requires a version 2 Archive".to_owned(),
             )),
@@ -7867,6 +7894,7 @@ fn execute_v2_registry_command(
             }
             execute_v2_verify(cli, database, args, None)?
         }
+        Command::Repair(args) => execute_v2_repair(cli, database, args, None)?,
         Command::Copy(args) => {
             if args.command.is_some() {
                 return Err(AppError::Input(
@@ -9286,6 +9314,22 @@ fn execute_v2_job(
                 "background_stale" => {
                     execute_v2_background_run(cli, database, Some(job_id.clone()), *max_items)?;
                 }
+                "repair" => {
+                    return execute_v2_repair(
+                        cli,
+                        database,
+                        &RepairArgs {
+                            location: None,
+                            path: None,
+                            dry_run: false,
+                            yes: true,
+                            non_interactive: true,
+                            include_changed: false,
+                            job_id: Some(job_id.clone()),
+                        },
+                        Some(job_params),
+                    );
+                }
                 "verify" => {
                     return execute_v2_verify(
                         cli,
@@ -9848,10 +9892,19 @@ fn registry_path_from_sql(
 }
 
 fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppError> {
-    let relative = target.copy_path.to_path_buf().ok_or_else(|| {
+    location_content_path(&target.location_root, &target.copy_path)
+}
+
+/// Resolves a cataloged copy path inside its Location root without following any
+/// symlink, refusing escapes and non-directory parents.
+fn location_content_path(
+    location_root: &Path,
+    copy_path: &RegistryPath,
+) -> Result<PathBuf, AppError> {
+    let relative = copy_path.to_path_buf().ok_or_else(|| {
         AppError::Input(format!(
             "copy path is unavailable on this platform: {}",
-            target.copy_path.display
+            copy_path.display
         ))
     })?;
     if relative.is_absolute()
@@ -9866,11 +9919,11 @@ fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppErro
     {
         return Err(AppError::Input(format!(
             "copy path escapes its Location: {}",
-            target.copy_path.display
+            copy_path.display
         )));
     }
-    let path = target.location_root.join(&relative);
-    let mut checked = target.location_root.clone();
+    let path = location_root.join(&relative);
+    let mut checked = location_root.to_path_buf();
     let component_count = relative.components().count();
     for (index, component) in relative.components().enumerate() {
         checked.push(component.as_os_str());
@@ -9896,10 +9949,10 @@ fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppErro
     let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
         AppError::Input(format!("cannot resolve {}: {error}", parent.display()))
     })?;
-    if !canonical_parent.starts_with(&target.location_root) {
+    if !canonical_parent.starts_with(location_root) {
         return Err(AppError::Input(format!(
             "copy path resolves outside its Location: {}",
-            target.copy_path.display
+            copy_path.display
         )));
     }
     Ok(path)
@@ -10121,6 +10174,701 @@ fn verification_failure_item(
             ],
         ),
     }))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RepairSummary {
+    corrupt: u64,
+    repaired: u64,
+    skipped_changed: u64,
+    no_source: u64,
+    failed: u64,
+    bytes_written: u64,
+}
+
+/// A corrupt copy plus the observation at which it was last good.
+struct RepairTarget {
+    copy: BackgroundTarget,
+    observed_size: Option<i64>,
+    observed_mtime: Option<i64>,
+}
+
+/// Corrupt copies at these Locations whose path is currently observed present.
+fn repair_targets(
+    database: &V2ProjectionDb,
+    locations: &[VerifyLocation],
+) -> Result<Vec<RepairTarget>, AppError> {
+    let (ids, _, _, _) = verify_selection_params(Some(locations), VerifySelection::All, 0)?;
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            &"SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
+                    cc.object_id, o.canonical_hash_hex, o.size_bytes,
+                    f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
+                    cc.relative_path_encoding, cc.relative_path_bytes, cc.relative_path_display,
+                    cc.external_identity_id, here.observed_size_bytes, here.modified_time_utc_ms
+             FROM copy_claims cc
+             JOIN objects o ON o.object_id = cc.object_id
+             JOIN path_observations here ON here.rowid = (
+                 SELECT here.rowid FROM path_observations here WHERE COPY_OBSERVATION_MATCH
+                 ORDER BY here.observed_path_encoding, here.observed_path_bytes LIMIT 1)
+             JOIN file_refs f ON f.file_ref_id = here.file_ref_id
+                             AND f.object_id = cc.object_id AND f.path_state = 'active'
+             WHERE cc.state = 'corrupt' AND cc.location_id IN (SELECT value FROM json_each(?1))
+             ORDER BY cc.location_id, cc.relative_path_encoding, cc.relative_path_bytes"
+                .replace("COPY_OBSERVATION_MATCH", COPY_OBSERVATION_MATCH),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map([ids], |row| {
+            let size: i64 = row.get(6)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                u64::try_from(size)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
+                (
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, String>(9)?,
+                ),
+                (
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, String>(12)?,
+                ),
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+            ))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    rows.into_iter()
+        .map(|row| {
+            let location = locations
+                .iter()
+                .find(|location| location.location_id == row.2)
+                .expect("selected from these Locations");
+            Ok(RepairTarget {
+                copy: BackgroundTarget {
+                    copy_claim_id: row.0,
+                    collection_id: row.1,
+                    location_id: row.2,
+                    file_ref_id: row.3,
+                    object_id: row.4,
+                    blake3_hex: row.5,
+                    size_bytes: row.6,
+                    logical_path: registry_path_from_sql(&row.7 .0, &row.7 .1, &row.7 .2)?,
+                    copy_path: registry_path_from_sql(&row.8 .0, &row.8 .1, &row.8 .2)?,
+                    external_identity_id: row.9,
+                    location_root: location.root.clone(),
+                    device_fingerprint_status: location.fingerprint_status.clone(),
+                },
+                observed_size: row.10,
+                observed_mtime: row.11,
+            })
+        })
+        .collect()
+}
+
+/// The most recently verified connected good copy of an Object, if any.
+fn repair_source(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    target: &BackgroundTarget,
+    roots: &mut BTreeMap<String, Option<PathBuf>>,
+) -> Result<Option<(String, PathBuf, String)>, AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT location_id, relative_path_encoding, relative_path_bytes, relative_path_display
+             FROM copy_claims
+             WHERE object_id = ?1 AND copy_claim_id != ?2 AND state = 'present'
+               AND last_verification_result = 'ok'
+             ORDER BY last_verified_time_utc_ms DESC, location_id, copy_claim_id",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let candidates = statement
+        .query_map(params![target.object_id, target.copy_claim_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    for (location_id, encoding, bytes, display) in candidates {
+        let root =
+            roots.entry(location_id.clone()).or_insert_with(
+                || match v2_mounted_location_by_selector(cli, database, state, &location_id) {
+                    Ok((_, root, status)) if status != "mismatch" => Some(root),
+                    _ => None,
+                },
+            );
+        let Some(root) = root.clone() else { continue };
+        let copy_path = registry_path_from_sql(&encoding, &bytes, &display)?;
+        let Ok(path) = location_content_path(&root, &copy_path) else {
+            continue;
+        };
+        // A cheap pre-check; the bytes themselves are verified while they are copied.
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == target.size_bytes)
+        {
+            return Ok(Some((location_id, path, display)));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn filesystem_id(path: &Path) -> Result<u64, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(std::fs::metadata(path)?.dev())
+}
+
+#[cfg(not(unix))]
+fn filesystem_id(_path: &Path) -> Result<u64, AppError> {
+    Ok(0)
+}
+
+/// Creates `root/relative` directory by directory, refusing any symlink or non-directory.
+fn ensure_real_directories(root: &Path, relative: &Path) -> Result<PathBuf, AppError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(AppError::Input(format!(
+                "unsafe quarantine path component in {}",
+                relative.display()
+            )));
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(AppError::Input(format!(
+                    "quarantine path is not a real directory: {}",
+                    current.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(current)
+}
+
+/// Runs `action` with `directory` writable by its owner, restoring its mode after,
+/// as git-annex object directories are read-only.
+#[cfg(unix)]
+fn with_writable_directory<T>(
+    directory: &Path,
+    action: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let original = std::fs::metadata(directory)?.permissions();
+    let locked = original.mode() & 0o200 == 0;
+    if locked {
+        std::fs::set_permissions(
+            directory,
+            std::fs::Permissions::from_mode(original.mode() | 0o200),
+        )?;
+    }
+    let result = action();
+    if locked {
+        // A failed restore is reported only if the action itself succeeded, so it can
+        // never hide what the action did or failed to do.
+        let restored = std::fs::set_permissions(directory, original);
+        if result.is_ok() {
+            restored?;
+        }
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn with_writable_directory<T>(
+    _directory: &Path,
+    action: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    action()
+}
+
+/// Replaces one corrupt copy without ever overwriting: stage verified bytes in
+/// the quarantine area, move the corrupt file into quarantine, then place the
+/// staged file at the original path. Each step is a no-replace move on one
+/// filesystem, so a resumed job recognizes and finishes any interrupted state.
+fn repair_one(
+    target: &BackgroundTarget,
+    source: Option<&Path>,
+    planned: Option<(u64, Option<SystemTime>)>,
+    quarantine: &Path,
+    staged: &Path,
+    destination: &Path,
+) -> Result<u64, AppError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::Input("copy path has no parent".to_owned()))?;
+    let fresh = !quarantine.exists() && !staged.exists();
+    if fresh {
+        // A previous run may already have placed good bytes without recording them.
+        if let Ok(verified) = archive_ledger::verify_existing_file(destination, &target.blake3_hex)
+        {
+            return Ok(verified.bytes_copied);
+        }
+        let source = source.ok_or_else(|| {
+            AppError::Input("no connected verified copy to repair from".to_owned())
+        })?;
+        let original = std::fs::symlink_metadata(destination)?;
+        archive_ledger::copy_verified_no_replace(source, staged, &target.blake3_hex)
+            .map_err(|error| AppError::Input(error.to_string()))?;
+        // Keep the file's dates and permissions as they were.
+        std::fs::File::options()
+            .write(true)
+            .open(staged)?
+            .set_modified(original.modified()?)?;
+        std::fs::set_permissions(staged, original.permissions())?;
+    } else if staged.exists() {
+        archive_ledger::verify_existing_file(staged, &target.blake3_hex)
+            .map_err(|error| AppError::Input(error.to_string()))?;
+    }
+    with_writable_directory(parent, || {
+        if !quarantine.exists() {
+            // The file must still be what was planned: an edit made since then is never
+            // quarantined behind the user's back.
+            if let Some((size, modified)) = planned {
+                let now = std::fs::symlink_metadata(destination)?;
+                if now.len() != size || now.modified().ok() != modified {
+                    let _ = std::fs::remove_file(staged);
+                    return Err(AppError::Input(
+                        "the file changed after the repair was planned; nothing was replaced"
+                            .to_owned(),
+                    ));
+                }
+            }
+            archive_ledger::place_file_no_replace(destination, quarantine)
+                .map_err(|error| AppError::Input(error.to_string()))?;
+        } else if staged.exists() && destination.exists() && same_file(destination, quarantine)? {
+            // Where a no-replace move is a hard link then an unlink, a crash can leave
+            // the corrupt file linked at both paths; the extra link holds no other bytes.
+            std::fs::remove_file(destination)?;
+        }
+        if staged.exists() && !destination.exists() {
+            archive_ledger::place_file_no_replace(staged, destination)
+                .map_err(|error| AppError::Input(error.to_string()))?;
+        }
+        Ok(())
+    })?;
+    let verified = archive_ledger::verify_existing_file(destination, &target.blake3_hex)
+        .map_err(|error| AppError::Input(error.to_string()))?;
+    Ok(verified.bytes_copied)
+}
+
+#[cfg(unix)]
+fn same_file(left: &Path, right: &Path) -> Result<bool, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (left, right) = (
+        std::fs::symlink_metadata(left)?,
+        std::fs::symlink_metadata(right)?,
+    );
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &Path, _right: &Path) -> Result<bool, AppError> {
+    Ok(false)
+}
+
+/// Repairs corrupt copies at one or all connected Locations from the most
+/// recently verified connected good copy, preserving the corrupt bytes in the
+/// Location's `.archive-ledger/quarantine/<job-id>/` area.
+fn execute_v2_repair(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    args: &RepairArgs,
+    resumed_params: Option<serde_json::Value>,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let (params, locations) = match resumed_params {
+        Some(params) => {
+            let mut locations = Vec::new();
+            for location in params["locations"].as_array().into_iter().flatten() {
+                let (mut resolved, _) = verify_locations(
+                    cli,
+                    database,
+                    location["location_id"].as_str(),
+                    location["root_path"].as_str().map(Path::new),
+                )?;
+                locations.append(&mut resolved);
+            }
+            (params, locations)
+        }
+        None => {
+            let (locations, _) = verify_locations(
+                cli,
+                database,
+                args.location.as_deref(),
+                args.path.as_deref(),
+            )?;
+            let params = json!({
+                "include_changed": args.include_changed,
+                "locations": locations.iter().map(|location| json!({
+                    "location_id": location.location_id,
+                    "root_path": location.root,
+                })).collect::<Vec<_>>(),
+            });
+            (params, locations)
+        }
+    };
+    for location in &locations {
+        if state
+            .locations
+            .iter()
+            .any(|known| known.location_id == location.location_id && !known.is_writable)
+        {
+            return Err(AppError::Input(format!(
+                "Location {} is registered read-only; repair refuses to change it",
+                location.location_id
+            )));
+        }
+    }
+    let include_changed = params["include_changed"].as_bool().unwrap_or(false);
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let mut roots = BTreeMap::new();
+    let mut summary = RepairSummary::default();
+    let mut items = Vec::new();
+    // Plan: classify every corrupt copy before changing anything.
+    let mut plan = Vec::new();
+    for target in repair_targets(database, &locations)? {
+        let copy = &target.copy;
+        summary.corrupt += 1;
+        let relative = copy.copy_path.to_path_buf().ok_or_else(|| {
+            AppError::Input(format!(
+                "copy path is unavailable: {}",
+                copy.copy_path.display
+            ))
+        })?;
+        let area = copy
+            .location_root
+            .join(".archive-ledger/quarantine")
+            .join(&job_id);
+        let quarantine = area.join(&relative);
+        let staged = area.join(".staged").join(&relative);
+        let destination = copy.location_root.join(&relative);
+        let resuming = quarantine.exists() || staged.exists();
+        let mut planned_state = None;
+        let mut item = json!({
+            "logical_path": copy.logical_path.display,
+            "location_id": copy.location_id,
+            "path": copy.copy_path.display,
+        });
+        if !resuming {
+            let current = match location_content_path(&copy.location_root, &copy.copy_path)
+                .and_then(|path| Ok(std::fs::symlink_metadata(path)?))
+            {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) | Err(_) => {
+                    summary.failed += 1;
+                    item["status"] = json!("failed");
+                    item["detail"] = json!("the corrupt copy is no longer a regular file here");
+                    items.push(item);
+                    continue;
+                }
+            };
+            let current_mtime = current
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|time| i64::try_from(time.as_millis()).ok());
+            planned_state = Some((current.len(), current.modified().ok()));
+            let edited = i64::try_from(current.len()).ok() != target.observed_size
+                || current_mtime != target.observed_mtime;
+            if edited && !include_changed {
+                summary.skipped_changed += 1;
+                item["status"] = json!("skipped_changed");
+                item["detail"] =
+                    json!("size or modification time changed, so this may be an intentional edit");
+                items.push(item);
+                continue;
+            }
+        }
+        let source = repair_source(cli, database, &state, copy, &mut roots)?;
+        if source.is_none() && !resuming {
+            summary.no_source += 1;
+            item["status"] = json!("no_source");
+            item["detail"] = json!("no connected verified copy; see archive report integrity");
+            items.push(item);
+            continue;
+        }
+        if let Some((source_location, _, source_path)) = &source {
+            item["source"] = json!({"location_id": source_location, "path": source_path});
+        }
+        plan.push((
+            target,
+            source,
+            planned_state,
+            area,
+            quarantine,
+            staged,
+            destination,
+            item,
+        ));
+    }
+    // Room for every replacement while the corrupt bytes stay in quarantine.
+    // Per filesystem, so Locations sharing one are checked against the same free space.
+    let mut needed = BTreeMap::<u64, (PathBuf, u64)>::new();
+    for (target, ..) in &plan {
+        let root = &target.copy.location_root;
+        let device = filesystem_id(root)?;
+        let entry = needed.entry(device).or_insert_with(|| (root.clone(), 0));
+        entry.1 += target.copy.size_bytes;
+    }
+    for (root, bytes) in needed.values() {
+        if available_space(root)? < bytes.saturating_add(1024 * 1024) {
+            return Err(AppError::Input(format!(
+                "not enough free space at {} to repair while keeping the corrupt bytes ({} needed)",
+                root.display(),
+                format_bytes(*bytes)
+            )));
+        }
+    }
+    let describe = |location_id: &str| {
+        state
+            .locations
+            .iter()
+            .find(|location| location.location_id == location_id)
+            .map_or(location_id.to_owned(), |location| {
+                location.display_name.clone()
+            })
+    };
+    if args.dry_run || plan.is_empty() {
+        for (.., mut item) in plan {
+            item["status"] = json!("planned");
+            items.push(item);
+        }
+        return print_repair(cli, &summary, &items, None, args.dry_run, &describe);
+    }
+    if !args.yes {
+        if args.non_interactive || !std::io::stdin().is_terminal() {
+            return Err(AppError::Input(
+                "repair changes archive content and requires --yes; preview with --dry-run"
+                    .to_owned(),
+            ));
+        }
+        for (target, ..) in &plan {
+            println!(
+                "  {} at {}",
+                target.copy.logical_path.display,
+                describe(&target.copy.location_id)
+            );
+        }
+        if !prompt_confirmation("Replace these corrupt copies, keeping their bytes in quarantine?")?
+        {
+            return Err(AppError::Input("repair cancelled".to_owned()));
+        }
+    }
+    let input_version = v2_local_job(database, &job_id)?
+        .map(|job| job.input_version)
+        .unwrap_or_else(|| format!("repair_{suffix}"));
+    let store = V2OriginStore::open(cli.events_path())?;
+    ensure_v2_job_started(
+        cli,
+        database,
+        &store,
+        &job_id,
+        "repair",
+        &input_version,
+        &params,
+    )?;
+    let mut placements = Vec::new();
+    let mut areas = BTreeSet::new();
+    for (target, source, planned_state, area, quarantine, staged, destination, mut item) in plan {
+        let copy = &target.copy;
+        let relative_parent = copy
+            .copy_path
+            .to_path_buf()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let outcome = (|| {
+            let area_relative = area
+                .strip_prefix(&copy.location_root)
+                .map_err(|_| AppError::Input("quarantine escapes its Location".to_owned()))?
+                .to_path_buf();
+            ensure_real_directories(&copy.location_root, &area_relative.join(&relative_parent))?;
+            ensure_real_directories(
+                &copy.location_root,
+                &area_relative.join(".staged").join(&relative_parent),
+            )?;
+            repair_one(
+                copy,
+                source.as_ref().map(|(_, path, _)| path.as_path()),
+                planned_state,
+                &quarantine,
+                &staged,
+                &destination,
+            )
+        })();
+        match outcome {
+            Ok(bytes) => {
+                let metadata = std::fs::symlink_metadata(&destination)?;
+                summary.repaired += 1;
+                summary.bytes_written += bytes;
+                areas.insert(area.display().to_string());
+                item["status"] = json!("repaired");
+                item["quarantined_to"] = json!(quarantine.display().to_string());
+                placements.push(archive_ledger::V2Placement {
+                    collection_id: copy.collection_id.clone(),
+                    location_id: copy.location_id.clone(),
+                    file_ref_id: copy.file_ref_id.clone(),
+                    logical_path: copy.logical_path.clone(),
+                    copy_path: copy.copy_path.clone(),
+                    object_id: copy.object_id.clone(),
+                    blake3_hex: copy.blake3_hex.clone(),
+                    size_bytes: copy.size_bytes,
+                    modified_time_utc_ms: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .and_then(|time| u64::try_from(time.as_millis()).ok()),
+                    representation: if copy.external_identity_id.is_some() {
+                        "annex_locked_symlink".to_owned()
+                    } else {
+                        "ordinary_file".to_owned()
+                    },
+                    external_identity_id: copy.external_identity_id.clone(),
+                    device_fingerprint_status: copy.device_fingerprint_status.clone(),
+                    job_id: job_id.clone(),
+                    job_type: "repair".to_owned(),
+                    input_version: input_version.clone(),
+                });
+            }
+            Err(error) => {
+                summary.failed += 1;
+                item["status"] = json!("failed");
+                item["detail"] = json!(error.to_string());
+            }
+        }
+        items.push(item);
+    }
+    for batch in placements.chunks(VERIFY_BATCH_COPIES) {
+        archive_ledger::v2_record_placements(&store, database, batch)?;
+    }
+    let status = if summary.failed == 0 {
+        "complete"
+    } else {
+        "partial"
+    };
+    finish_v2_job(
+        database,
+        &store,
+        &job_id,
+        "repair",
+        &input_version,
+        status,
+        &serde_json::to_value(&summary)?,
+    )?;
+    print_repair(
+        cli,
+        &summary,
+        &items,
+        Some((&job_id, &areas)),
+        false,
+        &describe,
+    )
+}
+
+fn print_repair(
+    cli: &Cli,
+    summary: &RepairSummary,
+    items: &[serde_json::Value],
+    job: Option<(&str, &BTreeSet<String>)>,
+    dry_run: bool,
+    describe: &dyn Fn(&str) -> String,
+) -> Result<u8, AppError> {
+    let unresolved = summary.skipped_changed + summary.no_source + summary.failed;
+    let planned = items
+        .iter()
+        .filter(|item| item["status"] == "planned")
+        .count();
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "status": if dry_run { "planned" } else if job.is_some() { "done" } else { "idle" },
+                "job_id": job.map(|(id, _)| id),
+                "summary": summary,
+                "items": items,
+                "quarantine": job.map(|(_, areas)| areas),
+            }))?
+        );
+    } else if summary.corrupt == 0 {
+        println!("No corrupt copies at the selected Locations.");
+    } else {
+        for item in items {
+            let location = describe(item["location_id"].as_str().unwrap_or_default());
+            let path = item["logical_path"].as_str().unwrap_or_default();
+            let source = || {
+                item["source"]["location_id"]
+                    .as_str()
+                    .map(|source| {
+                        format!(
+                            " from {} ({})",
+                            describe(source),
+                            item["source"]["path"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            match item["status"].as_str().unwrap_or_default() {
+                "planned" => println!("  would repair {path} at {location}{}", source()),
+                "repaired" => println!("  repaired {path} at {location}{}", source()),
+                "skipped_changed" => println!(
+                    "  skipped {path} at {location}: its size or modification time changed, so it may be an intentional edit (accept it with collection add --accept-changes, or repair it with --include-changed)"
+                ),
+                "no_source" => println!(
+                    "  cannot repair {path} at {location}: no connected verified copy (see archive report integrity)"
+                ),
+                _ => println!(
+                    "  failed {path} at {location}: {}",
+                    item["detail"].as_str().unwrap_or_default()
+                ),
+            }
+        }
+        if dry_run {
+            println!(
+                "Dry run: nothing changed. {planned} copies would be repaired; corrupt bytes would be kept under .archive-ledger/quarantine in each Location."
+            );
+        } else if let Some((job_id, areas)) = job {
+            if summary.repaired > 0 {
+                println!("Corrupt bytes are kept in:");
+                for area in areas {
+                    println!("  {area}");
+                }
+                println!("Delete them when you are satisfied with the repair (job {job_id}).");
+            }
+        }
+    }
+    Ok(if unresolved > 0 || (dry_run && planned > 0) {
+        EXIT_FINDINGS
+    } else {
+        EXIT_OK
+    })
 }
 
 /// Resolves the Locations a verify job reads. An explicit `--path` must be the

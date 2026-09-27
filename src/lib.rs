@@ -84,8 +84,8 @@ pub use review::{
     ObjectHashReview, ObjectReview, ReviewError, V2HistoryEntry, V2HistoryPage,
 };
 pub use safe_copy::{
-    copy_verified_no_replace, place_directory_no_replace, verify_existing_file, SafeCopyError,
-    VerifiedCopy,
+    copy_verified_no_replace, place_directory_no_replace, place_file_no_replace,
+    verify_existing_file, SafeCopyError, VerifiedCopy,
 };
 pub use scan::{
     LocationScanner, ScanConfig, ScanError, ScanMode, ScanResult, ScanStatus, ScanSummary,
