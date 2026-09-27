@@ -3760,6 +3760,137 @@ mod unix {
     }
 
     #[test]
+    fn interrupted_annex_import_of_a_changed_repository_is_cancelled_and_restarted() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let seed = temp.path().join("seed");
+        fs::create_dir(&seed).unwrap();
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            seed.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let repo = inventory_only_annex_fixture(&temp);
+        let import = |job_id: &str, extra: &[&str]| {
+            let mut command = archive(&temp);
+            command
+                .args([
+                    "--json",
+                    "location",
+                    "import-annex",
+                    repo.to_str().unwrap(),
+                    "--collection",
+                    "Files",
+                ])
+                .args([
+                    "--device",
+                    "Test Device",
+                    "--site",
+                    "Home",
+                    "--allow-unidentified-root",
+                ])
+                .args(["--non-interactive", "--inventory-only", "--job-id", job_id])
+                .args(extra);
+            command.output().unwrap()
+        };
+        let paused = import("job_changed", &["--max-items", "2"]);
+        assert!(
+            paused.status.success(),
+            "{}",
+            String::from_utf8_lossy(&paused.stderr)
+        );
+        assert_eq!(json(&paused)["annex_import"]["status"], "running");
+
+        // The repository changes while the import is interrupted.
+        git_success(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "change",
+            ],
+        );
+        let refused = archive(&temp)
+            .args(["job", "resume", "job_changed"])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        let message = String::from_utf8_lossy(&refused.stderr);
+        assert!(message.contains("[annex_source_changed]"), "{message}");
+        assert!(
+            message.contains("archive job cancel job_changed"),
+            "{message}"
+        );
+        assert!(message.contains("--inventory-only"), "{message}");
+        assert!(
+            message.contains("archive location import-annex"),
+            "{message}"
+        );
+        // A new import is refused while that one is unfinished.
+        assert!(!import("job_second", &[]).status.success());
+
+        let planned = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "cancel",
+            "job_changed",
+            "--dry-run",
+        ])));
+        assert_eq!(planned["job_type"], "annex_import");
+        assert!(planned["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["name"] == "annex-config.json"));
+        let cancelled = json(&success(archive(&temp).args([
+            "--json",
+            "job",
+            "cancel",
+            "job_changed",
+        ])));
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(!root(&temp).join("local/jobs/job_changed").exists());
+        let again = archive(&temp)
+            .args(["job", "resume", "job_changed"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&again.stderr).contains("cancelled"));
+        // Reusing the cancelled ID is refused before any job files are recreated.
+        assert!(!import("job_changed", &[]).status.success());
+        assert!(!root(&temp).join("local/jobs/job_changed").exists());
+
+        // Importing again from the changed repository completes.
+        let restarted = import("job_restarted", &[]);
+        assert!(
+            restarted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restarted.stderr)
+        );
+        assert_eq!(json(&restarted)["annex_import"]["status"], "complete");
+        success(archive(&temp).args(["fsck"]));
+    }
+
+    #[test]
     fn annex_inventory_only_location_import_resumes_without_hashing() {
         let temp = TempDir::new().unwrap();
         success(archive(&temp).args([

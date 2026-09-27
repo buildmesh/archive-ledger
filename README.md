@@ -770,7 +770,8 @@ explains where an unfinished job stopped. After `db rebuild`, `job resume <job-i
 annex and inventory work from this installation’s local checkpoint. Existing terminal job status
 still takes precedence; local checkpoints are not transferred by sync or portable snapshots.
 
-To abandon an unfinished location scan or collection add, run `archive job cancel <job-id>`.
+To abandon an unfinished location scan, collection add, or annex import, run
+`archive job cancel <job-id>`.
 Preview it first with `--dry-run`. Cancel removes only that job's local checkpoint files,
 including jobs left only on disk after `db rebuild`. Its unpublished progress is lost; the job had
 published nothing to catalog history. A job that is still running elsewhere is refused.

@@ -1458,38 +1458,61 @@ pub fn cancel_job(
         // db rebuild drops unpublished job rows; the local configuration names the
         // job type. Read it under the lock already held rather than re-locking.
         None => {
-            let config = job
-                .read_optional("inventory-config.json")
-                .map_err(|source| io_error("read inventory job configuration", job.path(), source))?
-                .ok_or_else(|| {
-                    V2InventoryError::Refused(format!(
-                        "job {job_id} is not in the catalog database and has no local scan configuration"
-                    ))
-                })?;
-            let config: serde_json::Value = serde_json::from_slice(&config).map_err(|error| {
-                V2InventoryError::Invalid(format!(
-                    "inventory job configuration is invalid: {error}"
-                ))
-            })?;
-            let job_type = match config["scan_mode"].as_str() {
-                Some("add") => "inventory_add",
-                Some("complete") => "location_scan",
-                _ => {
-                    return Err(V2InventoryError::Invalid(
-                        "inventory job configuration has an invalid scan mode".to_owned(),
-                    ))
+            let read = |name: &str| {
+                job.read_optional(name)
+                    .map_err(|source| io_error("read job configuration", job.path(), source))
+            };
+            let job_type = if let Some(bytes) = read("inventory-config.json")? {
+                let config: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        V2InventoryError::Invalid(format!(
+                            "inventory job configuration is invalid: {error}"
+                        ))
+                    })?;
+                match config["scan_mode"].as_str() {
+                    Some("add") => "inventory_add",
+                    Some("complete") => "location_scan",
+                    _ => {
+                        return Err(V2InventoryError::Invalid(
+                            "inventory job configuration has an invalid scan mode".to_owned(),
+                        ))
+                    }
                 }
+            } else if let Some(bytes) = read("annex-config.json")? {
+                let config: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        V2InventoryError::Invalid(format!(
+                            "annex job configuration is invalid: {error}"
+                        ))
+                    })?;
+                if config["job_id"].as_str() != Some(job_id) {
+                    return Err(V2InventoryError::Invalid(
+                        "annex configuration job ID does not match its directory".to_owned(),
+                    ));
+                }
+                "annex_import"
+            } else {
+                return Err(V2InventoryError::Refused(format!(
+                    "job {job_id} is not in the catalog database and has no local job configuration"
+                )));
             };
             (job_type.to_owned(), "local_only".to_owned())
         }
     };
-    if !matches!(job_type.as_str(), "location_scan" | "inventory_add") {
+    // An unfinished scan, add, or annex import has published nothing canonical;
+    // cancelling removes only that job's own local files.
+    let job_files: &[&str] = match job_type.as_str() {
+        "location_scan" | "inventory_add" => &INVENTORY_JOB_FILES,
+        "annex_import" => &crate::annex::ANNEX_JOB_FILES,
+        _ => &[],
+    };
+    if job_files.is_empty() {
         return Err(V2InventoryError::Refused(format!(
-            "job cancel supports location scan and collection add jobs; {job_id} is {job_type}"
+            "job cancel supports location scan, collection add, and annex import jobs; {job_id} is {job_type}"
         )));
     }
     let files = job
-        .existing_file_sizes(&INVENTORY_JOB_FILES)
+        .existing_file_sizes(job_files)
         .map_err(|source| io_error("inspect inventory job files", job.path(), source))?;
     match status.as_str() {
         "running" | "local_only" => {}
@@ -1514,9 +1537,8 @@ pub fn cancel_job(
             .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
     }
     if !dry_run {
-        job.cleanup(&INVENTORY_JOB_FILES).map_err(|source| {
-            io_error("remove cancelled inventory job files", job.path(), source)
-        })?;
+        job.cleanup(job_files)
+            .map_err(|source| io_error("remove cancelled job files", job.path(), source))?;
     }
     Ok(V2CancelResult {
         version: 2,

@@ -161,8 +161,23 @@ while that job is unfinished, and `archive-docker job cancel <job-id>` abandons 
 
 An interrupted import resumes only while the repository is unchanged: the same Git commit and the
 same worktree metadata. After a commit, `git annex get` or `drop`, or other changes, resume refuses
-with "belongs to a different repository snapshot or import". There is not yet a supported way to
-abandon an unfinished import, so leave the repository alone until the import finishes.
+and says so. Abandon that import and start again from the repository's current state:
+
+```bash
+archive-docker job cancel <job-id> --dry-run
+archive-docker job cancel <job-id>
+archive-docker location import-annex /locations/source --collection Media \
+  --location-name "Media source" --device "Source disk" --site Home \
+  --inventory-only --non-interactive
+```
+
+Cancel removes only that import's local progress; the Collection and Location it set up remain,
+which is why the restart uses `location import-annex` with the existing Collection. If the
+abandoned import was a `--reimport`, add `--reimport` again.
+For a large repository, prefer `--inventory-only` followed by `location scan`, both for the first
+import and after a restart. The inventory reads no file content, so it is short and cheap to
+redo. The long, content-reading part then happens in the scan, which resumes across repository
+changes and skips files it has already verified.
 
 ## 3. Verify presence and integrity throughout a Location
 

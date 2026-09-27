@@ -536,7 +536,7 @@ enum JobCommand {
         #[arg(long, hide = true)]
         max_items: Option<usize>,
     },
-    /// Abandon an unfinished location scan or collection add job and remove its local files.
+    /// Abandon an unfinished location scan, collection add, or annex import job and remove its local files.
     Cancel {
         job_id: String,
         /// Show what would be removed without changing anything.
@@ -9080,6 +9080,11 @@ fn execute_v2_job(
                         println!("Finished an interrupted catalog publication first.");
                     }
                     println!("This job had published nothing to catalog history.");
+                    if result.job_type == "annex_import" {
+                        println!(
+                            "The Collection and Location set up for this import remain; import again with archive location import-annex."
+                        );
+                    }
                 }
             }
         }
