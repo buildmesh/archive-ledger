@@ -672,6 +672,14 @@ archive report integrity
 archive report policy
 ```
 
+`report integrity` lists copies whose content differs from the catalog (corrupt copies). For each
+one it shows where verified copies of the same content are: Location, Device, path, when each was
+last verified, and whether it is connected now. It says plainly when no verified copy remains in
+the Archive. It reads only the catalog and exits with code 10 while corrupt copies exist. To
+repair one by hand, copy a good file back over the corrupt one, keeping the corrupt bytes aside
+if you are unsure, then run `archive verify` on that Location: corrupt copies are always
+re-read, and a matching read marks the copy good again.
+
 The starter Policy requires two qualifying copies on two Devices at two Sites, including one
 offsite copy, with verification, presence, and Device check-in evidence no more than 365 days old.
 Update only the settings that should change, for example:

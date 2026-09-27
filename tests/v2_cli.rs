@@ -2062,6 +2062,121 @@ mod unix {
         );
     }
 
+    #[test]
+    fn integrity_report_locates_verified_copies_of_corrupt_content() {
+        let (temp, content) = immutable_files_fixture();
+        let backup = temp.path().join("backup");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("a.txt"), b"original a").unwrap();
+        success(archive(&temp).args([
+            "location",
+            "init",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Backup",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        success(archive(&temp).args([
+            "location",
+            "scan",
+            "--path",
+            backup.to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        let clean = json(&success(archive(&temp).args([
+            "--json",
+            "report",
+            "integrity",
+        ])));
+        assert_eq!(clean["corrupt_copies"], 0);
+
+        // Bit rot on the backup keeps size and mtime; only a full verify finds it.
+        let rotted = backup.join("a.txt");
+        let modified = fs::metadata(&rotted).unwrap().modified().unwrap();
+        fs::write(&rotted, b"original X").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&rotted)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let verified = archive(&temp)
+            .args([
+                "verify",
+                "Backup",
+                "--path",
+                backup.to_str().unwrap(),
+                "--all",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(verified.status.code(), Some(10));
+        // The only copy of c.txt is damaged too.
+        fs::write(content.join("c.txt"), b"damaged c").unwrap();
+        let _ = archive(&temp)
+            .args([
+                "location",
+                "scan",
+                "--path",
+                content.to_str().unwrap(),
+                "--collection",
+                "Files",
+            ])
+            .output()
+            .unwrap();
+
+        let report = archive(&temp)
+            .args(["--json", "report", "integrity"])
+            .output()
+            .unwrap();
+        assert_eq!(report.status.code(), Some(10));
+        let report = json(&report);
+        assert_eq!(report["corrupt_copies"], 2);
+        let item = |logical: &str| {
+            report["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["logical_path"] == logical)
+                .unwrap()
+                .clone()
+        };
+        let a = item("a.txt");
+        assert_eq!(a["corrupt_copy"]["location_name"], "Backup");
+        let good = a["good_copies"].as_array().unwrap();
+        assert_eq!(good.len(), 1);
+        assert_eq!(good[0]["location_name"], "Files on Test Device");
+        assert_eq!(good[0]["path"], "a.txt");
+        assert!(good[0]["connected"].is_boolean());
+        assert_eq!(item("c.txt")["good_copies"], serde_json::json!([]));
+
+        let human = String::from_utf8(
+            archive(&temp)
+                .args(["report", "integrity"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            human.contains("good copy: Files on Test Device (a.txt"),
+            "{human}"
+        );
+        assert!(
+            human.contains("no verified copy remains in the Archive"),
+            "{human}"
+        );
+        assert!(human.contains("then run archive verify"), "{human}");
+    }
+
     fn immutable_file_object(temp: &TempDir, name: &str) -> String {
         rusqlite::Connection::open(root(temp).join("archive.db"))
             .unwrap()

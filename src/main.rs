@@ -10855,7 +10855,8 @@ fn execute_v2_report(
     let state = database.registry_state(false)?;
     match command {
         ReportCommand::StalePresence(args) => execute_v2_stale_report(cli, database, &state, args),
-        ReportCommand::Risk(args) | ReportCommand::Integrity(args) => {
+        ReportCommand::Integrity(args) => execute_v2_integrity_report(cli, database, &state, args),
+        ReportCommand::Risk(args) => {
             if args.continuation.is_some() {
                 return Err(AppError::Input(
                     "v2 risk summary does not require a continuation token".to_owned(),
@@ -11009,6 +11010,228 @@ fn execute_v2_report(
             "metadata checkpoint/replication reporting will be enabled with v2 sync".to_owned(),
         )),
     }
+}
+
+/// Corrupt copies (content differs from the catalog) and, for each, where verified
+/// copies of the same content are and whether they are connected now. Read-only.
+fn execute_v2_integrity_report(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    args: &ReportArgs,
+) -> Result<u8, AppError> {
+    if args.policy.is_some() || args.result.is_some() || args.continuation.is_some() {
+        return Err(AppError::Input(
+            "report integrity accepts --collection and --limit".to_owned(),
+        ));
+    }
+    let collection_id = args
+        .collection
+        .as_deref()
+        .map(|selector| {
+            select_collection(&state.collections, selector)?
+                .map(|collection| collection.collection_id)
+                .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))
+        })
+        .transpose()?;
+    let connection = v2_cli_connection(database)?;
+    let total: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM copy_claims cc
+             WHERE cc.state = 'corrupt' AND (?1 IS NULL OR EXISTS (
+               SELECT 1 FROM file_refs f WHERE f.object_id = cc.object_id
+                 AND f.path_state = 'active' AND f.collection_id = ?1))",
+            [&collection_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut corrupt = connection
+        .prepare(
+            "SELECT cc.copy_claim_id, cc.object_id, cc.location_id, cc.relative_path_display,
+                    cc.last_verified_time_utc_ms, f.file_ref_id, f.collection_id,
+                    f.logical_path_display
+             FROM copy_claims cc
+             JOIN file_refs f ON f.file_ref_id = (
+               SELECT candidate.file_ref_id FROM file_refs candidate
+               WHERE candidate.object_id = cc.object_id AND candidate.path_state = 'active'
+                 AND (?1 IS NULL OR candidate.collection_id = ?1)
+               ORDER BY candidate.collection_id, candidate.logical_path_encoding,
+                        candidate.logical_path_bytes LIMIT 1)
+             WHERE cc.state = 'corrupt'
+             ORDER BY f.collection_id, f.logical_path_encoding, f.logical_path_bytes,
+                      cc.location_id, cc.copy_claim_id
+             LIMIT ?2",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = corrupt
+        .query_map(
+            params![collection_id, i64::try_from(args.limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut good = connection
+        .prepare(
+            "SELECT location_id, relative_path_display, last_verified_time_utc_ms
+             FROM copy_claims
+             WHERE object_id = ?1 AND copy_claim_id != ?2 AND state = 'present'
+               AND last_verification_result = 'ok'
+             ORDER BY last_verified_time_utc_ms DESC, location_id, copy_claim_id",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    // Whether a Location is mounted with matching identity right now, probed once each.
+    let mut connected = BTreeMap::<String, bool>::new();
+    let mut is_connected = |location_id: &str| -> bool {
+        *connected.entry(location_id.to_owned()).or_insert_with(|| {
+            matches!(
+                v2_mounted_location_by_selector(cli, database, state, location_id),
+                Ok((_, _, status)) if status == "match"
+            )
+        })
+    };
+    let describe = |location_id: &str| {
+        let location = state
+            .locations
+            .iter()
+            .find(|location| location.location_id == location_id);
+        let device = location
+            .and_then(|location| location.device_id.as_deref())
+            .and_then(|id| state.devices.iter().find(|device| device.device_id == id));
+        let site = location
+            .and_then(|location| location.site_id.as_deref())
+            .and_then(|id| state.sites.iter().find(|site| site.site_id == id));
+        (
+            location.map_or(location_id.to_owned(), |location| {
+                location.display_name.clone()
+            }),
+            device.map(|device| device.display_name.clone()),
+            site.map(|site| site.display_name.clone()),
+        )
+    };
+    let now = now_utc_ms()?;
+    let mut items = Vec::new();
+    for (copy_claim_id, object_id, location_id, path, verified, file_ref_id, collection, logical) in
+        rows
+    {
+        let copies = good
+            .query_map(params![object_id, copy_claim_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|source| v2_cli_sql_error(database, source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| v2_cli_sql_error(database, source))?
+            .into_iter()
+            .map(|(good_location, good_path, good_verified)| {
+                let (name, device, site) = describe(&good_location);
+                json!({
+                    "location_id": good_location,
+                    "location_name": name,
+                    "device_name": device,
+                    "site_name": site,
+                    "path": good_path,
+                    "last_verified_time_utc_ms": good_verified,
+                    "connected": is_connected(&good_location),
+                })
+            })
+            .collect::<Vec<_>>();
+        let (name, device, site) = describe(&location_id);
+        items.push(json!({
+            "file_ref_id": file_ref_id,
+            "collection_id": collection,
+            "logical_path": logical,
+            "object_id": object_id,
+            "corrupt_copy": {
+                "copy_claim_id": copy_claim_id,
+                "location_id": location_id,
+                "location_name": name,
+                "device_name": device,
+                "site_name": site,
+                "path": path,
+                "last_checked_time_utc_ms": verified,
+            },
+            "good_copies": copies,
+        }));
+    }
+    let total = nonnegative_sql_count(total)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "corrupt_copies": total,
+                "items": items,
+                "truncated": (items.len() as u64) < total,
+            }))?
+        );
+    } else if total == 0 {
+        println!("No corrupt copies: every checked copy matches its catalog content.");
+    } else {
+        println!("Corrupt copies (content differs from the catalog): {total}");
+        for item in &items {
+            let corrupt = &item["corrupt_copy"];
+            println!(
+                "  {} at {} ({}), checked {}",
+                item["logical_path"].as_str().unwrap_or_default(),
+                corrupt["location_name"].as_str().unwrap_or_default(),
+                corrupt["path"].as_str().unwrap_or_default(),
+                corrupt["last_checked_time_utc_ms"]
+                    .as_u64()
+                    .map_or("never".to_owned(), |time| format_age(time, now))
+            );
+            let copies = item["good_copies"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if copies.is_empty() {
+                println!("    no verified copy remains in the Archive");
+            }
+            for copy in copies {
+                println!(
+                    "    good copy: {} ({}{}), verified {}, {}",
+                    copy["location_name"].as_str().unwrap_or_default(),
+                    copy["path"].as_str().unwrap_or_default(),
+                    copy["device_name"]
+                        .as_str()
+                        .map(|device| format!(" on {device}"))
+                        .unwrap_or_default(),
+                    copy["last_verified_time_utc_ms"]
+                        .as_u64()
+                        .map_or("never".to_owned(), |time| format_age(time, now)),
+                    if copy["connected"] == true {
+                        "connected"
+                    } else {
+                        "not connected"
+                    }
+                );
+            }
+        }
+        if (items.len() as u64) < total {
+            println!(
+                "  …and {} more; raise --limit to list them",
+                total - items.len() as u64
+            );
+        }
+        println!(
+            "Repair manually: copy the good file back over the corrupt one (keeping a copy of the corrupt bytes if unsure), then run archive verify on that Location to confirm."
+        );
+    }
+    Ok(if total > 0 { EXIT_FINDINGS } else { EXIT_OK })
 }
 
 fn execute_v2_stale_report(
@@ -11286,6 +11509,7 @@ fn print_v2_inventory_findings(summary: &archive_ledger::V2InventorySummary) {
     if remaining > 0 {
         println!("    ... and {remaining} more; see archive report integrity");
     }
+    println!("See where verified copies are with: archive report integrity");
     println!("Restore good bytes and rescan. For intentional ordinary-file edits, preview with:");
     println!("  archive collection add ROOT --accept-changes FILE --dry-run");
     println!("FILE is relative to ROOT. Replace --dry-run with --yes to accept; annex identities cannot be accepted this way.");
