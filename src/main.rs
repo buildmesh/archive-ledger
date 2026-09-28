@@ -12522,17 +12522,49 @@ fn refuse_unfinished_v2_scans(
              ORDER BY created_time_utc_ms DESC, job_id DESC",
         )
         .map_err(|source| v2_cli_sql_error(database, source))?;
-    let ids = statement
+    let mut ids = statement
         .query_map(params![location_id, collection_id, continuing], |row| {
             row.get::<_, String>(0)
         })
         .map_err(|source| v2_cli_sql_error(database, source))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|source| v2_cli_sql_error(database, source))?;
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    // Rebuild omits unpublished jobs, but their local state remains resumable.
+    for job_id in archive_ledger::local_job_ids(archive_root)? {
+        if continuing == Some(job_id.as_str()) {
+            continue;
+        }
+        let known: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
+                [&job_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if known {
+            continue; // In particular, a terminal database row takes precedence.
+        }
+        if let Some(config) = v2_local_job_config(database, &job_id)? {
+            if config.job_type == "location_scan"
+                && config
+                    .params
+                    .get("location_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(location_id)
+                && config
+                    .params
+                    .get("collection_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(collection_id)
+            {
+                ids.push(job_id);
+            }
+        }
+    }
     if ids.is_empty() {
         return Ok(());
     }
-    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
     let jobs = ids
         .into_iter()
         .map(|job_id| {

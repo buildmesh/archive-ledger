@@ -1672,8 +1672,8 @@ mod unix {
         let scan = |extra: &[&str]| {
             let mut command = archive(&temp);
             command
-                .args(extra)
-                .args(["location", "scan", "--path", path, "--collection", "Files"]);
+                .args(["location", "scan", "--path", path, "--collection", "Files"])
+                .args(extra);
             command.output().unwrap()
         };
         success(archive(&temp).args([
@@ -1694,24 +1694,71 @@ mod unix {
                 .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
                 .unwrap()
         };
-        let before = job_count();
+        let job_root = root(&temp).join("local/jobs/job_first");
+        let job_files = || {
+            fs::read_dir(&job_root)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let files_before = job_files();
+        for rebuild in [false, true] {
+            if rebuild {
+                success(archive(&temp).args(["db", "rebuild"]));
+                let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+                let rows: i64 = database
+                    .query_row(
+                        "SELECT COUNT(*) FROM jobs WHERE job_id = 'job_first'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rows, 0, "unfinished job survives only in local files");
+            }
+            let before = job_count();
+            let refused = scan(&[]);
+            assert!(
+                !refused.status.success(),
+                "fresh scan allowed after rebuild={rebuild}"
+            );
+            let message = String::from_utf8(refused.stderr).unwrap();
+            assert!(
+                message.starts_with("error [unfinished_scan_job]:"),
+                "{message}"
+            );
+            assert!(message.contains("archive job resume job_first"));
+            assert!(message.contains("archive job cancel job_first"));
+            for extra in [vec!["--json"], vec!["--json", "--dry-run"]] {
+                let refused = scan(&extra);
+                assert!(refused.stdout.is_empty());
+                let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
+                assert_eq!(error["error"]["code"], "unfinished_scan_job");
+                assert_eq!(error["error"]["details"]["jobs"][0]["job_id"], "job_first");
+                assert_eq!(error["error"]["details"]["jobs"][0]["live"], false);
+            }
+            assert_eq!(job_count(), before, "a refused scan creates no job");
+            assert_eq!(
+                job_files(),
+                files_before,
+                "refusal preserves checkpoint state"
+            );
+        }
 
-        let refused = scan(&[]);
-        assert!(!refused.status.success());
-        let message = String::from_utf8(refused.stderr).unwrap();
-        assert!(
-            message.starts_with("error [unfinished_scan_job]:"),
-            "{message}"
-        );
-        assert!(message.contains("archive job resume job_first"));
-        assert!(message.contains("archive job cancel job_first"));
-        let refused = scan(&["--json"]);
-        assert!(refused.stdout.is_empty());
-        let error: Value = serde_json::from_slice(&refused.stderr).unwrap();
-        assert_eq!(error["error"]["code"], "unfinished_scan_job");
-        assert_eq!(error["error"]["details"]["jobs"][0]["job_id"], "job_first");
-        assert_eq!(error["error"]["details"]["jobs"][0]["live"], false);
-        assert_eq!(job_count(), before, "a refused scan creates no job");
+        // Without a projected row, scope cannot be inspected while the job is locked.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root(&temp).join("local/job-locks/job_first.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        let busy = scan(&["--json"]);
+        let error: Value = serde_json::from_slice(&busy.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "job_busy");
+        assert_eq!(job_files(), files_before);
+        drop(lock);
 
         // Other Locations are unaffected, and the unfinished job itself can resume.
         success(archive(&temp).args([
@@ -1723,6 +1770,13 @@ mod unix {
             "Other",
         ]));
         success(archive(&temp).args(["job", "resume", "job_first"]));
+        // Completed database rows take precedence over leftover local configuration.
+        fs::create_dir_all(&job_root).unwrap();
+        fs::write(
+            job_root.join("inventory-config.json"),
+            b"invalid leftover config",
+        )
+        .unwrap();
         success(&mut {
             let mut command = archive(&temp);
             command.args(["location", "scan", "--path", path, "--collection", "Files"]);
@@ -1742,6 +1796,7 @@ mod unix {
             "--max-items",
             "1",
         ]));
+        success(archive(&temp).args(["db", "rebuild"]));
         assert!(!scan(&[]).status.success());
         success(archive(&temp).args(["job", "cancel", "job_second"]));
         assert!(scan(&[]).status.success());
