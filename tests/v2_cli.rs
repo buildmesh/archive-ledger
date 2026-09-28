@@ -34,6 +34,49 @@ mod unix {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_guide_does_not_use_the_callers_selected_archive() {
+        let caller = TempDir::new().unwrap();
+        success(archive(&caller).args([
+            "init",
+            "Caller archive",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let caller_root = root(&caller);
+        let database_before = fs::read(caller_root.join("archive.db")).unwrap();
+        let head_before = git(&caller_root.join("canonical"), &["rev-parse", "HEAD"]).stdout;
+        let guide = TempDir::new().unwrap();
+        let output = Command::new("python3")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test-lifecycle-guide.py"))
+            .args(["--binary", env!("CARGO_BIN_EXE_archive")])
+            .env("HOME", guide.path())
+            .env("XDG_DATA_HOME", guide.path().join("caller-data"))
+            .env("XDG_CONFIG_HOME", guide.path().join("caller-config"))
+            .env("ARCHIVE_LEDGER_ARCHIVE", &caller_root)
+            .env("ARCHIVE_LEDGER_OUTPUT", "json")
+            .output()
+            .unwrap();
+        assert_eq!(
+            git(&caller_root.join("canonical"), &["rev-parse", "HEAD"]).stdout,
+            head_before,
+            "guide mutated the caller-selected catalog"
+        );
+        assert_eq!(
+            fs::read(caller_root.join("archive.db")).unwrap(),
+            database_before,
+            "guide mutated the caller-selected projection"
+        );
+        assert!(
+            output.status.success(),
+            "guide failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn job_lookup_keeps_old_terminal_rows_authoritative() {
         let temp = TempDir::new().unwrap();

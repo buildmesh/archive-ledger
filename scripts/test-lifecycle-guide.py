@@ -10,6 +10,7 @@ directories that are removed afterwards. Substitutions make the guide runnable w
     stable filesystem identity (the guide tells readers not to use that flag casually).
 Archive Ledger exit code 10 means "findings" and is accepted; any other failure stops the run.
 Also checks that every README anchor the guide links to exists.
+Caller Archive Ledger environment overrides are cleared so commands use the disposable Archive.
 """
 
 import argparse
@@ -68,9 +69,11 @@ def main():
             block = re.sub(r'archive (collection|location) init ',
                            r'archive \1 init --allow-unidentified-root ', block)
             script += [f'echo "--- block {number}" >&2', block]
-        env = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(root / 'data'),
-                   XDG_CONFIG_HOME=str(root / 'config'),
-                   GIT_CONFIG_NOSYSTEM='1')
+        # A caller's absolute Archive selector overrides the temporary HOME/XDG paths.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith('ARCHIVE_LEDGER_')}
+        env.update(HOME=str(home), XDG_DATA_HOME=str(root / 'data'),
+                   XDG_CONFIG_HOME=str(root / 'config'), GIT_CONFIG_NOSYSTEM='1')
         result = subprocess.run(['bash', '-c', '\n'.join(script)], env=env, cwd=home,
                                 text=True, capture_output=True)
         if args.verbose:
