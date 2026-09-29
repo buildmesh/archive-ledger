@@ -120,6 +120,37 @@ The canonical Git commit binds both the pointer and referenced manifest. Git
 synchronization constructs a verified successor rather than text-merging this
 pointer.
 
+If interruption occurs after `HEAD` advances but before its Git commit, job resume and the next
+local append reconcile that pending publication under the append lock. Recovery verifies the
+signed history and requires one direct successor of the committed frontier, advancing only the
+active local origin by one segment. Only the exact segment, manifest, successor frontier, and
+`HEAD` may differ; unrelated worktree/index changes, unfinished Git operations, unsafe links, or
+ambiguous historical files cause a recoverable refusal. Already-staged matching files are allowed. Recovery commits the
+verified bytes without generating another batch, before resume projects completion or removes
+local job inputs. Read-only verification does not perform this recovery.
+
+An interrupted local append can leave its next-sequence segment, manifest, or
+detached successor frontier durable before `HEAD` advances. On retry, the writer
+holds the append lock, verifies accepted history, and checks that the leftover
+files are unpublished local append evidence. It refuses ambiguous metadata,
+unsafe filesystem links, and files already staged or present in Git history
+(including reflogs), with `v2_append_recovery_refused`.
+
+Recoverable files are preserved beneath `local/append-recovery/<id>/`, with a
+`recovery.json` recording their original paths and accepted frontier. The writer
+moves the detached frontier first, then the manifest, then the segment, syncing
+the retained evidence and directory entries before proceeding. Retrying after
+interruption of recovery is safe. It does not accept the abandoned batch; the
+requested operation publishes a new batch. The append result's optional
+`recovered_append` field names the evidence directory. Evidence is retained until
+the user has investigated the interruption and explicitly removes it.
+
+Read-only `archive fsck` reports segments and manifests beyond accepted origin
+tails as `unpublished_append_artifacts`, separately from damage to accepted
+signed history. A writer retry can recover its own recognized unpublished
+append; other or ambiguous artifacts require investigation. Temporary segment
+and HEAD files are outside this recovery scope.
+
 Each batch start records its causal base frontier. Projection may process a
 batch only after that base is satisfied. Concurrent batches need no invented
 global order: additive rules commute, while contradictions are preserved as
@@ -491,6 +522,20 @@ streams canonical history in bounded sequential passes, verifies the final
 cursor, and atomically installs the replacement. It does not delete the only
 usable database before the replacement succeeds.
 
+New-database reconstruction streams up to 64 canonical records per transaction
+with a 64 MiB SQLite page-cache target and reusable statements on the annex
+projection path. The cache target is not a process-memory limit. Primary-key,
+uniqueness, and replay lookup indexes remain active; selected reporting indexes
+are built after replay, before integrity and foreign-key validation. Normal
+rollback journaling and synchronization remain enabled. These are rebuild
+defaults, not user configuration flags; incremental apply retains its bounded
+per-record transactions.
+
+An unfinished database keeps SQLite's `user_version` at zero. The supported
+schema version is written only after reconstruction, index creation, and final
+validation succeed, so normal open cannot accept a partial construction as a
+finished projection.
+
 Local-operational job progress and caches may be rebuilt or discarded. Derived archive facts must reproduce the same logical state.
 
 ### Normal reads
@@ -507,6 +552,17 @@ batch items for durable outcomes. The logical names below are item/outcome kinds
 not separate physical event envelopes.
 
 ### Scans
+
+The current scanner spools outcomes locally until final publication. Its local
+SQLite seen index also stores the committed spool byte length and file-outcome
+summary. Each checkpoint first flushes and syncs the spool, then commits the
+index and checkpoint together in one SQLite transaction. This includes processed
+entries that emitted no canonical item, such as unreadable files. Resume
+validates the committed JSONL prefix and truncates everything after its boundary;
+SQLite recovery restores the matching seen index and counters. Walk-only counts
+are recomputed during enumeration. A finalization interrupted before canonical
+publication regenerates missing candidates and completion items from that
+checkpoint; canonical completion is reconciled before local recovery.
 
 - `scan_started` records the collection, location, optional logical-path prefix,
   resolved root/device identity, filesystem-boundary rule, traversal version,
@@ -545,7 +601,25 @@ hashing, event, and resume implementations.
 Namespace coverage and byte integrity are separate. An enumerated regular file
 whose content cannot be read remains a present unknown/non-qualifying fact with
 a verification failure; that error alone does not hide names or make coverage
-partial. New or metadata-changed content is hashed to establish identity.
+partial. New content is hashed to establish identity. Known content is hashed
+against its expected identity: a mismatch emits `copy_verification_failed`, keeps
+the File's expected Object, and makes the observed Copy corrupt/non-qualifying.
+It never silently emits a replacement `content_observed` for differing bytes.
+Matching bytes, including after restoration of a corrupt copy or a metadata-only
+change, emit successful observation/verification and clear the Copy's failure.
+Explicit acceptance via named ordinary files in `collection add --accept-changes`
+may publish a new `content_observed` identity after confirmation. The selected
+paths are immutable resume inputs, and the positive-only acceptance job does not
+enumerate or reconcile other paths. Annex expected identities are not replaceable
+through this option. Historical content observations retain their replay semantics.
+Explicit acceptance adds `accepted_change: true` to `content_observed` as audit
+context; it does not reinterpret older observations. Ordinary mismatch items add
+`collection_id` and `file_ref_id` to `copy_verification_failed`, with the expected
+BLAKE3 Object/hash and the logical and copy paths. These fields let replay attach
+a corrupt claim at a newly observed Location without inventing a successful
+verification or replacing the File's identity. The projector validates the
+scoped File, expected Object/hash, and any existing Copy identity. Namespace
+reappearance can reactivate the File path while retaining its expected Object.
 Unchanged known content is not rehashed by default; routine rehashing belongs to
 `archive verify`. Traversal or directory-stat errors that may hide entries make
 the scan partial.
@@ -558,7 +632,11 @@ and is not made missing by an effective candidate. Facts already `missing` or
 `superseded` before the scan are excluded. The projector recomputes the declared
 observation count/digest by streaming that canonical set in stable
 encoded-path order. It then updates
-`last_complete_scan_id` for the covered set in the same finalization transaction.
+`last_complete_scan_id` for the covered set in the same finalization transaction, and raises its
+presence (`last_seen_time_utc_ms`) to the scan's start time without moving any later observation
+backwards, for completions that record `unchanged_files` (earlier completions itemized what
+they read and replay unchanged). Claims are refreshed only through present observations the scan
+covered. Verification time is unchanged: only reading bytes refreshes integrity.
 No local job row or per-file unchanged item is needed for replay. Causal
 comparison ensures an effective missing candidate never overwrites a concurrent
 or descendant positive/replacement fact for the same target.
@@ -580,6 +658,14 @@ outcome marks the item complete without another append. Before emitting a new
 outcome, the writer holds the exclusive stream lock and rejects any existing
 operation key. A crash can therefore leave local progress behind canonical
 history, but cannot duplicate a canonical outcome.
+
+The current v2 inventory and annex-import writers enforce same-job exclusion
+with a nonblocking local job lock, held before canonical reconciliation through
+publication, projection, and cleanup. Contention returns `job_busy`. Empty lock
+files remain in `local/job-locks` so job-directory cleanup cannot split lock
+ownership across different files; process exit releases the lock. The store's
+append lock alone does not yet enforce the general operation-key rejection
+invariant above across all writers.
 
 The opt-in background stale-presence runner uses `job_started` and
 `job_finished` only when a recognized connected Device has eligible work or an

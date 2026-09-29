@@ -6,6 +6,8 @@ verification, synchronization, and recovery.
 
 Available workflows:
 
+- [From first Archive to routine maintenance](guides/archive-lifecycle.md): the end-to-end
+  lifecycle of an Archive, from setup and catalog protection to routine checks.
 - [Seven git-annex workflows in Docker](guides/annex-workflows.md): import legacy repositories
   without git-annex, verify and add files, register an existing clone, copy to an ordinary
   Location, and review copy requirements.

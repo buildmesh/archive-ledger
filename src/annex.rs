@@ -14,21 +14,41 @@ use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256, Sha512};
 use thiserror::Error;
 
-use crate::annex_progress::AnnexProgress;
 use crate::discovery::{encode_relative_path, modified_time_ms, EncodedPath};
 use crate::event_store::{EventReferences, EventRequest, EventStore, EventStoreError};
 use crate::git::managed_git_command;
 use crate::job::{validate_job_id, JobDirectory};
+use crate::progress::Progress;
 use crate::projection::{ProjectionDb, ProjectionError};
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 use crate::v2_store::{V2OriginStore, V2StoreError};
 
 const MAX_POINTER_BYTES: u64 = 32 * 1024;
+/// A job configuration without the repository snapshot it was taken from, to tell
+/// "the repository changed" apart from any other input mismatch.
+fn without_snapshot(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("git_head_commit");
+        object.remove("source_fingerprint");
+    }
+    value
+}
+
+/// Every file an annex import job may leave in its local job directory.
+pub(crate) const ANNEX_JOB_FILES: [&str; 4] = [
+    "annex-items.jsonl",
+    "annex-summary.json",
+    "annex-summary.json.tmp",
+    "annex-config.json",
+];
 
 pub type Result<T> = std::result::Result<T, AnnexImportError>;
 
 #[derive(Debug, Error)]
 pub enum AnnexImportError {
+    #[error("job {0} is running in another process")]
+    JobBusy(String),
     #[error(transparent)]
     EventStore(#[from] EventStoreError),
 
@@ -67,6 +87,13 @@ pub enum AnnexImportError {
     #[error("git-annex repository changed during import")]
     SourceChanged,
 
+    #[error("the git-annex repository changed since import job {job_id} started, so it cannot be resumed; abandon it with `archive job cancel {job_id}`, then import again with `archive location import-annex {repository} --collection {collection_id}` (add --reimport if the abandoned import was one; for a large repository, add --inventory-only and then run `archive location scan`, which resumes across repository changes)")]
+    ChangedSinceStarted {
+        job_id: String,
+        repository: String,
+        collection_id: String,
+    },
+
     #[error("lossless git path handling is unavailable on this platform")]
     UnsupportedPlatform,
 }
@@ -74,6 +101,7 @@ pub enum AnnexImportError {
 impl AnnexImportError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::JobBusy(_) => "job_busy",
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
             Self::V2Store(error) => error.code(),
@@ -82,7 +110,7 @@ impl AnnexImportError {
             Self::Git { .. } => "annex_git_failed",
             Self::InvalidGitOutput { .. } => "annex_invalid_git_output",
             Self::InvalidConfig(_) => "annex_invalid_config",
-            Self::SourceChanged => "annex_source_changed",
+            Self::SourceChanged | Self::ChangedSinceStarted { .. } => "annex_source_changed",
             Self::UnsupportedPlatform => "annex_platform_unsupported",
         }
     }
@@ -200,7 +228,7 @@ pub struct V2AnnexImporter<'a> {
     store: &'a V2OriginStore,
     projection: &'a V2ProjectionDb,
     config: AnnexImportConfig,
-    progress: Option<&'a AnnexProgress>,
+    progress: Option<&'a Progress>,
 }
 
 /// Detects a git-annex worktree from its local Git configuration without
@@ -351,7 +379,15 @@ impl<'a> V2AnnexImporter<'a> {
         })
     }
 
-    pub fn with_progress(mut self, progress: &'a AnnexProgress) -> Self {
+    fn changed_since_started(&self) -> AnnexImportError {
+        AnnexImportError::ChangedSinceStarted {
+            job_id: self.config.job_id.clone(),
+            repository: self.config.repo_path.display().to_string(),
+            collection_id: self.config.collection_id.clone(),
+        }
+    }
+
+    pub fn with_progress(mut self, progress: &'a Progress) -> Self {
         self.progress = Some(progress);
         self
     }
@@ -373,7 +409,43 @@ impl<'a> V2AnnexImporter<'a> {
     }
 
     pub fn run_at_most(&self, limit: Option<usize>) -> Result<AnnexImportResult> {
+        let archive_root = self
+            .projection
+            .path()
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let job = JobDirectory::new(archive_root, &self.config.job_id)
+            .map_err(|source| io_error("prepare annex import job path", archive_root, source))?;
+        let _job_lock = job.try_lock().map_err(|source| {
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                AnnexImportError::JobBusy(self.config.job_id.clone())
+            } else {
+                io_error("lock annex import job", job.path(), source)
+            }
+        })?;
+        let cancelled: bool = rusqlite::Connection::open(self.projection.path())
+            .and_then(|connection| {
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1 AND status = 'cancelled')",
+                    [&self.config.job_id],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(|source| {
+                AnnexImportError::V2Projection(V2ProjectionError::Sqlite {
+                    path: self.projection.path().to_path_buf(),
+                    source,
+                })
+            })?;
+        if cancelled {
+            return Err(AnnexImportError::InvalidConfig(format!(
+                "job {} was cancelled; start a new import with a different job ID",
+                self.config.job_id
+            )));
+        }
         self.progress_phase("Preparing catalog");
+        self.store.recover_pending_publication()?;
         self.projection.apply(self.store)?;
         self.progress_phase("Inspecting source metadata");
         let initial = SourceSnapshot::capture_with_progress(&self.config.repo_path, self.progress)?;
@@ -387,14 +459,6 @@ impl<'a> V2AnnexImporter<'a> {
                 "repository has no annex.uuid".to_owned(),
             ));
         }
-        let archive_root = self
-            .projection
-            .path()
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let job = JobDirectory::new(archive_root, &self.config.job_id)
-            .map_err(|source| io_error("prepare annex import job path", archive_root, source))?;
         job.ensure()
             .map_err(|source| io_error("create annex import job directory", job.path(), source))?;
         let job_root = job.path().to_path_buf();
@@ -430,6 +494,10 @@ impl<'a> V2AnnexImporter<'a> {
                 ))
             })?;
             if existing != config_value {
+                // Same import, different repository state: name the way forward.
+                if without_snapshot(&existing) == without_snapshot(&config_value) {
+                    return Err(self.changed_since_started());
+                }
                 return Err(AnnexImportError::InvalidConfig(format!(
                     "job {} belongs to a different repository snapshot or import",
                     self.config.job_id
@@ -478,6 +546,14 @@ impl<'a> V2AnnexImporter<'a> {
                 path: self.projection.path().to_path_buf(),
                 source,
             }))?;
+        if actual.0 == "annex_import"
+            && actual.2 == self.config.import_id
+            && actual.3 != params_text
+            && serde_json::from_str::<Value>(&actual.3)
+                .is_ok_and(|stored| without_snapshot(&stored) == without_snapshot(&config_value))
+        {
+            return Err(self.changed_since_started());
+        }
         if actual.0 != "annex_import"
             || actual.2 != self.config.import_id
             || actual.3 != params_text
@@ -500,13 +576,7 @@ impl<'a> V2AnnexImporter<'a> {
                 })?
                 .unwrap_or_default();
             self.progress_summary(&summary);
-            job.cleanup(&[
-                "annex-items.jsonl",
-                "annex-summary.json",
-                "annex-summary.json.tmp",
-                "annex-config.json",
-            ])
-            .map_err(|source| {
+            job.cleanup(&ANNEX_JOB_FILES).map_err(|source| {
                 io_error("remove completed annex import job files", &job_root, source)
             })?;
             return Ok(AnnexImportResult {
@@ -718,8 +788,10 @@ impl<'a> V2AnnexImporter<'a> {
             .and_then(|()| spool.get_ref().sync_all())
             .map_err(|source| io_error("sync annex import spool", &spool_path, source))?;
         drop(spool);
-        self.progress_phase("Saving catalog events");
-        self.store.append_jsonl_batch(
+        let mut append_progress = self
+            .progress
+            .map(|progress| move |update| progress.append_progress(update));
+        self.store.append_jsonl_batch_with_progress(
             "annex_import",
             1,
             json!({
@@ -729,17 +801,23 @@ impl<'a> V2AnnexImporter<'a> {
             }),
             json!({}),
             &spool_path,
+            append_progress
+                .as_mut()
+                .map(|observer| observer as &mut dyn FnMut(_)),
         )?;
-        self.progress_phase("Updating catalog index");
-        self.projection.apply(self.store)?;
+        let mut apply_progress = self
+            .progress
+            .map(|progress| move |update| progress.apply_progress(update));
+        self.projection.apply_with_progress(
+            self.store,
+            apply_progress
+                .as_mut()
+                .map(|observer| observer as &mut dyn FnMut(_)),
+        )?;
         drop(connection);
-        job.cleanup(&[
-            "annex-items.jsonl",
-            "annex-summary.json",
-            "annex-summary.json.tmp",
-            "annex-config.json",
-        ])
-        .map_err(|source| io_error("remove completed annex import job files", &job_root, source))?;
+        job.cleanup(&ANNEX_JOB_FILES).map_err(|source| {
+            io_error("remove completed annex import job files", &job_root, source)
+        })?;
         Ok(AnnexImportResult {
             status: AnnexImportStatus::Complete,
             annex_uuid,
@@ -1641,7 +1719,7 @@ fn inspect_entry_v2(
     entry: &IndexEntry,
     index_blob: &[u8],
     key: &AnnexKey,
-    progress: Option<&AnnexProgress>,
+    progress: Option<&Progress>,
 ) -> Result<EntryOutcome> {
     if config.inventory_only {
         return inventory_entry_v2(config, entry, index_blob, key);
@@ -1906,7 +1984,7 @@ fn hash_file(
     path: &Path,
     initial_metadata: &Metadata,
     hash_sha512: bool,
-    progress: Option<&AnnexProgress>,
+    progress: Option<&Progress>,
 ) -> Result<ContentHashes> {
     let start = std::time::Instant::now();
     let mut file =
@@ -2411,7 +2489,7 @@ impl SourceSnapshot {
         Self::capture_with_progress(repo, None)
     }
 
-    fn capture_with_progress(repo: &Path, progress: Option<&AnnexProgress>) -> Result<Self> {
+    fn capture_with_progress(repo: &Path, progress: Option<&Progress>) -> Result<Self> {
         Ok(Self {
             head: git_text(repo, "read HEAD", &["rev-parse", "--verify", "HEAD"])?,
             annex_branch: git_text_optional(
@@ -2442,7 +2520,7 @@ impl SourceSnapshot {
 }
 
 #[cfg(unix)]
-fn worktree_metadata_digest(repo: &Path, progress: Option<&AnnexProgress>) -> Result<String> {
+fn worktree_metadata_digest(repo: &Path, progress: Option<&Progress>) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
@@ -2487,7 +2565,7 @@ fn worktree_metadata_digest(repo: &Path, progress: Option<&AnnexProgress>) -> Re
 }
 
 #[cfg(not(unix))]
-fn worktree_metadata_digest(_repo: &Path, _progress: Option<&AnnexProgress>) -> Result<String> {
+fn worktree_metadata_digest(_repo: &Path, _progress: Option<&Progress>) -> Result<String> {
     Err(AnnexImportError::UnsupportedPlatform)
 }
 

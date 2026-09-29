@@ -97,39 +97,100 @@ archive-docker location scan "Media source" --path /locations/source
 The scan reads available content, validates its original annex checksum, and establishes its
 BLAKE3 identity and verified presence. The positional argument is a Location name or ID, not a
 filesystem path; supply the mounted directory with `--path`. An incomplete scan cannot mark
-unvisited files missing.
+unvisited files missing. The scan prints its job ID and resume command on stderr before it starts;
+keep it for `archive job resume` if the scan is interrupted. Live scan progress needs a terminal,
+so omit Compose's `-T` to see it.
 
 Import progress goes to stderr through metadata inspection, import, source rechecking,
 publication, and projection. It includes processed entries, skipped links and other entries,
 verified, absent and unchecked counts, errors, and bytes read this run. A terminal gets updates
 about once a second; redirected output gets updates every 30 seconds, plus start and finish
 updates. The helper above uses Compose's `-T`, so it uses the redirected cadence. Omit `-T` for
-terminal progress. JSON results stay on stdout. There is no percentage or ETA.
+terminal progress. JSON results stay on stdout. Saving events shows bytes read from the spool
+against its size; SQLite replay shows committed records processed this pass against the frontier
+gap. Verification and finalization are named separately, so a full spool counter does not claim
+that the Git publication is already complete. There is no percentage or ETA.
 
 If an earlier Archive Ledger version imported SHA512 entries as unresolved or without their
-expected checksum metadata, rerun import on the same registered path, then verify:
+expected checksum metadata, explicitly re-import the same registered path, then scan it:
 
 ```bash
-archive-docker location import-annex /locations/source \
+archive-docker location import-annex /locations/source --reimport \
   --collection Media --location-name "Media source" \
   --device "Source disk" --site Home --non-interactive
-archive-docker verify "Media source" --path /locations/source
+archive-docker location scan "Media source" --path /locations/source
 ```
 
 Use the existing Collection and Location settings, including `--allow-unidentified-root` if that
 was required after discovery. Re-import reuses the Location and Files while learning the original
 SHA512 checksum metadata. Rebuilding the catalog database alone cannot discover missing hashes.
 
+Ordinary updates use `location scan`. Repeating a completed import requires `--reimport` to
+avoid an accidental full rescan and duplicate import evidence. If an import is unfinished,
+setup names its job and refuses to start another; use the printed `archive job resume <job-id>`
+command. `--reimport` does not bypass an unfinished job.
+
+### If an import or scan is interrupted
+
+A long import or scan that stops (Ctrl-C, a crash, a stopped container, or a reboot) is
+recoverable. Both save local progress every 1,000 entries (`--batch-entries`), so an interruption
+costs at most the entries since the last checkpoint. Nothing reaches the catalog history until a
+run finishes, so there is no half-written import to repair. The saved progress lives in the
+Archive's `local/jobs/<job-id>/` directory on this installation. It is not synchronized to other
+installations.
+
+Find the unfinished job and resume it:
+
+```bash
+archive-docker job list
+archive-docker job show <job-id>
+archive-docker job resume <job-id>
+```
+
+`job list` shows unfinished jobs by default, including jobs whose progress survives only on disk
+(for example after `db rebuild`), and `archive-docker status` mentions them. `job resume` needs no
+other options: it takes the original repository, Collection, Location, and settings from the job.
+A resumed import repeats the repository metadata checks, which can take a while on a large
+repository, then continues from its last checkpoint.
+
+Do not re-run `collection init --import-annex` or `location import-annex` to continue. While the
+import is unfinished they refuse and name the job, and `--reimport` does not bypass it. A
+`location scan` prints its job ID when it starts. A new scan of the same Location is refused
+while that job is unfinished, and `archive-docker job cancel <job-id>` abandons an unfinished scan
+(preview with `--dry-run`).
+
+An interrupted import resumes only while the repository is unchanged: the same Git commit and the
+same worktree metadata. After a commit, `git annex get` or `drop`, or other changes, resume refuses
+and says so. Abandon that import and start again from the repository's current state:
+
+```bash
+archive-docker job cancel <job-id> --dry-run
+archive-docker job cancel <job-id>
+archive-docker location import-annex /locations/source --collection Media \
+  --location-name "Media source" --device "Source disk" --site Home \
+  --inventory-only --non-interactive
+```
+
+Cancel removes only that import's local progress; the Collection and Location it set up remain,
+which is why the restart uses `location import-annex` with the existing Collection. If the
+abandoned import was a `--reimport`, add `--reimport` again.
+For a large repository, prefer `--inventory-only` followed by `location scan`, both for the first
+import and after a restart. The inventory reads no file content, so it is short and cheap to
+redo. The long, content-reading part then happens in the scan, which resumes across repository
+changes and skips files it has already verified.
+
 ## 3. Verify presence and integrity throughout a Location
 
 ```bash
-archive-docker verify "Media source" --path /locations/source
+archive-docker verify "Media source" --path /locations/source --all
+archive-docker location scan "Media source" --path /locations/source
 archive-docker location status "Media source"
 ```
 
-In the current v2 implementation, `verify` runs a complete Location scan and reads content for
-integrity checking. It also discovers additions and reconciles absence; only complete traversal
-can publish missing facts. Partial traversal does not mark unvisited files absent. Review the
+`verify --all` re-reads every current copy at the Location and checks it against its content
+identity; plain `verify` reads only copies that are due. Verification does not discover additions
+or reconcile absence: `location scan` does, and only a complete traversal can publish missing
+facts. Partial traversal does not mark unvisited files absent. Review the
 reported integrity failures and coverage status: exit `10` signals findings, while exit `2`
 means a command error. The mounted path must correspond to the entire registered Location.
 
@@ -292,6 +353,163 @@ present copies remain in the results.
 These are recorded-present copy counts, not qualifying Policy copies, distinct Devices, or
 distinct Sites. Refresh relevant Locations first when current physical presence matters. Use the
 Policy workflow above when freshness and independent failure domains should affect the result.
+
+## SQLite temporary-directory failure and recovery
+
+A large annex import can save canonical events before updating the SQLite projection fails:
+
+```text
+error [v2_projection_sqlite]: SQLite operation failed for .../archive.db: disk I/O error
+```
+
+Current projection errors append SQLite's numeric primary and extended result codes to the
+original message, in both human and JSON output, while retaining `v2_projection_sqlite`.
+For example, extended code `6410` (`SQLITE_IOERR_GETTEMPPATH`) identifies failure to find
+a usable temporary directory and adds a permissions/storage hint. Other I/O codes do not
+receive that hint. The older failure quoted above did not capture its extended code.
+
+The database path identifies the affected catalog; it does not establish which underlying file
+operation failed. SQLite can need temporary files as operations outgrow their temporary page
+caches, and an unavailable temporary directory can produce an I/O error. Other I/O errors have
+different causes, so do not assume every occurrence has this explanation. See SQLite's
+[temporary-file documentation](https://www.sqlite.org/tempfiles.html#temporary_file_storage_locations)
+and [extended error codes](https://www.sqlite.org/rescode.html#ioerr_gettemppath).
+
+### What the observed failure established
+
+During a real large-repository import, the catalog was on a read/write ext4 bind mount. It had
+42 GB available despite `df` rounding usage to 100%, and only 5% of its inodes were used. The
+supplied kernel-log excerpt contained normal startup messages without a reported storage error;
+this did not rule out all storage faults. In the diagnostic container, `/tmp` resolved to the
+overlay filesystem rather than the writable tmpfs configured in this repository's Compose file.
+
+Routine `fsck` passed Git, signed-event, SQLite `quick_check`, and foreign-key checks, but found
+SQLite behind canonical history. Ordinary `db apply` reproduced the I/O error. Running the same
+command with `SQLITE_TMPDIR=/state` succeeded, and a subsequent `fsck` reported a current,
+healthy catalog with matching record counts and origin cursors.
+
+The operator subsequently reported an earlier out-of-space failure and changing the Compose
+`tmpfs` destination from `/tmp` to a host-looking disk directory. A `tmpfs` entry names a
+destination inside the container; it does not bind that host directory or use its disk space or
+permissions. That change explains why `/tmp` was on overlay and strongly supports unusable
+default temporary storage as the cause of the later I/O error. The exact failing syscall and
+SQLite extended error code were not captured. There was no evidence requiring a database
+rebuild, and this recovery did not rehash annex content.
+
+### Diagnose and recover
+
+Stop the failed import before recovery and preserve the Archive directory, including database
+sidecars and local job files. Do not delete the database or repeat `collection init` to clear
+this error. From the directory containing your Compose configuration, inspect the mounts:
+
+```bash
+docker compose run --rm --no-deps --entrypoint /bin/sh archive -c '
+  df -h /state /tmp
+  df -i /state /tmp
+  findmnt -T /state -o TARGET,SOURCE,FSTYPE,OPTIONS
+  findmnt -T /tmp -o TARGET,SOURCE,FSTYPE,OPTIONS
+'
+```
+
+This starts a new container: it shows the current configuration, not the failed container's
+previous temporary-file usage. Also check host kernel logs around the failure for filesystem or
+device errors. Check the catalog without attempting repairs (replace `Main` with your Archive):
+
+```bash
+docker compose run --rm archive --archive Main fsck
+```
+
+If history and SQLite checks pass but the projection is behind, test the temporary-directory
+workaround with `/state` writable by the configured container UID/GID:
+
+```bash
+docker compose run --rm -e SQLITE_TMPDIR=/state archive --archive Main db apply
+# Run this after db apply succeeds:
+docker compose run --rm archive --archive Main fsck
+```
+
+`db apply` updates SQLite from saved canonical events. It does not scan or hash Location content.
+If the workaround also fails, preserve the error and investigate further instead of repeatedly
+retrying or assuming disk exhaustion. A successful routine `fsck` establishes the checks it
+reports; it does not verify annex payload integrity, prove the entire intended import completed,
+or perform the optional full projection-rebuild comparison.
+
+### Disk-backed temporary storage in Compose
+
+The repository's Compose configuration now sets `SQLITE_TMPDIR=/state` by default. Large SQLite
+operations can spill to disk without competing with the application for the RAM backing `/tmp`.
+Older or custom Compose files can adopt the same setting by adding this entry to the existing
+service environment, preserving its other entries:
+
+```yaml
+services:
+  archive:
+    environment:
+      SQLITE_TMPDIR: /state
+```
+
+It takes effect on subsequent `docker compose run` invocations without rebuilding the image.
+SQLite then prefers `/state` for temporary-file selection; temporary spill uses the state disk
+and needs free space there. This does not relocate the catalog or disable SQLite journaling.
+Temporary-space requirements depend on the operation and catalog; 4 GiB is not a universal
+threshold or a sizing guarantee. Increasing the tmpfs limit alone does not add RAM. Disk-backed
+SQLite temporary storage addresses the capacity limitation without enlarging tmpfs.
+
+Restore the original `/tmp` tmpfs entry if it was changed to a host-looking path: other tools
+also use `/tmp`. The container's tmpfs is separate from the host's `/tmp` mount. Docker normally
+limits a tmpfs to half the host's RAM unless a size is specified; a 4 GiB limit on an 8 GiB
+machine does not mean Docker mounted the host's `/tmp`. See
+[Docker tmpfs mounts](https://docs.docker.com/engine/storage/tmpfs/).
+
+### Use a dedicated disk directory for large temporary files
+
+`SQLITE_TMPDIR=/state` is sufficient when the state disk has adequate free space. To put SQLite
+spill files on a different disk, create a dedicated host directory on that mounted disk and make
+it writable by the configured container UID/GID. Use a bind mount, keeping the original `/tmp`
+tmpfs for other tools. Merge these settings into the service, preserving its existing environment
+and `/state` and Location volume entries:
+
+```yaml
+services:
+  archive:
+    environment:
+      SQLITE_TMPDIR: /sqlite-tmp
+    tmpfs:
+      - /tmp:mode=1777,noexec,nosuid,nodev
+    volumes:
+      - type: bind
+        source: /var/data/disk7/tmp/archive-ledger
+        target: /sqlite-tmp
+        read_only: false
+        bind:
+          create_host_path: false
+```
+
+Here `source` is the host directory and `target` is its container path. SQLite temporary files
+use the host directory's filesystem capacity rather than the `/tmp` tmpfs limit. Mount the disk
+before starting the container. For the reported UID 1000 setup, host directory ownership by UID
+1000 works with a container configured to run as that UID. Confirm the effective mounts with:
+
+```bash
+docker compose run --rm --entrypoint /bin/sh archive -c '
+  id
+  df -h /tmp /sqlite-tmp
+  findmnt -T /sqlite-tmp -o TARGET,SOURCE,FSTYPE,OPTIONS
+  test -w /sqlite-tmp
+'
+```
+
+See [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/) for the distinction
+between a host source and a container destination.
+
+The reported I/O failure followed a deployment configuration mistake; the earlier temporary-space
+exhaustion also exposed a limitation of using tmpfs for large imports. The Compose default now
+addresses that limitation using the already-required writable state mount. Custom Compose files,
+overrides, and plain `docker run` deployments need to provide usable temporary storage too;
+plain `docker run` does not inherit Compose's environment settings. There is no demonstrated
+event-replay defect from this incident. Archive Ledger's error reporting still needs improvement:
+the current projection error message omits SQLite's extended error code, making different I/O
+failures hard to distinguish.
 
 ## Repeat the Docker end-to-end test
 

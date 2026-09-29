@@ -21,6 +21,11 @@ registered Locations. It does not move, delete, repair, or drop archive content.
 > an independent backup of each Archive's canonical event tree and do not rely on
 > this pre-production build as the only catalog for irreplaceable data.
 
+New to Archive Ledger? [From first Archive to routine maintenance](docs/guides/archive-lifecycle.md)
+walks through setup, protecting the catalog itself, adding copies, Policy, keeping the catalog
+current, and maintenance in order. A test script runs every command in it against a disposable
+Archive.
+
 See [Example workflows](docs/workflows.md) for task-oriented walkthroughs based on realistic
 Archive Ledger use.
 
@@ -179,6 +184,14 @@ mounts; `/state` and explicit copy destinations remain writable. See the
 [Docker Compose service reference](https://docs.docker.com/reference/compose-file/services/) for
 the capability and network controls.
 
+Compose sets `SQLITE_TMPDIR=/state` so large SQLite operations use the state disk for temporary
+files instead of consuming the RAM-backed `/tmp` capacity. Keep enough free space on the state
+disk for both the catalog and temporary files. Other tools retain writable `/tmp` on tmpfs.
+For a dedicated temporary-file disk, or if an older/custom setup fails during import or
+`db apply` with `v2_projection_sqlite: disk I/O error`, see
+[SQLite temporary-directory failure and recovery](docs/guides/annex-workflows.md#sqlite-temporary-directory-failure-and-recovery)
+for configuration, diagnostics, and recovery from saved events.
+
 Remote HTTP(S)/SSH synchronization and cloning require an explicit network opt-in for that command:
 
 ```bash
@@ -301,8 +314,11 @@ archive collection add . --collection "Documents"
 ```
 
 `collection add` infers the current Location and is positive-only. It streams traversal, computes
-BLAKE3 for new or changed regular files, records successful reads as verification and presence at
-that Location, and never marks an unvisited file missing. Git metadata named `.git` is always
+BLAKE3 for new and changed regular files, records matching reads as verification and presence at
+that Location, and never marks an unvisited file missing. A known file whose size and modification
+time are unchanged at this Location, with a good last check, is not read again: adding a few new
+files to a large tree reads only those files. A file that appears at a Location for the first time
+is always read, even if the Collection already has it elsewhere. Git metadata named `.git` is always
 excluded. It can safely target a subtree:
 
 ```bash
@@ -317,19 +333,59 @@ A complete reconciliation is explicit:
 
 ```bash
 cd /srv/archive/documents
+archive location scan --dry-run
 archive location scan
 ```
+
+`--dry-run` on `location scan` or `collection add` previews the run from metadata alone. It
+lists new files, files known elsewhere but not recorded at this Location, size or time changes,
+corrupt or unverified copies that would be read, files that would be marked missing (complete
+scan only), and copies whose presence or verification is due. It reads no file content, writes
+nothing, and exits with code 10 when a real run would record something. It cannot predict
+integrity results. Unlocked annex pointer files are recognized from their size; a small
+annex-tracked file that is neither unchanged, its recorded content size, nor a pointer's size is
+listed as uncertain, because telling requires reading it. Like a scan, the preview refuses while
+the Location has an unfinished scan job.
+
+On a terminal, `location scan` and `collection add` show live progress on stderr. Each first
+prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
+While a Location has an unfinished scan, a new `location scan` of it is refused rather than
+silently starting over; the error names the job to resume or cancel.
+
+A complete `location scan` also skips unchanged files, and when it finishes it refreshes presence
+for every file it saw. It re-reads new, changed, corrupt, and never-verified files. Byte integrity
+of unchanged files is the job of `archive verify` and the background runner, which re-read copies
+as their verification comes due. Content replaced with the same size and modification time (for
+example by `rsync -a`, coarse FAT timestamps, or some network filesystems) is therefore detected
+when that copy is next verified, not by the scan. Scan output reports how many copies at the
+Location are due and suggests `archive verify`.
 
 Only a successfully completed scan can mark prior paths missing. Traversal errors, permission
 failures, Device removal, cancellation, or concurrent namespace changes make coverage partial.
 Partial runs retain positives but cannot publish missing facts or fresh complete-coverage evidence.
 
-The human scan summary separates what was learned: files first added to this Location, files that
-were already known there, missing files, and files whose content was actually hashed and
-integrity-verified during this scan. A known path whose catalog observation needed refreshing is
-not described as a changed file. The versioned JSON retains the legacy `changed_paths` field for
-compatibility; it means an existing path observation was updated, not necessarily that its bytes
-changed. `integrity_verified_paths` is the explicit byte-verification count.
+Cataloged content is immutable by default. If a known file's bytes differ, add and scan report
+“content differs from catalog,” mark that copy corrupt, and return exit code 10. The File keeps
+its expected content identity. Restoring the original bytes and rescanning makes the copy good
+again. Merely changing modification time without changing bytes is not an integrity failure.
+
+To accept an intentional edit, name the exact ordinary file relative to the inventory directory:
+
+```bash
+archive collection add . --accept-changes notes.txt --dry-run
+archive collection add . --accept-changes notes.txt --yes
+```
+
+Repeat `--accept-changes FILE` for multiple files. Only those files are processed; directories,
+unknown paths, and annex-managed files cannot be accepted this way. Preview hashes current bytes
+without recording changes. Acceptance hashes them again, updates the catalog, and leaves file
+contents untouched. Without `--yes`, an interactive confirmation is required; scripts can use
+`--non-interactive --yes`. Paused acceptance jobs retain their exact selection for `job resume`.
+
+The v2 JSON summary reports `new_paths`, `confirmed_good`, `missing_paths`, and
+`integrity_mismatches`. `changed_paths` counts explicitly accepted changes to known content;
+ordinary add and scan never increment it for unexpected edits. `integrity_findings` provides up
+to 20 example paths; the mismatch count includes all findings.
 
 ## Check an unfamiliar directory before deleting its original
 
@@ -518,9 +574,10 @@ metadata inspection, import, source rechecking, publication, and projection; it 
 completion time. JSON results remain on stdout.
 
 For SHA512 entries imported by an earlier version without their expected checksum metadata,
-rerun `location import-annex` on the same registered path with its existing Collection and
-Location settings, then run `verify`. Re-import preserves the Location and File identities while
-learning the original checksum; a database rebuild alone does not discover missing hashes. See
+rerun `location import-annex --reimport` on the same registered path with its existing
+Collection and Location settings, then run `location scan`. Re-import preserves the Location and File
+identities while learning the original checksum; a database rebuild alone does not discover missing
+hashes. See
 the [legacy annex guide](docs/guides/annex-workflows.md#2-create-a-collection-by-importing-git-annex)
 for commands.
 
@@ -615,6 +672,31 @@ archive report integrity
 archive report policy
 ```
 
+`report integrity` lists copies whose content differs from the catalog (corrupt copies). For each
+one it shows where verified copies of the same content are: Location, Device, path, when each was
+last verified, and whether it is connected now. It says plainly when no verified copy remains in
+the Archive. It reads only the catalog and exits with code 10 while corrupt copies exist. To
+repair one by hand, copy a good file back over the corrupt one, keeping the corrupt bytes aside
+if you are unsure, then run `archive verify` on that Location: corrupt copies are always
+re-read, and a matching read marks the copy good again.
+
+`archive repair` does that for you when a verified copy is connected:
+
+```bash
+archive repair "Photos on Blue disk" --dry-run
+archive repair "Photos on Blue disk" --yes
+```
+
+For each corrupt copy it re-reads the most recently verified connected copy of the same content
+while copying it, moves the corrupt file into `.archive-ledger/quarantine/<job-id>/` in the same
+Location, places the verified replacement with its original modification time and permissions,
+reads it back, and records it as verified. Scans ignore the quarantine; delete it when you are
+satisfied. A copy whose size or modification time changed may be an intentional edit, so it is
+skipped unless you pass `--include-changed` (accept a real edit with
+`collection add --accept-changes` instead). Without a connected verified copy it says so and
+changes nothing. Omit the Location to repair every connected Location with matching identity.
+It is resumable with `archive job resume`, and requires `--yes` when not interactive.
+
 The starter Policy requires two qualifying copies on two Devices at two Sites, including one
 offsite copy, with verification, presence, and Device check-in evidence no more than 365 days old.
 Update only the settings that should change, for example:
@@ -672,13 +754,24 @@ conflicting, disconnected, or ambiguously mounted Device is skipped and its evid
 ## Verify bytes and resume work
 
 Adding or scanning content records the hashing read as baseline verification. Routine verification
-currently re-reads the selected Location:
+re-reads only the copies that are due: never verified, failed their last check, past their
+Policy's presence or verification age, or expiring within 30 days (`--verify-within DAYS`), but
+never more often than every half of the Policy's verification age. It reads the least recently
+verified first and does not walk directories. Omit the Location to verify every connected
+Location whose identity currently matches; add `--all` to re-read every copy:
 
 ```bash
+archive verify
 archive verify <main-location-id> \
   --path /srv/archive/documents \
   --fingerprint-status match
+archive verify <main-location-id> --all
 ```
+
+Verification does not discover new files or mark files missing; use `location scan` for that. If
+a copy cannot be read because it was moved or removed, verify records a read error and suggests a
+scan. Copies whose content identity is not yet known, for example after an inventory-only annex
+import, are reported and need `location scan`.
 
 Use `match` only after confirming the mounted filesystem is the registered Device. A mismatch
 blocks reads. A hash mismatch marks that copy corrupt without redefining the expected Object; a
@@ -690,10 +783,29 @@ Long operations print durable job IDs:
 archive job list
 archive job show <job-id>
 archive job resume <job-id>
+archive job cancel <job-id> --dry-run
 ```
 
-Resume applies canonical events first and uses deterministic outcomes, so interruption does not
-duplicate durable facts. Operations are batched and do not require all paths in memory.
+`job list` shows unfinished jobs with their type, age and last recorded progress; add `--all` to
+include finished, partial, failed and cancelled jobs. `archive status` mentions unfinished jobs.
+It also lists local job directories that have no row in the catalog database, for example after
+`db rebuild`. These are marked resumable, in use by another running process, or unrecognized.
+An unrecognized directory has no readable configuration and is kept for inspection. `job show`
+explains where an unfinished job stopped. After `db rebuild`, `job resume <job-id>` can recover
+annex and inventory work from this installation’s local checkpoint. Existing terminal job status
+still takes precedence; local checkpoints are not transferred by sync or portable snapshots.
+
+To abandon an unfinished location scan, collection add, or annex import, run
+`archive job cancel <job-id>`.
+Preview it first with `--dry-run`. Cancel removes only that job's local checkpoint files,
+including jobs left only on disk after `db rebuild`. Its unpublished progress is lost; the job had
+published nothing to catalog history. A job that is still running elsewhere is refused.
+
+Resume first finishes a verified local publication interrupted between frontier advancement and
+its Git commit, then applies canonical events and reconciles deterministic outcomes. It does not
+duplicate durable facts. Recovery refuses unrelated canonical edits, unfinished Git operations, or
+ambiguous history; preserve the files and inspect the reported problem before retrying. Operations
+are batched and do not require all paths in memory.
 
 ## Protect and recover the catalog
 
@@ -725,6 +837,13 @@ archive sync remote add central ssh://backup.example/personal-archive.git
 archive sync
 archive sync status
 ```
+
+Until catalog history is on a sync remote, `archive status` and commands that change the catalog
+(`init`, `collection init`, annex import, `collection add`, `location scan`) print one warning with
+the next step, for example `WARNING: 3 catalog commits are not yet on a sync remote; … Next:
+archive sync`. The warning stops once `archive sync` has sent the history to a configured
+remote. Put that remote on another device and site: Archive Ledger does not yet check whether it is
+independent.
 
 `archive sync [remote]` fetches and verifies both histories before changing accepted state. A
 fast-forward remains a fast-forward; compatible offline additions from different enrolled
@@ -888,8 +1007,9 @@ fail closed if SQLite advances between pages.
   and refuses overwrite.
 - `copy` is an explicit mutation that creates only verified files at a registered destination
   Location. It refuses overwrite and never changes or deletes its source.
-- Generic traversal excludes every `.git` path, does not follow symlinks as ordinary files, and
-  does not cross filesystems.
+- Generic traversal excludes every `.git` path and every `.archive-ledger` path (repair's
+  quarantine) at any depth, does not follow symlinks as ordinary files, and does not cross
+  filesystems. Do not keep archive content in directories with either name.
 - A git-annex repository requires one successful import. Later add and scan operations use the
   imported catalog facts and direct filesystem reads without depending on Git or git-annex.
 - Imported annex symlinks are read only when both lexical and canonical checks keep the target
@@ -900,7 +1020,11 @@ fail closed if SQLite advances between pages.
 - Positive-only add and every partial scan are incapable of publishing missing facts.
 - Complete missing activation is atomic and follows only confirmed complete coverage.
 - Registry changes and renames append canonical events; history is not rewritten.
-- No command deletes, drops, repairs, quarantines, or rewrites existing archive content.
+- `repair` is the one explicit command that replaces existing archive content: only a copy whose
+  bytes no longer match the catalog, only from a verified copy re-read during the repair, never
+  by overwriting (the corrupt file is moved into the Location's `.archive-ledger/quarantine`
+  first), and never automatically. No command deletes, drops, or otherwise rewrites existing
+  archive content.
 
 Background scanning of connected Devices and destructive Location-to-Location operations remain
 future work. Verified copy is available as both `archive copy` and the equivalent

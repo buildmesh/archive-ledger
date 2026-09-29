@@ -18,6 +18,7 @@ use crate::discovery::{
     EncodedPath, FileDiscovery,
 };
 use crate::job::{validate_job_id, JobDirectory};
+use crate::progress::Progress;
 use crate::registry::RegistryPath;
 use crate::scan::ScanMode;
 use crate::v2_projection::{V2ApplyStats, V2ProjectionDb, V2ProjectionError};
@@ -25,10 +26,33 @@ use crate::v2_store::{V2AppendResult, V2OriginStore, V2StoreError};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Every file an inventory job may leave in its local job directory.
+const INVENTORY_JOB_FILES: [&str; 8] = [
+    "inventory-config.json",
+    "inventory-items.jsonl",
+    "inventory-seen.sqlite3",
+    "inventory-seen.sqlite3-wal",
+    "inventory-seen.sqlite3-shm",
+    "inventory-seen.sqlite3-journal",
+    "inventory-summary.json",
+    "inventory-summary.json.tmp",
+];
+
+mod acceptance;
+mod preview;
+pub use acceptance::{preview_changes, V2ChangePreview};
+use acceptance::{selected_files, validate_selected_path};
+pub use preview::{preview_scan, V2PreviewCategory, V2ScanPreview};
+
+#[cfg(test)]
+mod recovery_tests;
+
 pub type Result<T> = std::result::Result<T, V2InventoryError>;
 
 #[derive(Debug, Error)]
 pub enum V2InventoryError {
+    #[error("job {0} is running in another process")]
+    JobBusy(String),
     #[error(transparent)]
     Discovery(#[from] DiscoveryError),
     #[error(transparent)]
@@ -50,17 +74,21 @@ pub enum V2InventoryError {
     },
     #[error("invalid inventory configuration: {0}")]
     Invalid(String),
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl V2InventoryError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::JobBusy(_) => "job_busy",
             Self::Discovery(error) => error.code(),
             Self::Store(error) => error.code(),
             Self::Projection(error) => error.code(),
             Self::Io { .. } => "v2_inventory_io",
             Self::Sqlite { .. } => "v2_inventory_sqlite",
             Self::Invalid(_) => "v2_inventory_invalid",
+            Self::Refused(_) => "v2_inventory_refused",
         }
     }
 }
@@ -77,6 +105,8 @@ pub struct V2InventoryConfig {
     pub job_id: String,
     pub scan_id: String,
     pub scan_mode: ScanMode,
+    pub batch_entries: usize,
+    pub accept_changes: Vec<PathBuf>,
     pub max_items: Option<usize>,
 }
 
@@ -89,6 +119,8 @@ pub struct V2InventorySummary {
     pub confirmed_good: u64,
     pub observed_without_verification: u64,
     pub integrity_mismatches: u64,
+    #[serde(default)]
+    pub integrity_findings: Vec<RegistryPath>,
     pub missing_paths: u64,
     pub ignored_symlinks: u64,
     pub ignored_special_files: u64,
@@ -97,6 +129,9 @@ pub struct V2InventorySummary {
     pub read_errors: u64,
     pub concurrent_changes: u64,
     pub traversal_errors: u64,
+    /// Known files whose size and mtime matched a good copy here, so they were not read.
+    #[serde(default)]
+    pub unchanged_files: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -252,27 +287,15 @@ pub fn record_placements(
     Ok(Some((append, apply)))
 }
 
+/// `progress` receives ephemeral display updates only; nothing it observes is
+/// written to the job, the spool, or canonical history.
 pub fn add_files(
     store: &V2OriginStore,
     projection: &V2ProjectionDb,
     config: &V2InventoryConfig,
+    progress: Option<&Progress>,
 ) -> Result<V2InventoryResult> {
     validate_config(config)?;
-    let coordination_remote =
-        if config.scan_mode == ScanMode::Complete && store.coordination_required()? {
-            let remote = store.coordination_remote()?;
-            store.sync_remote(&remote)?;
-            Some(remote)
-        } else {
-            None
-        };
-    let initial_apply = projection.apply(store)?;
-    validate_scope(projection.path(), config)?;
-    let job_type = if config.scan_mode == ScanMode::Add {
-        "inventory_add"
-    } else {
-        "location_scan"
-    };
     let archive_root = projection
         .path()
         .parent()
@@ -280,11 +303,45 @@ pub fn add_files(
         .unwrap_or_else(|| Path::new("."));
     let job = JobDirectory::new(archive_root, &config.job_id)
         .map_err(|source| io_error("prepare inventory job path", archive_root, source))?;
+    // Reconcile canonical completion only while holding the job lock. The store's
+    // append lock serializes batches but does not deduplicate operation keys.
+    let _job_lock = job.try_lock().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            V2InventoryError::JobBusy(config.job_id.clone())
+        } else {
+            io_error("lock inventory job", job.path(), source)
+        }
+    })?;
+    // A durable frontier may still need its Git commit after an interrupted
+    // append. Finish that publication before projecting completion or cleanup.
+    store.recover_pending_publication()?;
+    let coordination_remote =
+        if config.scan_mode == ScanMode::Complete && store.coordination_required()? {
+            let remote = store.coordination_remote()?;
+            if let Some(progress) = progress {
+                progress.phase("Synchronizing catalog");
+            }
+            store.sync_remote(&remote)?;
+            Some(remote)
+        } else {
+            None
+        };
+    let initial_apply = apply_with_progress(store, projection, progress)?;
+    if job_status(projection.path(), &config.job_id)?.as_deref() == Some("cancelled") {
+        return Err(V2InventoryError::Refused(format!(
+            "job {} was cancelled; start a new scan with a different job ID",
+            config.job_id
+        )));
+    }
+    validate_scope(projection.path(), config)?;
+    let job_type = if config.scan_mode == ScanMode::Add {
+        "inventory_add"
+    } else {
+        "location_scan"
+    };
     let job_root = job.path().to_path_buf();
     let config_path = job_root.join("inventory-config.json");
-    let spool_path = job_root.join("inventory-items.jsonl");
     let seen_path = job_root.join("inventory-seen.sqlite3");
-    let summary_path = job_root.join("inventory-summary.json");
     let config_value = json!({
         "root_path": RegistryPath::from_path(&config.root_path),
         "location_prefix": config.location_prefix.as_deref().map(RegistryPath::from_path),
@@ -295,6 +352,8 @@ pub fn add_files(
         "device_fingerprint_status": config.device_fingerprint_status,
         "scan_id": config.scan_id,
         "scan_mode": config.scan_mode.as_str(),
+        "batch_entries": config.batch_entries,
+        "accept_changes": config.accept_changes.iter().map(|path| RegistryPath::from_path(path)).collect::<Vec<_>>(),
     });
     let connection =
         Connection::open(projection.path()).map_err(|source| V2InventoryError::Sqlite {
@@ -312,30 +371,25 @@ pub fn add_files(
             path: projection.path().to_path_buf(),
             source,
         })?;
-    if let Some((actual_type, input_version, progress)) = completed {
+    if let Some((actual_type, input_version, stored_summary)) = completed {
         if actual_type != job_type || input_version != config.scan_id {
             return Err(V2InventoryError::Invalid(format!(
                 "job {} belongs to different immutable inputs",
                 config.job_id
             )));
         }
-        let summary = progress
+        let summary = stored_summary
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
             .map_err(|error| V2InventoryError::Invalid(format!("job summary is invalid: {error}")))?
             .unwrap_or_default();
-        job.cleanup(&[
-            "inventory-config.json",
-            "inventory-items.jsonl",
-            "inventory-seen.sqlite3",
-            "inventory-seen.sqlite3-wal",
-            "inventory-seen.sqlite3-shm",
-            "inventory-seen.sqlite3-journal",
-            "inventory-summary.json",
-            "inventory-summary.json.tmp",
-        ])
-        .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
+        if let Some(progress) = progress {
+            progress.scan_summary(&summary);
+        }
+        job.cleanup(&INVENTORY_JOB_FILES).map_err(|source| {
+            io_error("remove completed inventory job files", &job_root, source)
+        })?;
         return Ok(V2InventoryResult {
             version: 2,
             status: "complete".to_owned(),
@@ -346,16 +400,21 @@ pub fn add_files(
             apply: Some(initial_apply),
         });
     }
+    if !config.accept_changes.is_empty() {
+        selected_files(&connection, projection.path(), config)?;
+    }
     job.ensure()
         .map_err(|source| io_error("create inventory job directory", &job_root, source))?;
     let existing_config = job
         .read_optional("inventory-config.json")
         .map_err(|source| io_error("read inventory job configuration", &config_path, source))?;
-    let new_job = existing_config.is_none();
+    job.verify_safe_entries(&["inventory-summary.json", "inventory-summary.json.tmp"])
+        .map_err(|source| io_error("verify legacy inventory summary", &job_root, source))?;
     if let Some(bytes) = existing_config {
-        let existing: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        let mut existing: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             V2InventoryError::Invalid(format!("inventory job configuration is invalid: {error}"))
         })?;
+        default_inventory_batch_entries(&mut existing);
         if existing != config_value {
             return Err(V2InventoryError::Invalid(format!(
                 "job {} belongs to different immutable inputs",
@@ -402,19 +461,15 @@ pub fn add_files(
             path: projection.path().to_path_buf(),
             source,
         })?;
-    if actual.0 != job_type || actual.1 != config.scan_id || actual.2 != params_text {
+    let mut actual_params: serde_json::Value = serde_json::from_str(&actual.2)
+        .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
+    default_inventory_batch_entries(&mut actual_params);
+    if actual.0 != job_type || actual.1 != config.scan_id || actual_params != config_value {
         return Err(V2InventoryError::Invalid(format!(
             "job {} belongs to different immutable inputs",
             config.job_id
         )));
     }
-    let spool_file = job
-        .open_append("inventory-items.jsonl")
-        .map_err(|source| io_error("open inventory spool", &spool_path, source))?;
-    let mut spool = SpoolGuard {
-        path: spool_path.clone(),
-        writer: Some(BufWriter::new(spool_file)),
-    };
     let seen_names = [
         "inventory-seen.sqlite3",
         "inventory-seen.sqlite3-wal",
@@ -439,12 +494,11 @@ pub fn add_files(
              path_bytes BLOB NOT NULL,
              PRIMARY KEY(path_encoding, path_bytes)
          ) WITHOUT ROWID;
-         CREATE TABLE IF NOT EXISTS ignored_entries(
-             entry_kind TEXT NOT NULL,
-             path_encoding TEXT NOT NULL,
-             path_bytes BLOB NOT NULL,
-             PRIMARY KEY(entry_kind, path_encoding, path_bytes)
-         ) WITHOUT ROWID;",
+         CREATE TABLE IF NOT EXISTS inventory_checkpoint(
+             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+             spool_bytes INTEGER NOT NULL CHECK(spool_bytes >= 0),
+             summary_json TEXT NOT NULL
+         );",
     )
     .map_err(|source| V2InventoryError::Sqlite {
         path: seen_path.clone(),
@@ -452,7 +506,14 @@ pub fn add_files(
     })?;
     job.verify_safe_entries(&seen_names)
         .map_err(|source| io_error("verify inventory job database", &seen_path, source))?;
-    recover_seen_from_spool(&job, &spool_path, &seen, &seen_path)?;
+    let (mut summary, new_job, mut spool) = recover_inventory_checkpoint(&job, &seen, &seen_path)?;
+    // Persist the spool/database entries and the local/jobs/<id> directory
+    // chain, including jobs created for the first time on this installation.
+    for directory in job_root.ancestors().take(4) {
+        File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|source| io_error("sync inventory job directory", directory, source))?;
+    }
     seen.execute_batch("BEGIN IMMEDIATE")
         .map_err(|source| V2InventoryError::Sqlite {
             path: seen_path.clone(),
@@ -543,7 +604,7 @@ pub fn add_files(
     }
     let mut known = connection
         .prepare(
-            "SELECT object_id FROM file_refs WHERE collection_id = ?1 AND logical_path_encoding = ?2 AND logical_path_bytes = ?3 AND path_state = 'active'",
+            "SELECT object_id, file_ref_id, identity_state FROM file_refs WHERE collection_id = ?1 AND logical_path_encoding = ?2 AND logical_path_bytes = ?3 ORDER BY (path_state = 'active') DESC LIMIT 1",
         )
         .map_err(|source| V2InventoryError::Sqlite {
             path: projection.path().to_path_buf(),
@@ -561,29 +622,41 @@ pub fn add_files(
             path: seen_path.clone(),
             source,
         })?;
-    let mut record_ignored = seen
-        .prepare(
-            "INSERT OR IGNORE INTO ignored_entries(entry_kind, path_encoding, path_bytes)
-             VALUES (?1, ?2, ?3)",
-        )
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.clone(),
-            source,
-        })?;
-    let mut summary: V2InventorySummary = job
-        .read_optional("inventory-summary.json")
-        .map_err(|source| io_error("read inventory job summary", &summary_path, source))?
-        .map(|bytes| {
-            serde_json::from_slice(&bytes).map_err(|error| {
-                V2InventoryError::Invalid(format!("inventory job summary is invalid: {error}"))
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
+    // These counters belong to this traversal, not to checkpointed file decisions.
+    let mut walk_summary = V2InventorySummary::default();
     let mut processed_this_run = 0_usize;
+    let mut checkpointed_items = 0_usize;
     let mut interrupted = false;
-    let discovery = FileDiscovery::with_exclusions(&config.root_path, config.exclusions.clone())?;
+    checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
+    seen.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+    let discovery: Box<dyn Iterator<Item = DiscoveryItem>> = if config.accept_changes.is_empty() {
+        Box::new(FileDiscovery::with_exclusions(
+            &config.root_path,
+            config.exclusions.clone(),
+        )?)
+    } else {
+        Box::new(
+            selected_files(&connection, projection.path(), config)?
+                .into_iter()
+                .map(DiscoveryItem::File),
+        )
+    };
+    if let Some(progress) = progress {
+        progress.phase("Scanning files");
+    }
     for discovered in discovery {
+        if let Some(progress) = progress {
+            progress.scan_summary(&summary);
+        }
+        // Check at the next iteration so every branch (including nonspooled
+        // outcomes and early continues) checkpoints its complete decision.
+        if processed_this_run - checkpointed_items >= config.batch_entries {
+            checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
+            seen.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+            checkpointed_items = processed_this_run;
+        }
         match discovered {
             DiscoveryItem::File(file) => {
                 let relative = raw_relative_path(&file.relative_path)?;
@@ -653,12 +726,34 @@ pub fn add_files(
                         summary.observed_without_verification.saturating_add(1);
                     continue;
                 }
+                if !config.accept_changes.is_empty() {
+                    validate_selected_path(config, &relative)?;
+                } else if copy_unchanged(
+                    &connection,
+                    projection.path(),
+                    &config.collection_id,
+                    &config.location_id,
+                    &encode_relative_path(&ordinary_copy_path),
+                    file.size_bytes,
+                    file.modified_time_utc_ms,
+                )? {
+                    record_seen
+                        .execute(params![
+                            logical_encoded.encoding.as_str(),
+                            logical_encoded.bytes
+                        ])
+                        .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+                    summary.files_observed = summary.files_observed.saturating_add(1);
+                    summary.unchanged_files = summary.unchanged_files.saturating_add(1);
+                    continue;
+                }
                 let hashed = match hash_file_stable(
                     &absolute,
                     &file,
                     annex
                         .as_ref()
                         .is_some_and(|known| known.expected_hash_algo.as_deref() == Some("sha512")),
+                    progress,
                 ) {
                     HashOutcome::Stable(hashed) => hashed,
                     HashOutcome::ReadError => {
@@ -688,6 +783,9 @@ pub fn add_files(
                         continue;
                     }
                 };
+                if !config.accept_changes.is_empty() {
+                    validate_selected_path(config, &relative)?;
+                }
                 let copy_path = annex
                     .as_ref()
                     .and_then(|known| known.copy_path.clone())
@@ -724,14 +822,14 @@ pub fn add_files(
                     continue;
                 }
                 let copy_encoded = encode_relative_path(&copy_path);
-                let existing: Option<Option<String>> = known
+                let existing: Option<(Option<String>, String, String)> = known
                     .query_row(
                         params![
                             config.collection_id,
                             logical_encoded.encoding.as_str(),
                             logical_encoded.bytes,
                         ],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()
                     .map_err(|source| V2InventoryError::Sqlite {
@@ -739,21 +837,66 @@ pub fn add_files(
                         source,
                     })?;
                 let object_id = format!("blake3:{}", hashed.blake3_hex);
-                match existing.as_ref().and_then(|value| value.as_deref()) {
+                if annex.is_none() {
+                    if let Some((expected, file_id, state)) = &existing {
+                        if state != "resolved" || expected.is_none() {
+                            return Err(V2InventoryError::Invalid(format!(
+                                "cataloged path {} has unresolved identity; ordinary inventory cannot replace it",
+                                logical_encoded.display
+                            )));
+                        }
+                        let expected = expected.as_ref().expect("checked above");
+                        if expected != &object_id && config.accept_changes.is_empty() {
+                            let item = ordinary_verification_failure_item(
+                                config,
+                                file_id,
+                                expected,
+                                &logical_path,
+                                &copy_path,
+                                &hashed,
+                                observed_time_utc_ms,
+                            );
+                            write_spool_item(&mut spool, &item)?;
+                            record_seen
+                                .execute(params![
+                                    logical_encoded.encoding.as_str(),
+                                    logical_encoded.bytes
+                                ])
+                                .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+                            summary.files_observed = summary.files_observed.saturating_add(1);
+                            summary.bytes_observed =
+                                summary.bytes_observed.saturating_add(hashed.size_bytes);
+                            summary.integrity_mismatches =
+                                summary.integrity_mismatches.saturating_add(1);
+                            if summary.integrity_findings.len() < 20 {
+                                summary
+                                    .integrity_findings
+                                    .push(RegistryPath::from_path(&logical_path));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                match existing.as_ref().and_then(|value| value.0.as_deref()) {
                     None => summary.new_paths = summary.new_paths.saturating_add(1),
                     Some(existing) if existing != object_id => {
                         summary.changed_paths = summary.changed_paths.saturating_add(1)
                     }
                     Some(_) => summary.confirmed_good = summary.confirmed_good.saturating_add(1),
                 }
-                let file_ref_id = stable_id(
-                    "file",
-                    &[
-                        config.collection_id.as_bytes(),
-                        logical_encoded.encoding.as_str().as_bytes(),
-                        &logical_encoded.bytes,
-                    ],
-                );
+                let file_ref_id = existing
+                    .as_ref()
+                    .map(|value| value.1.clone())
+                    .unwrap_or_else(|| {
+                        stable_id(
+                            "file",
+                            &[
+                                config.collection_id.as_bytes(),
+                                logical_encoded.encoding.as_str().as_bytes(),
+                                &logical_encoded.bytes,
+                            ],
+                        )
+                    });
                 let copy_claim_id = annex
                     .as_ref()
                     .and_then(|known| known.copy_claim_id.clone())
@@ -770,6 +913,7 @@ pub fn add_files(
                     });
                 let item = json!({
                     "kind": "content_observed",
+                    "accepted_change": !config.accept_changes.is_empty(),
                     "collection_id": config.collection_id,
                     "location_id": config.location_id,
                     "logical_path": registry_path(&logical_encoded),
@@ -823,19 +967,7 @@ pub fn add_files(
                 let logical_path = prefixed_path(config.logical_prefix.as_deref(), &relative);
                 let logical_encoded = encode_relative_path(&logical_path);
                 if !annex_imported {
-                    let inserted = record_ignored
-                        .execute(params![
-                            "symlink",
-                            logical_encoded.encoding.as_str(),
-                            logical_encoded.bytes,
-                        ])
-                        .map_err(|source| V2InventoryError::Sqlite {
-                            path: seen_path.clone(),
-                            source,
-                        })?;
-                    if inserted > 0 {
-                        summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
-                    }
+                    walk_summary.ignored_symlinks = walk_summary.ignored_symlinks.saturating_add(1);
                     continue;
                 }
                 let was_seen: bool = already_seen
@@ -901,7 +1033,32 @@ pub fn add_files(
                     &known,
                     config,
                     observed_time_utc_ms,
+                    progress,
+                    &mut |size, modified| {
+                        copy_unchanged(
+                            &connection,
+                            projection.path(),
+                            &config.collection_id,
+                            &config.location_id,
+                            &encode_relative_path(&prefixed_path(
+                                config.location_prefix.as_deref(),
+                                &relative,
+                            )),
+                            size,
+                            modified,
+                        )
+                    },
                 )? {
+                    AnnexSymlinkObservation::Unchanged => {
+                        record_seen
+                            .execute(params![
+                                logical_encoded.encoding.as_str(),
+                                logical_encoded.bytes
+                            ])
+                            .map_err(|source| inventory_sqlite_error(&seen_path, source))?;
+                        summary.files_observed = summary.files_observed.saturating_add(1);
+                        summary.unchanged_files = summary.unchanged_files.saturating_add(1);
+                    }
                     AnnexSymlinkObservation::Absent => {
                         if let Some(item) = known
                             .copy_path
@@ -970,41 +1127,39 @@ pub fn add_files(
                 }
             }
             DiscoveryItem::Special(_) => {
-                summary.ignored_special_files = summary.ignored_special_files.saturating_add(1)
+                walk_summary.ignored_special_files =
+                    walk_summary.ignored_special_files.saturating_add(1)
             }
             DiscoveryItem::Excluded(_) => {
-                summary.excluded_subtrees = summary.excluded_subtrees.saturating_add(1)
+                walk_summary.excluded_subtrees = walk_summary.excluded_subtrees.saturating_add(1)
             }
             DiscoveryItem::FilesystemBoundary(_) => {
-                summary.filesystem_boundaries = summary.filesystem_boundaries.saturating_add(1)
+                walk_summary.filesystem_boundaries =
+                    walk_summary.filesystem_boundaries.saturating_add(1)
             }
             DiscoveryItem::ConcurrentChange(_) => {
-                summary.concurrent_changes = summary.concurrent_changes.saturating_add(1)
+                walk_summary.concurrent_changes = walk_summary.concurrent_changes.saturating_add(1)
             }
             DiscoveryItem::Error { .. } => {
-                summary.traversal_errors = summary.traversal_errors.saturating_add(1)
+                walk_summary.traversal_errors = walk_summary.traversal_errors.saturating_add(1)
             }
         }
     }
     drop(known);
     drop(record_seen);
     drop(already_seen);
-    drop(record_ignored);
-    spool.sync()?;
-    seen.execute_batch("COMMIT")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.clone(),
-            source,
-        })?;
+    checkpoint_inventory(&mut spool, &seen, &seen_path, &summary)?;
+    summary.ignored_symlinks = summary
+        .ignored_symlinks
+        .saturating_add(walk_summary.ignored_symlinks);
+    summary.ignored_special_files = walk_summary.ignored_special_files;
+    summary.excluded_subtrees = walk_summary.excluded_subtrees;
+    summary.filesystem_boundaries = walk_summary.filesystem_boundaries;
+    summary.concurrent_changes = summary
+        .concurrent_changes
+        .saturating_add(walk_summary.concurrent_changes);
+    summary.traversal_errors = walk_summary.traversal_errors;
     if interrupted {
-        let summary_bytes = serde_json::to_vec(&summary)
-            .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
-        job.replace(
-            "inventory-summary.json",
-            "inventory-summary.json.tmp",
-            &summary_bytes,
-        )
-        .map_err(|source| io_error("write inventory job summary", &summary_path, source))?;
         connection
             .execute(
                 "UPDATE jobs SET progress_json = ?2 WHERE job_id = ?1",
@@ -1037,7 +1192,13 @@ pub fn add_files(
         && summary.read_errors == 0
         && summary.concurrent_changes == 0
         && summary.traversal_errors == 0;
+    if let Some(progress) = progress {
+        progress.scan_summary(&summary);
+    }
     if complete_safe {
+        if let Some(progress) = progress {
+            progress.phase("Checking for missing files");
+        }
         let mut missing = connection
             .prepare(
                 "SELECT p.file_ref_id, p.observed_path_encoding, p.observed_path_bytes, p.observed_path_display,
@@ -1182,6 +1343,14 @@ pub fn add_files(
             "extension_hint": null,
         }
     });
+    if let Some(progress) = progress {
+        progress.scan_summary(&summary);
+    }
+    let mut append_progress =
+        progress.map(|progress| move |update| progress.append_progress(update));
+    let append_progress = append_progress
+        .as_mut()
+        .map(|observer| observer as &mut dyn FnMut(_));
     let append = if let Some(remote) = coordination_remote {
         store.append_coordinated_jsonl_batch(
             &remote,
@@ -1190,22 +1359,21 @@ pub fn add_files(
             context,
             defaults,
             &spool_path,
+            append_progress,
         )?
     } else {
-        store.append_jsonl_batch(operation_kind, 2, context, defaults, &spool_path)?
+        store.append_jsonl_batch_with_progress(
+            operation_kind,
+            2,
+            context,
+            defaults,
+            &spool_path,
+            append_progress,
+        )?
     };
-    let apply = projection.apply(store)?;
-    job.cleanup(&[
-        "inventory-config.json",
-        "inventory-items.jsonl",
-        "inventory-seen.sqlite3",
-        "inventory-seen.sqlite3-wal",
-        "inventory-seen.sqlite3-shm",
-        "inventory-seen.sqlite3-journal",
-        "inventory-summary.json",
-        "inventory-summary.json.tmp",
-    ])
-    .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
+    let apply = apply_with_progress(store, projection, progress)?;
+    job.cleanup(&INVENTORY_JOB_FILES)
+        .map_err(|source| io_error("remove completed inventory job files", &job_root, source))?;
     Ok(V2InventoryResult {
         version: 2,
         status: completion_status.to_owned(),
@@ -1217,7 +1385,221 @@ pub fn add_files(
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct V2CancelResult {
+    pub version: u32,
+    /// `cancelled`, or `planned` for a dry run.
+    pub status: String,
+    pub job_id: String,
+    pub job_type: String,
+    pub files: Vec<V2CancelledFile>,
+    pub bytes: u64,
+    /// Cancel first finished an interrupted catalog publication, as resume does.
+    pub finished_interrupted_publication: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2CancelledFile {
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+/// Abandons an unfinished location scan or inventory add job. An unfinished
+/// scan has published nothing canonical, so this marks the local job row
+/// cancelled and removes only that job's known local files. A dry run changes
+/// nothing. Rerunning on a cancelled job removes files a failed cleanup left.
+pub fn cancel_job(
+    store: &V2OriginStore,
+    projection: &V2ProjectionDb,
+    job_id: &str,
+    dry_run: bool,
+) -> Result<V2CancelResult> {
+    let archive_root = projection
+        .path()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let job = JobDirectory::new(archive_root, job_id)
+        .map_err(|source| io_error("prepare inventory job path", archive_root, source))?;
+    let _job_lock = job.try_lock().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            V2InventoryError::JobBusy(job_id.to_owned())
+        } else {
+            io_error("lock inventory job", job.path(), source)
+        }
+    })?;
+    let mut finished_interrupted_publication = false;
+    if !dry_run {
+        // A run interrupted after its batch reached canonical history but before
+        // its Git commit or projection is complete, not cancellable. Settle that
+        // first, as resume does, so the row reflects canonical completion.
+        finished_interrupted_publication = store.recover_pending_publication()?.is_some();
+        projection.apply(store)?;
+    }
+    let connection = Connection::open_with_flags(
+        projection.path(),
+        if dry_run {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            OpenFlags::default()
+        },
+    )
+    .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT job_type, status FROM jobs WHERE job_id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
+    let (job_type, status) = match row {
+        Some(row) => row,
+        // db rebuild drops unpublished job rows; the local configuration names the
+        // job type. Read it under the lock already held rather than re-locking.
+        None => {
+            let read = |name: &str| {
+                job.read_optional(name)
+                    .map_err(|source| io_error("read job configuration", job.path(), source))
+            };
+            let job_type = if let Some(bytes) = read("inventory-config.json")? {
+                let config: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        V2InventoryError::Invalid(format!(
+                            "inventory job configuration is invalid: {error}"
+                        ))
+                    })?;
+                match config["scan_mode"].as_str() {
+                    Some("add") => "inventory_add",
+                    Some("complete") => "location_scan",
+                    _ => {
+                        return Err(V2InventoryError::Invalid(
+                            "inventory job configuration has an invalid scan mode".to_owned(),
+                        ))
+                    }
+                }
+            } else if let Some(bytes) = read("annex-config.json")? {
+                let config: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        V2InventoryError::Invalid(format!(
+                            "annex job configuration is invalid: {error}"
+                        ))
+                    })?;
+                if config["job_id"].as_str() != Some(job_id) {
+                    return Err(V2InventoryError::Invalid(
+                        "annex configuration job ID does not match its directory".to_owned(),
+                    ));
+                }
+                "annex_import"
+            } else {
+                return Err(V2InventoryError::Refused(format!(
+                    "job {job_id} is not in the catalog database and has no local job configuration"
+                )));
+            };
+            (job_type.to_owned(), "local_only".to_owned())
+        }
+    };
+    // An unfinished scan, add, or annex import has published nothing canonical;
+    // cancelling removes only that job's own local files.
+    let job_files: &[&str] = match job_type.as_str() {
+        "location_scan" | "inventory_add" => &INVENTORY_JOB_FILES,
+        "annex_import" => &crate::annex::ANNEX_JOB_FILES,
+        _ => &[],
+    };
+    if job_files.is_empty() {
+        return Err(V2InventoryError::Refused(format!(
+            "job cancel supports location scan, collection add, and annex import jobs; {job_id} is {job_type}"
+        )));
+    }
+    let files = job
+        .existing_file_sizes(job_files)
+        .map_err(|source| io_error("inspect inventory job files", job.path(), source))?;
+    match status.as_str() {
+        "running" | "local_only" => {}
+        "cancelled" if !files.is_empty() => {}
+        other => {
+            return Err(V2InventoryError::Refused(format!(
+                "job {job_id} is already {other}"
+            )))
+        }
+    }
+    // A local-only job has no row to mark; removing its files is the whole cancel.
+    if !dry_run && status != "local_only" {
+        let finished = i64::try_from(now_utc_ms()?).map_err(|_| {
+            V2InventoryError::Invalid("system time exceeds SQLite range".to_owned())
+        })?;
+        connection
+            .execute(
+                "UPDATE jobs SET status = 'cancelled', finished_time_utc_ms = COALESCE(finished_time_utc_ms, ?2)
+                 WHERE job_id = ?1 AND status IN ('running', 'cancelled')",
+                params![job_id, finished],
+            )
+            .map_err(|source| inventory_sqlite_error(projection.path(), source))?;
+    }
+    if !dry_run {
+        job.cleanup(job_files)
+            .map_err(|source| io_error("remove cancelled job files", job.path(), source))?;
+    }
+    Ok(V2CancelResult {
+        version: 2,
+        status: if dry_run { "planned" } else { "cancelled" }.to_owned(),
+        job_id: job_id.to_owned(),
+        job_type,
+        bytes: files.iter().map(|(_, size)| size).sum(),
+        files: files
+            .into_iter()
+            .map(|(name, size_bytes)| V2CancelledFile { name, size_bytes })
+            .collect(),
+        finished_interrupted_publication,
+    })
+}
+
+fn job_status(database: &Path, job_id: &str) -> Result<Option<String>> {
+    Connection::open(database)
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT status FROM jobs WHERE job_id = ?1",
+                    [job_id],
+                    |row| row.get(0),
+                )
+                .optional()
+        })
+        .map_err(|source| inventory_sqlite_error(database, source))
+}
+
+fn apply_with_progress(
+    store: &V2OriginStore,
+    projection: &V2ProjectionDb,
+    progress: Option<&Progress>,
+) -> Result<V2ApplyStats> {
+    let mut observer = progress.map(|progress| move |update| progress.apply_progress(update));
+    Ok(projection.apply_with_progress(
+        store,
+        observer
+            .as_mut()
+            .map(|observer| observer as &mut dyn FnMut(_)),
+    )?)
+}
+
+fn default_inventory_batch_entries(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.entry("batch_entries").or_insert(json!(1_000));
+        object.entry("accept_changes").or_insert(json!([]));
+    }
+}
+
 fn validate_config(config: &V2InventoryConfig) -> Result<()> {
+    if !config.accept_changes.is_empty() && config.scan_mode != ScanMode::Add {
+        return Err(V2InventoryError::Invalid(
+            "accept_changes is only valid for collection add".to_owned(),
+        ));
+    }
+    if config.batch_entries == 0 {
+        return Err(V2InventoryError::Invalid(
+            "batch_entries must be positive".to_owned(),
+        ));
+    }
     if config.collection_id.is_empty()
         || config.location_id.is_empty()
         || config.scan_id.is_empty()
@@ -1280,6 +1662,55 @@ struct KnownAnnexEntry {
     object_id: Option<String>,
     copy_claim_id: Option<String>,
     copy_path: Option<PathBuf>,
+}
+
+/// Whether this path at this Location was last observed with the same size and
+/// mtime as a present Copy whose last check succeeded and whose Object is still
+/// the File's expected content. Such a file needs no read: its presence is
+/// refreshed when a complete scan finishes, and integrity belongs to verify.
+/// A missing mtime, a corrupt or unknown Copy, or any other doubt means read it.
+fn copy_unchanged(
+    connection: &Connection,
+    database: &Path,
+    collection_id: &str,
+    location_id: &str,
+    path: &EncodedPath,
+    size_bytes: u64,
+    modified_time_utc_ms: Option<u64>,
+) -> Result<bool> {
+    let Some(modified) = modified_time_utc_ms else {
+        return Ok(false);
+    };
+    let (Ok(size), Ok(modified)) = (i64::try_from(size_bytes), i64::try_from(modified)) else {
+        return Ok(false);
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM path_observations p
+               JOIN file_refs f ON f.file_ref_id = p.file_ref_id
+               JOIN copy_claims c ON c.object_id = f.object_id AND c.state = 'present'
+                 AND c.location_id = p.location_id AND c.last_verification_result = 'ok'
+                 AND ((c.relative_path_encoding = p.observed_path_encoding
+                       AND c.relative_path_bytes = p.observed_path_bytes)
+                   OR (p.representation = 'annex_locked_symlink'
+                       AND c.external_identity_id = p.external_identity_id))
+               WHERE p.location_id = ?1 AND p.observed_path_encoding = ?2
+                 AND p.observed_path_bytes = ?3 AND p.state = 'present'
+                 AND p.observed_size_bytes = ?4 AND p.modified_time_utc_ms = ?5
+                 AND f.collection_id = ?6 AND f.path_state = 'active'
+                 AND f.object_id IS NOT NULL AND p.object_id = f.object_id)",
+            params![
+                location_id,
+                path.encoding.as_str(),
+                path.bytes,
+                size,
+                modified,
+                collection_id
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|source| inventory_sqlite_error(database, source))
 }
 
 fn known_annex_entry(
@@ -1426,6 +1857,56 @@ fn annex_missing_copy_item(
     }))
 }
 
+fn ordinary_verification_failure_item(
+    config: &V2InventoryConfig,
+    file_ref_id: &str,
+    expected_object: &str,
+    logical_path: &Path,
+    copy_path: &Path,
+    hashed: &HashedContent,
+    observed_time: u64,
+) -> serde_json::Value {
+    let encoded = encode_relative_path(copy_path);
+    let copy_claim_id = stable_id(
+        "copy",
+        &[
+            config.location_id.as_bytes(),
+            encoded.encoding.as_str().as_bytes(),
+            &encoded.bytes,
+            expected_object.as_bytes(),
+        ],
+    );
+    json!({
+        "kind": "copy_verification_failed",
+        "collection_id": config.collection_id,
+        "file_ref_id": file_ref_id,
+        "copy_claim_id": copy_claim_id,
+        "object_id": expected_object,
+        "location_id": config.location_id,
+        "logical_path": RegistryPath::from_path(logical_path),
+        "copy_path": RegistryPath::from_path(copy_path),
+        "result": "hash_mismatch",
+        "expected_hash_algo": "blake3",
+        "expected_hash_hex": expected_object.strip_prefix("blake3:"),
+        "observed_hash_hex": hashed.blake3_hex,
+        "size_bytes": hashed.size_bytes,
+        "duration_ms": hashed.duration_ms,
+        "verified_time_utc_ms": observed_time,
+        "device_fingerprint_status": config.device_fingerprint_status,
+        "error_detail": "content differs from catalog",
+        "job_id": config.job_id,
+        "scan_id": config.scan_id,
+        "job_type": if config.scan_mode == ScanMode::Add { "inventory_add" } else { "location_scan" },
+        "item_type": "copy_claim",
+        "item_key": copy_claim_id,
+        "outcome_kind": "hash_mismatch",
+        "operation_key": stable_id("op", &[
+            config.job_id.as_bytes(), config.scan_id.as_bytes(), copy_claim_id.as_bytes(),
+            b"hash_mismatch", hashed.blake3_hex.as_bytes(),
+        ]),
+    })
+}
+
 fn annex_verification_failure_item(
     known: &KnownAnnexEntry,
     config: &V2InventoryConfig,
@@ -1473,42 +1954,58 @@ fn annex_verification_failure_item(
 }
 
 enum AnnexSymlinkObservation {
+    /// The annex object file matches a good copy here and was not read.
+    Unchanged,
     Absent,
-    Mismatch { item: Option<serde_json::Value> },
+    Mismatch {
+        item: Option<serde_json::Value>,
+    },
     Error,
-    Observed { item: serde_json::Value, size: u64 },
+    Observed {
+        item: serde_json::Value,
+        size: u64,
+    },
 }
 
-fn observe_annex_symlink(
+enum AnnexContent {
+    Present {
+        path: PathBuf,
+        metadata: fs::Metadata,
+    },
+    Absent,
+    Error,
+}
+
+/// Resolves a registered annex symlink to its object file without reading it:
+/// the link must be relative and stay inside `.git/annex/objects`, at the
+/// recorded copy path when one is known.
+fn resolve_annex_content(
     root: &Path,
     logical_relative: &Path,
-    logical_encoded: &EncodedPath,
     known: &KnownAnnexEntry,
-    config: &V2InventoryConfig,
-    observed_time_utc_ms: u64,
-) -> Result<AnnexSymlinkObservation> {
+) -> Result<AnnexContent> {
     let link = root.join(logical_relative);
     let target = match fs::read_link(&link) {
         Ok(target) => target,
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
+        Err(_) => return Ok(AnnexContent::Error),
     };
     if target.is_absolute() {
-        return Ok(AnnexSymlinkObservation::Error);
+        return Ok(AnnexContent::Error);
     }
     let unresolved = link.parent().unwrap_or(root).join(target);
     let content = match fs::canonicalize(&unresolved) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AnnexSymlinkObservation::Absent)
+            return Ok(AnnexContent::Absent)
         }
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
+        Err(_) => return Ok(AnnexContent::Error),
     };
     let cas_root = match fs::canonicalize(root.join(".git/annex/objects")) {
         Ok(path) => path,
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
+        Err(_) => return Ok(AnnexContent::Error),
     };
     if !content.starts_with(&cas_root) {
-        return Ok(AnnexSymlinkObservation::Error);
+        return Ok(AnnexContent::Error);
     }
     let copy_relative = content
         .strip_prefix(root)
@@ -1518,22 +2015,49 @@ fn observe_annex_symlink(
         .as_deref()
         .is_some_and(|expected| expected != copy_relative)
     {
-        return Ok(AnnexSymlinkObservation::Error);
+        return Ok(AnnexContent::Error);
     }
-    let metadata = match fs::metadata(&content) {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return Ok(AnnexSymlinkObservation::Error),
-        Err(_) => return Ok(AnnexSymlinkObservation::Error),
+    match fs::metadata(&content) {
+        Ok(metadata) if metadata.is_file() => Ok(AnnexContent::Present {
+            path: content,
+            metadata,
+        }),
+        _ => Ok(AnnexContent::Error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_annex_symlink(
+    root: &Path,
+    logical_relative: &Path,
+    logical_encoded: &EncodedPath,
+    known: &KnownAnnexEntry,
+    config: &V2InventoryConfig,
+    observed_time_utc_ms: u64,
+    progress: Option<&Progress>,
+    unchanged: &mut dyn FnMut(u64, Option<u64>) -> Result<bool>,
+) -> Result<AnnexSymlinkObservation> {
+    let (content, metadata) = match resolve_annex_content(root, logical_relative, known)? {
+        AnnexContent::Present { path, metadata } => (path, metadata),
+        AnnexContent::Absent => return Ok(AnnexSymlinkObservation::Absent),
+        AnnexContent::Error => return Ok(AnnexSymlinkObservation::Error),
     };
+    let copy_relative = content
+        .strip_prefix(root)
+        .map_err(|_| V2InventoryError::Invalid("annex content escaped its Location".to_owned()))?;
     let discovered = DiscoveredFile {
         relative_path: logical_encoded.clone(),
         size_bytes: metadata.len(),
         modified_time_utc_ms: modified_time_ms(&metadata),
     };
+    if unchanged(discovered.size_bytes, discovered.modified_time_utc_ms)? {
+        return Ok(AnnexSymlinkObservation::Unchanged);
+    }
     let hashed = match hash_file_stable(
         &content,
         &discovered,
         known.expected_hash_algo.as_deref() == Some("sha512"),
+        progress,
     ) {
         HashOutcome::Stable(hashed) => hashed,
         HashOutcome::ReadError | HashOutcome::Changed => return Ok(AnnexSymlinkObservation::Error),
@@ -1619,7 +2143,12 @@ enum HashOutcome {
     Changed,
 }
 
-fn hash_file_stable(path: &Path, discovered: &DiscoveredFile, hash_sha512: bool) -> HashOutcome {
+fn hash_file_stable(
+    path: &Path,
+    discovered: &DiscoveredFile,
+    hash_sha512: bool,
+    progress: Option<&Progress>,
+) -> HashOutcome {
     let started = Instant::now();
     let before = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -1649,6 +2178,9 @@ fn hash_file_stable(path: &Path, discovered: &DiscoveredFile, hash_sha512: bool)
                     sha512.update(&buffer[..read]);
                 }
                 bytes_read = bytes_read.saturating_add(read as u64);
+                if let Some(progress) = progress {
+                    progress.read_bytes(read);
+                }
             }
             Err(_) => return HashOutcome::ReadError,
         }
@@ -1751,72 +2283,132 @@ fn now_utc_ms() -> Result<u64> {
         .map_err(|_| V2InventoryError::Invalid("system time exceeds u64 milliseconds".to_owned()))
 }
 
-fn recover_seen_from_spool(
-    job: &JobDirectory,
-    spool_path: &Path,
+fn inventory_sqlite_error(path: &Path, source: rusqlite::Error) -> V2InventoryError {
+    V2InventoryError::Sqlite {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// The index, including decisions with no canonical outcome, and its summary
+/// share one SQLite commit. The spool must be durable before that commit.
+fn checkpoint_inventory(
+    spool: &mut SpoolGuard,
     seen: &Connection,
     seen_path: &Path,
+    summary: &V2InventorySummary,
 ) -> Result<()> {
-    let Some(spool) = job
-        .open_read_optional("inventory-items.jsonl")
-        .map_err(|source| io_error("open inventory spool for recovery", spool_path, source))?
-    else {
-        return Ok(());
-    };
-    let reader = BufReader::new(spool);
-    seen.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.to_path_buf(),
-            source,
+    spool.sync()?;
+    let spool_bytes = spool
+        .writer_mut()?
+        .get_ref()
+        .metadata()
+        .map_err(|source| io_error("measure inventory spool", &spool.path, source))?
+        .len();
+    let summary_json = serde_json::to_string(summary)
+        .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
+    let spool_bytes = i64::try_from(spool_bytes).map_err(|_| {
+        V2InventoryError::Invalid("inventory spool exceeds SQLite size range".to_owned())
+    })?;
+    seen.execute(
+        "INSERT INTO inventory_checkpoint(singleton, spool_bytes, summary_json) VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET spool_bytes = excluded.spool_bytes,
+             summary_json = excluded.summary_json",
+        params![spool_bytes, summary_json],
+    )
+    .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    seen.execute_batch("COMMIT")
+        .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    Ok(())
+}
+
+fn recover_inventory_checkpoint(
+    job: &JobDirectory,
+    seen: &Connection,
+    seen_path: &Path,
+) -> Result<(V2InventorySummary, bool, SpoolGuard)> {
+    let checkpoint: Option<(i64, String)> = seen
+        .query_row(
+            "SELECT spool_bytes, summary_json FROM inventory_checkpoint WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    let spool_path = job.path().join("inventory-items.jsonl");
+    let new_job = checkpoint.is_none();
+    let (spool_bytes, summary) = if let Some((spool_bytes, summary_json)) = checkpoint {
+        let spool_bytes = u64::try_from(spool_bytes).map_err(|_| {
+            V2InventoryError::Invalid("inventory checkpoint has a negative spool size".to_owned())
         })?;
-    let mut insert = seen
-        .prepare("INSERT OR IGNORE INTO seen(path_encoding, path_bytes) VALUES (?1, ?2)")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.to_path_buf(),
-            source,
+        let summary = serde_json::from_str(&summary_json).map_err(|error| {
+            V2InventoryError::Invalid(format!("inventory checkpoint summary is invalid: {error}"))
         })?;
-    for line in reader.lines() {
-        let line = line
-            .map_err(|source| io_error("read inventory spool for recovery", spool_path, source))?;
-        if line.trim().is_empty() {
-            continue;
+        let file = job
+            .open_read_optional("inventory-items.jsonl")
+            .map_err(|source| io_error("open inventory spool for recovery", &spool_path, source))?
+            .ok_or_else(|| {
+                V2InventoryError::Invalid("checkpointed inventory spool is missing".to_owned())
+            })?;
+        if file
+            .metadata()
+            .map_err(|source| io_error("measure inventory spool", &spool_path, source))?
+            .len()
+            < spool_bytes
+        {
+            return Err(V2InventoryError::Invalid(
+                "inventory spool is shorter than its checkpoint".to_owned(),
+            ));
         }
-        let item: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
-            V2InventoryError::Invalid(format!(
-                "inventory recovery spool contains invalid JSON: {error}"
-            ))
-        })?;
-        if !matches!(
-            item.get("kind").and_then(serde_json::Value::as_str),
-            Some("content_observed" | "copy_verification_failed")
-        ) {
-            continue;
-        }
-        let path: RegistryPath =
-            serde_json::from_value(item.get("logical_path").cloned().ok_or_else(|| {
-                V2InventoryError::Invalid("content observation lacks a logical path".to_owned())
-            })?)
-            .map_err(|error| {
+        // Validate only the committed prefix before modifying anything. Even a
+        // syntactically valid tail is uncommitted and must be discarded.
+        let mut reader = BufReader::new(file.take(spool_bytes));
+        let mut line = Vec::new();
+        while reader
+            .read_until(b'\n', &mut line)
+            .map_err(|source| io_error("read inventory spool for recovery", &spool_path, source))?
+            > 0
+        {
+            if line.last() != Some(&b'\n') {
+                return Err(V2InventoryError::Invalid(
+                    "inventory checkpoint ends inside a spool record".to_owned(),
+                ));
+            }
+            serde_json::from_slice::<serde_json::Value>(&line).map_err(|error| {
                 V2InventoryError::Invalid(format!(
-                    "content observation logical path is invalid: {error}"
+                    "inventory checkpoint spool contains invalid JSON: {error}"
                 ))
             })?;
-        let bytes = crate::registry::registry_path_bytes(&path)
-            .map_err(|error| V2InventoryError::Invalid(error.to_string()))?;
-        insert
-            .execute(params![path.encoding, bytes])
-            .map_err(|source| V2InventoryError::Sqlite {
-                path: seen_path.to_path_buf(),
-                source,
-            })?;
-    }
-    drop(insert);
-    seen.execute_batch("COMMIT")
-        .map_err(|source| V2InventoryError::Sqlite {
-            path: seen_path.to_path_buf(),
+            line.clear();
+        }
+        (spool_bytes, summary)
+    } else {
+        // Before the first checkpoint (or upgrading a legacy unpublished job),
+        // there is no consistent durable progress to adopt. Re-enumerate it.
+        (0, V2InventorySummary::default())
+    };
+    let file = job
+        .open_append("inventory-items.jsonl")
+        .map_err(|source| io_error("open inventory spool", &spool_path, source))?;
+    file.set_len(spool_bytes).map_err(|source| {
+        io_error(
+            "truncate uncheckpointed inventory spool",
+            &spool_path,
             source,
-        })?;
-    Ok(())
+        )
+    })?;
+    if new_job {
+        seen.execute("DELETE FROM seen", [])
+            .map_err(|source| inventory_sqlite_error(seen_path, source))?;
+    }
+    Ok((
+        summary,
+        new_job,
+        SpoolGuard {
+            path: spool_path,
+            writer: Some(BufWriter::new(file)),
+        },
+    ))
 }
 
 struct SpoolGuard {

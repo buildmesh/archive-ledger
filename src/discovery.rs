@@ -227,9 +227,16 @@ impl FileDiscovery {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
-        if self.root.components().chain(relative.components()).any(
-            |component| matches!(component, Component::Normal(name) if name == OsStr::new(".git")),
-        ) {
+        // `.git` is repository metadata; `.archive-ledger` holds repair quarantine.
+        if self
+            .root
+            .components()
+            .chain(relative.components())
+            .any(|component| {
+                matches!(component, Component::Normal(name)
+                if name == OsStr::new(".git") || name == OsStr::new(".archive-ledger"))
+            })
+        {
             return true;
         }
         self.exclusions

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use archive_ledger::annex_progress::AnnexProgressReporter;
+use archive_ledger::progress::{ProgressKind, ProgressReporter};
 use archive_ledger::{
     access_plan, central_archive, create_portable_snapshot, fsck_v2_archive,
     inspect_portable_snapshot, install_portable_snapshot, introduced_files, utf8_path,
@@ -226,6 +226,8 @@ enum Command {
     Scan(ScanArgs),
     /// Verify the bytes behind current copy claims.
     Verify(VerifyArgs),
+    /// Replace corrupt copies with verified bytes from a connected good copy.
+    Repair(RepairArgs),
     /// Import source-specific inventories.
     Import {
         #[command(subcommand)]
@@ -374,11 +376,17 @@ struct ScanArgs {
 
 #[derive(Debug, Args, Clone)]
 struct VerifyArgs {
-    /// Registered filesystem location whose current copies should be checked.
-    location: String,
-    /// Mounted path corresponding exactly to the registered location.
+    /// Location to verify; omit to verify every connected Location.
+    location: Option<String>,
+    /// Mounted path corresponding exactly to the Location; found from its recorded mount when omitted.
     #[arg(long)]
-    path: PathBuf,
+    path: Option<PathBuf>,
+    /// Re-read every current copy instead of only those that are due.
+    #[arg(long)]
+    all: bool,
+    /// Also re-read copies whose verification expires within this many days.
+    #[arg(long, default_value_t = DEFAULT_VERIFY_WINDOW_DAYS)]
+    verify_within: u64,
     /// Verify one claim instead of every current claim at the location.
     #[arg(long)]
     copy: Option<String>,
@@ -391,6 +399,28 @@ struct VerifyArgs {
     /// Stop cleanly after this many claims; useful for testing resume.
     #[arg(long, hide = true)]
     max_items: Option<usize>,
+}
+
+#[derive(Debug, Args)]
+struct RepairArgs {
+    /// Location to repair; omit to repair every connected Location.
+    location: Option<String>,
+    /// Mounted path corresponding exactly to the Location; found from its recorded mount when omitted.
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Show every planned replacement and its source without changing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm the repair; required when not interactive.
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    non_interactive: bool,
+    /// Also repair copies whose size or modification time changed (likely edited).
+    #[arg(long)]
+    include_changed: bool,
+    #[arg(long)]
+    job_id: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -513,9 +543,14 @@ enum AnnexRemoteCommand {
 
 #[derive(Debug, Subcommand)]
 enum JobCommand {
+    /// List jobs. Version 2 Archives show unfinished jobs, including local jobs missing
+    /// from the catalog database, unless --all is given.
     List {
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Include finished, partial, failed and cancelled jobs (version 2 Archives).
+        #[arg(long)]
+        all: bool,
     },
     Show {
         job_id: String,
@@ -524,6 +559,13 @@ enum JobCommand {
         job_id: String,
         #[arg(long, hide = true)]
         max_items: Option<usize>,
+    },
+    /// Abandon an unfinished location scan, collection add, or annex import job and remove its local files.
+    Cancel {
+        job_id: String,
+        /// Show what would be removed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1020,10 +1062,24 @@ struct CollectionAddArgs {
     collection: Option<String>,
     #[arg(long = "exclude")]
     exclusions: Vec<PathBuf>,
+    /// Accept intentional edits to this exact ordinary file, relative to the inventory directory.
+    /// Repeat for multiple files; only these files are processed.
+    #[arg(long, value_name = "FILE")]
+    accept_changes: Vec<PathBuf>,
+    /// Preview without recording anything: with --accept-changes, hash the selected files and
+    /// show the acceptance; otherwise show how disk and catalog differ from metadata only.
+    #[arg(long)]
+    dry_run: bool,
+    /// Confirm acceptance of the explicitly selected files.
+    #[arg(long, requires = "accept_changes")]
+    yes: bool,
+    #[arg(long, requires = "accept_changes")]
+    non_interactive: bool,
     #[arg(long)]
     job_id: Option<String>,
     #[arg(long)]
     scan_id: Option<String>,
+    /// Checkpoint local progress after this many processed entries.
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long, hide = true)]
@@ -1046,10 +1102,14 @@ struct LocationScanArgs {
     job_id: Option<String>,
     #[arg(long)]
     scan_id: Option<String>,
+    /// Checkpoint local progress after this many processed entries.
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long, hide = true)]
     max_items: Option<usize>,
+    /// Show how disk and catalog differ, from metadata only; read and record nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1220,6 +1280,9 @@ struct LocationImportAnnexArgs {
     /// Inventory annex references without checking local presence or reading content.
     #[arg(long)]
     inventory_only: bool,
+    /// Deliberately repeat a completed import, for example to repair source metadata.
+    #[arg(long)]
+    reimport: bool,
     #[arg(long, default_value_t = 1_000)]
     batch_entries: usize,
     #[arg(long)]
@@ -1426,9 +1489,27 @@ enum AppError {
     Json(serde_json::Error),
     Clock,
     Input(String),
+    /// A fresh scan would strand these unfinished scan jobs: (job ID, live in another process).
+    UnfinishedScan {
+        location: String,
+        jobs: Vec<(String, bool)>,
+    },
 }
 
 impl AppError {
+    /// Structured context for JSON errors; `null` for most errors.
+    fn details(&self) -> serde_json::Value {
+        match self {
+            Self::UnfinishedScan { jobs, .. } => json!({
+                "jobs": jobs
+                    .iter()
+                    .map(|(job_id, live)| json!({"job_id": job_id, "live": live}))
+                    .collect::<Vec<_>>(),
+            }),
+            _ => serde_json::Value::Null,
+        }
+    }
+
     fn code(&self) -> &'static str {
         match self {
             Self::Catalog(error) => error.code(),
@@ -1453,6 +1534,7 @@ impl AppError {
             Self::Json(_) => "output_json",
             Self::Clock => "clock_invalid",
             Self::Input(_) => "invalid_input",
+            Self::UnfinishedScan { .. } => "unfinished_scan_job",
         }
     }
 }
@@ -1482,6 +1564,23 @@ impl std::fmt::Display for AppError {
             Self::Json(error) => error.fmt(formatter),
             Self::Clock => formatter.write_str("system clock is before the Unix epoch"),
             Self::Input(message) => formatter.write_str(message),
+            Self::UnfinishedScan { location, jobs } => {
+                write!(formatter, "{location} has an unfinished scan job:")?;
+                for (job_id, live) in jobs {
+                    if *live {
+                        write!(
+                            formatter,
+                            "\n  {job_id} is running in another process; wait for it to finish"
+                        )?;
+                    } else {
+                        write!(
+                            formatter,
+                            "\n  {job_id} was interrupted; resume it with: archive job resume {job_id}\n    or abandon it with: archive job cancel {job_id}"
+                        )?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1797,15 +1896,6 @@ struct BackgroundTarget {
     device_fingerprint_status: String,
 }
 
-#[derive(Debug)]
-struct BackgroundVerificationFailure<'a> {
-    result: &'a str,
-    observed_hash_hex: Option<&'a str>,
-    observed_size: Option<u64>,
-    duration_ms: u64,
-    detail: &'a str,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BackgroundRunSummary {
     selected: u64,
@@ -1900,6 +1990,10 @@ fn main() -> ExitCode {
     let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
+            if error.exit_code() == 0 {
+                let _ = error.print();
+                return ExitCode::SUCCESS;
+            }
             if json_requested {
                 let output = json!({
                     "version": 1,
@@ -1917,13 +2011,12 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             if cli.json {
-                eprintln!(
-                    "{}",
-                    json!({
-                        "version": 1,
-                        "error": {"code": error.code(), "message": error.to_string()},
-                    })
-                );
+                let mut body = json!({"code": error.code(), "message": error.to_string()});
+                let details = error.details();
+                if !details.is_null() {
+                    body["details"] = details;
+                }
+                eprintln!("{}", json!({"version": 1, "error": body}));
             } else {
                 eprintln!("error [{}]: {error}", error.code());
             }
@@ -2114,6 +2207,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             },
             Command::AnnexRemote { command } => execute_annex_remote(cli, &database, command),
             Command::Job { command } => execute_job(cli, &database, command),
+            Command::Repair(_) => Err(AppError::Input(
+                "archive repair requires a version 2 Archive".to_owned(),
+            )),
             Command::Background { .. } => Err(AppError::Input(
                 "background work requires a version 2 Archive".to_owned(),
             )),
@@ -2331,6 +2427,8 @@ fn execute_v2_clone(
         }
         let store = V2OriginStore::open(&canonical)?;
         let verified = store.verification_report()?;
+        // The verified clone is exactly the remote's history; git clone names it origin.
+        let _ = store.record_synced_head("origin");
         let archive_name = store.verify()?.genesis.body.archive_display_name;
         let known = central_archive(&verified.archive_id, &archive_name)?;
         if known.root.exists() {
@@ -3426,7 +3524,7 @@ fn record_annex_remote(
 
 fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Result<u8, AppError> {
     match command {
-        JobCommand::List { limit } => {
+        JobCommand::List { limit, .. } => {
             if *limit == 0 || *limit > 10_000 {
                 return Err(AppError::Input(
                     "--limit must be between 1 and 10000".to_owned(),
@@ -3439,6 +3537,11 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
             let job = local_job(database, job_id)?
                 .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
             print_jobs(cli.json, &[job])?;
+        }
+        JobCommand::Cancel { .. } => {
+            return Err(AppError::Input(
+                "job cancel requires a version 2 Archive".to_owned(),
+            ))
         }
         JobCommand::Resume { job_id, max_items } => {
             let job = local_job(database, job_id)?
@@ -3517,8 +3620,10 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
                         cli,
                         database,
                         &VerifyArgs {
-                            location: json_string(params, "location_id")?,
-                            path: PathBuf::from(json_string(params, "root_path")?),
+                            location: Some(json_string(params, "location_id")?),
+                            path: Some(PathBuf::from(json_string(params, "root_path")?)),
+                            all: false,
+                            verify_within: DEFAULT_VERIFY_WINDOW_DAYS,
                             copy: params["copy_claim_id"].as_str().map(str::to_owned),
                             fingerprint_status: params["fingerprint_status"]
                                 .as_str()
@@ -3616,6 +3721,13 @@ fn print_jobs(as_json: bool, jobs: &[LocalJob]) -> Result<(), AppError> {
 }
 
 fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Result<u8, AppError> {
+    let location = args.location.as_deref().ok_or_else(|| {
+        AppError::Input("this Archive version requires verify LOCATION".to_owned())
+    })?;
+    let verification_path = args
+        .path
+        .as_deref()
+        .ok_or_else(|| AppError::Input("this Archive version requires verify --path".to_owned()))?;
     if args.batch_entries == 0 {
         return Err(AppError::Input(
             "--batch-entries must be greater than zero".to_owned(),
@@ -3629,24 +3741,24 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
             "--fingerprint-status must be match, unavailable, or mismatch".to_owned(),
         ));
     }
-    let root_path = std::fs::canonicalize(&args.path).map_err(|error| {
+    let root_path = std::fs::canonicalize(verification_path).map_err(|error| {
         AppError::Input(format!(
             "cannot resolve verification path {}: {error}",
-            args.path.display()
+            verification_path.display()
         ))
     })?;
     let location_valid: bool = cli_connection(database)?
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM locations
                             WHERE location_id = ?1 AND kind = 'filesystem' AND status = 'active')",
-            [&args.location],
+            [location],
             |row| row.get(0),
         )
         .map_err(|source| cli_sql_error(database, source))?;
     if !location_valid {
         return Err(AppError::Input(format!(
             "active filesystem location not found: {}",
-            args.location
+            location
         )));
     }
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
@@ -3657,13 +3769,13 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
     let input_version = stable_id(
         "verify_input",
         &[
-            args.location.as_bytes(),
+            location.as_bytes(),
             root_path.to_string_lossy().as_bytes(),
             args.copy.as_deref().unwrap_or("").as_bytes(),
         ],
     );
     let params_value = json!({
-        "location_id": args.location,
+        "location_id": location,
         "root_path": root_path,
         "copy_claim_id": args.copy,
         "fingerprint_status": args.fingerprint_status,
@@ -3695,7 +3807,7 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
     loop {
         let targets = verification_targets(
             database,
-            &args.location,
+            location,
             args.copy.as_deref(),
             after.as_deref(),
             args.batch_entries,
@@ -3947,7 +4059,7 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
                     object_id: resolved_object_id,
                     file_ref_id: target.file_ref_id,
                     copy_claim_id: Some(target.copy_claim_id),
-                    location_id: Some(args.location.clone()),
+                    location_id: Some(location.to_owned()),
                     ..EventReferences::default()
                 }),
             );
@@ -3969,7 +4081,7 @@ fn execute_verify(cli: &Cli, database: &ProjectionDb, args: &VerifyArgs) -> Resu
     if args.copy.is_some() && !matched_target {
         return Err(AppError::Input(format!(
             "current verifiable copy not found at location {}: {}",
-            args.location,
+            location,
             args.copy.as_deref().unwrap_or_default()
         )));
     }
@@ -4951,11 +5063,16 @@ fn execute_v2_status(cli: &Cli) -> Result<u8, AppError> {
         .iter()
         .any(|(_, summary)| summary.files_at_risk > 0 || summary.files_uncertain > 0)
         || status.unresolved_conflicts > 0;
+    let (unfinished_jobs, local_jobs_error) = unfinished_v2_job_ids(&database)?;
+    let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
+                "unfinished_jobs": unfinished_jobs.len(),
+                "catalog_protection": catalog_protection_json(&protection),
+                "local_jobs_error": local_jobs_error,
                 "archive_id": status.archive_id,
                 "archive_name": status.archive_name,
                 "schema_version": status.schema_version,
@@ -5000,6 +5117,15 @@ fn execute_v2_status(cli: &Cli) -> Result<u8, AppError> {
                 status.unresolved_conflicts
             );
         }
+        match unfinished_jobs.as_slice() {
+            [] => {}
+            [job_id] => println!("1 unfinished job ({job_id}); see archive job show {job_id}"),
+            jobs => println!("{} unfinished jobs; see archive job list", jobs.len()),
+        }
+        if let Some(error) = local_jobs_error {
+            println!("WARNING: cannot inspect local job directories: {error}");
+        }
+        print_catalog_protection_warning(&protection);
     }
     Ok(if has_findings { EXIT_FINDINGS } else { EXIT_OK })
 }
@@ -6974,11 +7100,13 @@ fn execute_v2_init(
     let mut registry = CatalogRegistry::load()?;
     let became_default = registry.archives().is_empty() || make_default;
     registry.register(known_archive.clone(), make_default)?;
+    let protection = v2_catalog_protection(&known_archive.root.join("canonical"));
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
+                "catalog_protection": catalog_protection_json(&protection),
                 "archive_id": initialized.archive_id,
                 "archive_name": initialized.archive_name,
                 "origin_id": initialized.origin_id,
@@ -6997,6 +7125,7 @@ fn execute_v2_init(
         println!();
         println!("Next: go to the directory containing your files and run:");
         println!("  archive collection init --name <name>");
+        print_catalog_protection_warning(&protection);
     }
     Ok(EXIT_OK)
 }
@@ -7697,7 +7826,7 @@ fn execute_v2_registry_command(
                     import_id: args.import_id.clone(),
                     max_items: args.max_items,
                 };
-                execute_v2_annex_setup(cli, database, &setup, Some(collection))?
+                execute_v2_annex_setup(cli, database, &setup, Some(collection), args.reimport)?
             }
             LocationCommand::Copy(args) => execute_v2_copy_mutation(cli, database, args)?,
         },
@@ -7763,21 +7892,9 @@ fn execute_v2_registry_command(
                         .to_owned(),
                 ));
             }
-            execute_v2_location_scan(
-                cli,
-                database,
-                &LocationScanArgs {
-                    location: Some(args.location.clone()),
-                    path: Some(args.path.clone()),
-                    collection: None,
-                    exclusions: Vec::new(),
-                    job_id: args.job_id.clone(),
-                    scan_id: None,
-                    batch_entries: args.batch_entries,
-                    max_items: args.max_items,
-                },
-            )?
+            execute_v2_verify(cli, database, args, None)?
         }
+        Command::Repair(args) => execute_v2_repair(cli, database, args, None)?,
         Command::Copy(args) => {
             if args.command.is_some() {
                 return Err(AppError::Input(
@@ -8823,96 +8940,273 @@ fn execute_v2_job(
     command: &JobCommand,
 ) -> Result<u8, AppError> {
     match command {
-        JobCommand::List { limit } => {
-            let jobs = list_v2_jobs(database, *limit)?;
+        JobCommand::List { limit, all } => {
+            let jobs = query_v2_jobs(database, None, (!*all).then_some("running"), *limit)?;
+            // Local inspection problems must not hide the database jobs.
+            let (local_only, local_jobs_error) = match v2_local_only_jobs(database) {
+                Ok(jobs) => (jobs, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json!({"version": 2, "items": jobs}))?
+                    serde_json::to_string_pretty(&json!({
+                        "version": 2,
+                        "items": jobs,
+                        "local_only": local_only,
+                        "local_jobs_error": local_jobs_error,
+                    }))?
                 );
-            } else if jobs.is_empty() {
-                println!("No resumable jobs.");
-            } else {
-                for job in jobs {
-                    println!("{}  {}  {}", job.job_id, job.status, job.job_type);
+                return Ok(EXIT_OK);
+            }
+            if let Some(error) = &local_jobs_error {
+                println!("WARNING: cannot inspect local job directories: {error}");
+            }
+            if jobs.is_empty() && local_only.is_empty() {
+                println!(
+                    "{}",
+                    if *all {
+                        "No jobs."
+                    } else {
+                        "No unfinished jobs."
+                    }
+                );
+                return Ok(EXIT_OK);
+            }
+            let now = now_utc_ms()?;
+            for job in &jobs {
+                let mut line = format!(
+                    "{}  {}  {}  started {}",
+                    job.job_id,
+                    job.status,
+                    job.job_type,
+                    format_age(
+                        job.started_time_utc_ms.unwrap_or(job.created_time_utc_ms),
+                        now
+                    )
+                );
+                if let Some(progress) = job.progress.as_ref().and_then(job_progress_count) {
+                    line.push_str(&format!("  {progress}"));
                 }
+                println!("{line}");
+            }
+            if !local_only.is_empty() {
+                println!("Local job directories missing from the catalog database:");
+                for job in &local_only {
+                    println!(
+                        "{}  {}  {}",
+                        job.job_id,
+                        job.job_type.unwrap_or("unknown"),
+                        job.state.description()
+                    );
+                }
+            }
+            if jobs.iter().any(|job| job.status == "running")
+                || local_only
+                    .iter()
+                    .any(|job| job.state == LocalOnlyJobState::Resumable)
+            {
+                println!("Resume with: archive job resume <job-id>");
+            }
+            if !*all {
+                println!("Use --all to include finished jobs.");
             }
         }
         JobCommand::Show { job_id } => {
-            let job = v2_local_job(database, job_id)?
-                .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+            let Some(job) = v2_local_job(database, job_id)? else {
+                archive_ledger::validate_job_id(job_id)
+                    .map_err(|_| AppError::Input(format!("job not found: {job_id}")))?;
+                let job = v2_local_only_job(database, job_id)?
+                    .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&job)?);
+                } else {
+                    println!("Job: {}", job.job_id);
+                    println!(
+                        "Type: {}; not in the catalog database (for example after db rebuild)",
+                        job.job_type.unwrap_or("unknown")
+                    );
+                    println!("Local files: {}", job.path.display());
+                    println!("State: {}", job.state.description());
+                    if job.state == LocalOnlyJobState::Resumable {
+                        println!("Resume with: archive job resume {}", job.job_id);
+                    }
+                }
+                return Ok(EXIT_OK);
+            };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&job)?);
             } else {
                 println!("Job: {}", job.job_id);
                 println!("Type: {}; Status: {}", job.job_type, job.status);
-                if let Some(progress) = job.progress {
+                let now = now_utc_ms()?;
+                println!(
+                    "Started: {}",
+                    format_age(
+                        job.started_time_utc_ms.unwrap_or(job.created_time_utc_ms),
+                        now
+                    )
+                );
+                if let Some(finished) = job.finished_time_utc_ms {
+                    println!("Finished: {}", format_age(finished, now));
+                }
+                if job.status == "running" {
+                    // Recorded when a run pauses; a live or crashed run may be further along.
+                    let recorded = job.progress.as_ref().map(|progress| {
+                        job_progress_phase(progress)
+                            .into_iter()
+                            .chain(job_progress_count(progress))
+                            .collect::<Vec<_>>()
+                    });
+                    match recorded {
+                        Some(parts) if !parts.is_empty() => {
+                            println!("Last recorded progress: {}", parts.join(", "))
+                        }
+                        _ => println!(
+                            "Last recorded progress: none (the run may still be going, or was interrupted before pausing); resume continues from its local checkpoint"
+                        ),
+                    }
+                } else if let Some(progress) = job.progress {
                     println!("Progress: {progress}");
                 }
-                if job.status != "complete" {
+                if job.status == "running" {
                     println!("Resume with: archive job resume {}", job.job_id);
                 }
             }
         }
+        JobCommand::Cancel { job_id, dry_run } => {
+            let store = V2OriginStore::open(cli.events_path())?;
+            let result = archive_ledger::v2_cancel_job(&store, database, job_id, *dry_run)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                let size = format_bytes(result.bytes);
+                if *dry_run {
+                    println!(
+                        "Would cancel job {} ({}) and remove {} local files ({size}):",
+                        result.job_id,
+                        result.job_type,
+                        result.files.len()
+                    );
+                } else {
+                    println!(
+                        "Cancelled job {} ({}); removed {} local files ({size}).",
+                        result.job_id,
+                        result.job_type,
+                        result.files.len()
+                    );
+                }
+                if *dry_run {
+                    for file in &result.files {
+                        println!("  {} ({})", file.name, format_bytes(file.size_bytes));
+                    }
+                    println!(
+                        "Dry run: nothing changed. The preview does not finish an interrupted catalog publication; if one is pending, cancel may report the job already complete."
+                    );
+                } else {
+                    if result.finished_interrupted_publication {
+                        println!("Finished an interrupted catalog publication first.");
+                    }
+                    println!("This job had published nothing to catalog history.");
+                    if result.job_type == "annex_import" {
+                        println!(
+                            "The Collection and Location set up for this import remain; import again with archive location import-annex."
+                        );
+                    }
+                }
+            }
+        }
         JobCommand::Resume { job_id, max_items } => {
-            let job = v2_local_job(database, job_id)?
-                .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
-            if matches!(job.status.as_str(), "complete" | "cancelled") {
+            let (job_type, job_status, input_version, job_params) =
+                if let Some(job) = v2_local_job(database, job_id)? {
+                    (job.job_type, job.status, job.input_version, job.params)
+                } else {
+                    let config = v2_local_job_config(database, job_id)?
+                        .ok_or_else(|| AppError::Input(format!("job not found: {job_id}")))?;
+                    // Existing runners recheck these inputs and checkpoints under
+                    // their lock before reconstructing the missing operational row.
+                    (
+                        config.job_type.to_owned(),
+                        "running".to_owned(),
+                        config.input_version,
+                        config.params,
+                    )
+                };
+            let recovered = V2OriginStore::open(cli.events_path())?
+                .recover_pending_publication()?
+                .is_some();
+            // db apply may already have projected the pending completion. Let
+            // the job reconcile and clean up after finishing its publication.
+            let recovered_inventory = recovered
+                && matches!(
+                    job_type.as_str(),
+                    "inventory_add" | "location_scan" | "annex_import"
+                );
+            if job_status == "cancelled" || (job_status == "complete" && !recovered_inventory) {
                 return Err(AppError::Input(format!(
                     "job {job_id} is already {}",
-                    job.status
+                    job_status
                 )));
             }
-            match job.job_type.as_str() {
+            match job_type.as_str() {
                 "inventory_add" => {
-                    execute_v2_collection_add(
+                    return execute_v2_collection_add(
                         cli,
                         database,
                         &CollectionAddArgs {
-                            path: job_registry_path(&job.params, "root_path")?,
-                            location: Some(json_string(&job.params, "location_id")?),
-                            collection: Some(json_string(&job.params, "collection_id")?),
-                            exclusions: job_registry_paths(&job.params, "exclusions")?,
-                            job_id: Some(job.job_id),
-                            scan_id: Some(job.input_version),
-                            batch_entries: 1_000,
+                            path: job_registry_path(&job_params, "root_path")?,
+                            location: Some(json_string(&job_params, "location_id")?),
+                            collection: Some(json_string(&job_params, "collection_id")?),
+                            exclusions: job_registry_paths(&job_params, "exclusions")?,
+                            accept_changes: if job_params.get("accept_changes").is_some() {
+                                job_registry_paths(&job_params, "accept_changes")?
+                            } else {
+                                Vec::new()
+                            },
+                            dry_run: false,
+                            yes: true,
+                            non_interactive: true,
+                            job_id: Some(job_id.clone()),
+                            scan_id: Some(input_version),
+                            batch_entries: inventory_job_batch_entries(&job_params)?,
                             max_items: *max_items,
                         },
-                    )?;
+                    );
                 }
                 "location_scan" => {
-                    execute_v2_location_scan(
+                    return execute_v2_location_scan(
                         cli,
                         database,
                         &LocationScanArgs {
-                            location: Some(json_string(&job.params, "location_id")?),
-                            path: Some(job_registry_path(&job.params, "root_path")?),
-                            collection: Some(json_string(&job.params, "collection_id")?),
-                            exclusions: job_registry_paths(&job.params, "exclusions")?,
-                            job_id: Some(job.job_id),
-                            scan_id: Some(job.input_version),
-                            batch_entries: 1_000,
+                            location: Some(json_string(&job_params, "location_id")?),
+                            path: Some(job_registry_path(&job_params, "root_path")?),
+                            collection: Some(json_string(&job_params, "collection_id")?),
+                            exclusions: job_registry_paths(&job_params, "exclusions")?,
+                            job_id: Some(job_id.clone()),
+                            scan_id: Some(input_version),
+                            batch_entries: inventory_job_batch_entries(&job_params)?,
                             max_items: *max_items,
+                            dry_run: false,
                         },
-                    )?;
+                    );
                 }
                 "annex_import" => {
-                    let progress = AnnexProgressReporter::start()?;
+                    let progress = ProgressReporter::start(ProgressKind::AnnexImport)?;
                     let store = V2OriginStore::open(cli.events_path())?;
                     let importer = archive_ledger::V2AnnexImporter::new(
                         &store,
                         database,
                         AnnexImportConfig {
-                            inventory_only: job.params["inventory_only"].as_bool().unwrap_or(false),
-                            repo_path: job_registry_path(&job.params, "repo_path")?,
-                            import_id: job.input_version.clone(),
-                            job_id: job.job_id.clone(),
-                            collection_id: json_string(&job.params, "collection_id")?,
-                            worktree_location_id: json_string(&job.params, "worktree_location_id")?,
-                            cas_location_id: json_string(&job.params, "cas_location_id")?,
-                            device_id: json_string(&job.params, "device_id")?,
-                            archive_root_id: json_string(&job.params, "archive_root_id")?,
-                            batch_entries: job.params["batch_entries"]
+                            inventory_only: job_params["inventory_only"].as_bool().unwrap_or(false),
+                            repo_path: job_registry_path(&job_params, "repo_path")?,
+                            import_id: input_version.clone(),
+                            job_id: job_id.clone(),
+                            collection_id: json_string(&job_params, "collection_id")?,
+                            worktree_location_id: json_string(&job_params, "worktree_location_id")?,
+                            cas_location_id: json_string(&job_params, "cas_location_id")?,
+                            device_id: json_string(&job_params, "device_id")?,
+                            archive_root_id: json_string(&job_params, "archive_root_id")?,
+                            batch_entries: job_params["batch_entries"]
                                 .as_u64()
                                 .and_then(|value| usize::try_from(value).ok())
                                 .ok_or_else(|| {
@@ -8939,8 +9233,8 @@ fn execute_v2_job(
                             "{}",
                             serde_json::to_string_pretty(&json!({
                                 "version": 2,
-                                "job_id": job.job_id,
-                                "import_id": job.input_version,
+                                "job_id": job_id,
+                                "import_id": input_version,
                                 "status": status,
                                 "annex_uuid": result.annex_uuid,
                                 "git_head_commit": result.git_head_commit,
@@ -8952,7 +9246,7 @@ fn execute_v2_job(
                             "Annex import paused after {} index entries.",
                             result.summary.entries_seen
                         );
-                        println!("Resume with: archive job resume {}", job.job_id);
+                        println!("Resume with: archive job resume {job_id}");
                     } else {
                         println!(
                             "Annex import complete: {} index entries; {} verified present; {} absent; {} unchecked.",
@@ -8964,23 +9258,23 @@ fn execute_v2_job(
                     }
                 }
                 "stage_import" => {
-                    let source = job_path(&job.params, "source")?;
-                    let manifest = Some(job_path(&job.params, "manifest")?);
-                    let destination_root = Some(job_path(&job.params, "destination_root")?);
-                    let into = Some(job_path(&job.params, "into")?);
+                    let source = job_path(&job_params, "source")?;
+                    let manifest = Some(job_path(&job_params, "manifest")?);
+                    let destination_root = Some(job_path(&job_params, "destination_root")?);
+                    let into = Some(job_path(&job_params, "into")?);
                     execute_v2_stage_import(
                         cli,
                         database,
                         &StageImportArgs {
                             source,
                             manifest,
-                            collection: Some(json_string(&job.params, "collection")?),
-                            location: Some(json_string(&job.params, "location")?),
+                            collection: Some(json_string(&job_params, "collection")?),
+                            location: Some(json_string(&job_params, "location")?),
                             into,
                             dry_run: false,
                             yes: true,
                             non_interactive: true,
-                            job_id: Some(job.job_id),
+                            job_id: Some(job_id.clone()),
                             destination_root,
                             max_items: *max_items,
                             stop_after_publish: false,
@@ -8988,7 +9282,7 @@ fn execute_v2_job(
                     )?;
                 }
                 "copy" => {
-                    let cwd = job_path(&job.params, "cwd")?;
+                    let cwd = job_path(&job_params, "cwd")?;
                     std::env::set_current_dir(&cwd).map_err(|error| {
                         AppError::Input(format!(
                             "cannot return to copy job source {}: {error}",
@@ -8996,7 +9290,7 @@ fn execute_v2_job(
                         ))
                     })?;
                     let logical_filters: Vec<PathBuf> = serde_json::from_value(
-                        job.params.get("logical_filters").cloned().ok_or_else(|| {
+                        job_params.get("logical_filters").cloned().ok_or_else(|| {
                             AppError::Input("copy job lacks logical filters".to_owned())
                         })?,
                     )?;
@@ -9004,21 +9298,55 @@ fn execute_v2_job(
                         cli,
                         database,
                         &CopyMutationArgs {
-                            to: Some(json_string(&job.params, "to")?),
-                            from: Some(json_string(&job.params, "from")?),
-                            collection: Some(json_string(&job.params, "collection")?),
+                            to: Some(json_string(&job_params, "to")?),
+                            from: Some(json_string(&job_params, "from")?),
+                            collection: Some(json_string(&job_params, "collection")?),
                             paths: Vec::new(),
                             dry_run: false,
                             yes: true,
                             non_interactive: true,
-                            job_id: Some(job.job_id),
+                            job_id: Some(job_id.clone()),
                             max_items: *max_items,
                             logical_filters: Some(logical_filters),
                         },
                     )?;
                 }
                 "background_stale" => {
-                    execute_v2_background_run(cli, database, Some(job.job_id), *max_items)?;
+                    execute_v2_background_run(cli, database, Some(job_id.clone()), *max_items)?;
+                }
+                "repair" => {
+                    return execute_v2_repair(
+                        cli,
+                        database,
+                        &RepairArgs {
+                            location: None,
+                            path: None,
+                            dry_run: false,
+                            yes: true,
+                            non_interactive: true,
+                            include_changed: false,
+                            job_id: Some(job_id.clone()),
+                        },
+                        Some(job_params),
+                    );
+                }
+                "verify" => {
+                    return execute_v2_verify(
+                        cli,
+                        database,
+                        &VerifyArgs {
+                            location: None,
+                            path: None,
+                            all: false,
+                            verify_within: DEFAULT_VERIFY_WINDOW_DAYS,
+                            copy: None,
+                            fingerprint_status: "unavailable".to_owned(),
+                            job_id: Some(job_id.clone()),
+                            batch_entries: VERIFY_BATCH_COPIES,
+                            max_items: *max_items,
+                        },
+                        Some(job_params),
+                    );
                 }
                 other => {
                     return Err(AppError::Input(format!(
@@ -9150,6 +9478,9 @@ fn print_background_status(
                 "enabled": config.enabled,
                 "paused": config.paused,
                 "max_items": config.max_items,
+                "pending_due": pending,
+                // Earlier name, kept for existing consumers; the count now includes
+                // copies due for verification, not only stale presence.
                 "pending_stale_presence": pending,
                 "running_job_id": running,
                 "execution_model": "external_scheduler_one_shot",
@@ -9166,7 +9497,7 @@ fn print_background_status(
             if config.paused { " (paused)" } else { "" }
         );
         println!("Bound per run: {} Copy claims", config.max_items);
-        println!("Stale presence pending: {pending}");
+        println!("Copies due for verification: {pending}");
         if let Some(job_id) = running {
             println!("Running/resumable job: {job_id}");
         }
@@ -9177,21 +9508,14 @@ fn print_background_status(
 
 fn count_background_stale(database: &V2ProjectionDb) -> Result<u64, AppError> {
     let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
-    let count: i64 = v2_cli_connection(database)?
-        .query_row(
-            "SELECT COUNT(DISTINCT cc.copy_claim_id)
-             FROM copy_claims cc
-             JOIN file_refs f ON f.object_id = cc.object_id AND f.path_state = 'active'
-             JOIN collections c ON c.collection_id = f.collection_id AND c.status = 'active'
-             JOIN policies p ON p.policy_id = c.policy_id AND p.status = 'active' AND p.enabled = 1
-             WHERE cc.state = 'present'
-               AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
-                    ?1 - CAST(json_extract(p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000)",
-            [now],
-            |row| row.get(0),
-        )
-        .map_err(|source| v2_cli_sql_error(database, source))?;
-    nonnegative_sql_count(count)
+    count_due_copies(
+        database,
+        None,
+        VerifySelection::Due {
+            window_days: DEFAULT_VERIFY_WINDOW_DAYS,
+        },
+        now,
+    )
 }
 
 fn running_background_job(
@@ -9224,25 +9548,281 @@ fn background_job_host(
         .map_err(|source| v2_cli_sql_error(database, source))
 }
 
-fn background_targets(
+const DEFAULT_VERIFY_WINDOW_DAYS: u64 = 30;
+/// Outcomes per canonical append; also the placement batch limit.
+const VERIFY_BATCH_COPIES: usize = 1_000;
+
+/// Which copies a verification job reads. The job fixes `as_of_ms` when it
+/// starts: only copies last verified before then are selected, so a resumed
+/// job continues the same selection and reads each copy at most once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifySelection {
+    /// Copies never verified, whose last check failed, whose verification is past
+    /// due or due within `window_days`, or whose presence is past its limit.
+    Due { window_days: u64 },
+    /// Every current copy.
+    All,
+}
+
+#[derive(Debug, Clone)]
+struct VerifyLocation {
+    location_id: String,
+    root: PathBuf,
+    fingerprint_status: String,
+}
+
+/// A present path observation at the copy's Location for the copy itself: the same
+/// path, or for a locked annex symlink the same key (its claim is the object file).
+const COPY_OBSERVATION_MATCH: &str = "here.location_id = cc.location_id AND here.state = 'present'
+    AND ((here.observed_path_encoding = cc.relative_path_encoding
+          AND here.observed_path_bytes = cc.relative_path_bytes)
+      OR (here.representation = 'annex_locked_symlink'
+          AND here.external_identity_id = cc.external_identity_id))";
+
+/// Shared eligibility for verify and the background runner. A copy is due when its
+/// check is within the window of expiring, but never more often than every half of
+/// the Policy's verification age, so short Policies are not re-read on every run. `?1` is a JSON array
+/// of Location IDs (NULL for all), `?2` the selection time, `?3` 1 for all
+/// copies, and `?4` the due window in days.
+const DUE_COPIES_SQL: &str = "
+    FROM copy_claims cc
+    JOIN objects o ON o.object_id = cc.object_id
+    WHERE (?1 IS NULL OR cc.location_id IN (SELECT value FROM json_each(?1)))
+      AND cc.state IN ('present', 'corrupt', 'unknown')
+      AND (cc.last_verified_time_utc_ms IS NULL OR cc.last_verified_time_utc_ms < ?2)
+      -- Only a path currently present at this Location is verified: verification
+      -- must never revive a missing path or invent one for another File.
+      AND EXISTS (SELECT 1 FROM path_observations here WHERE COPY_OBSERVATION_MATCH)
+      AND EXISTS (
+        SELECT 1 FROM file_refs due_file
+        JOIN collections due_collection ON due_collection.collection_id = due_file.collection_id
+                                       AND due_collection.status = 'active'
+        LEFT JOIN policies p ON p.policy_id = due_collection.policy_id
+                            AND p.status = 'active' AND p.enabled = 1
+        WHERE due_file.object_id = cc.object_id AND due_file.path_state = 'active'
+          AND (?3 = 1 OR (p.policy_id IS NOT NULL AND (
+                cc.last_verified_time_utc_ms IS NULL
+             OR cc.last_verification_result IS NOT 'ok'
+             OR cc.last_verified_time_utc_ms < ?2 - MAX(
+                    CAST(json_extract(p.requirements_json, '$.max_verification_age_days') AS INTEGER) - ?4,
+                    CAST(json_extract(p.requirements_json, '$.max_verification_age_days') AS INTEGER) / 2
+                ) * 86400000
+             OR cc.last_seen_time_utc_ms IS NULL
+             OR cc.last_seen_time_utc_ms < ?2 - CAST(json_extract(
+                    p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000))))";
+
+fn verify_selection_params(
+    locations: Option<&[VerifyLocation]>,
+    selection: VerifySelection,
+    as_of_ms: i64,
+) -> Result<(Option<String>, i64, i64, i64), AppError> {
+    let ids = locations
+        .map(|locations| {
+            serde_json::to_string(
+                &locations
+                    .iter()
+                    .map(|location| location.location_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .transpose()?;
+    let (all, window) = match selection {
+        VerifySelection::All => (1, 0),
+        VerifySelection::Due { window_days } => (0, i64::try_from(window_days).unwrap_or(i64::MAX)),
+    };
+    Ok((ids, as_of_ms, all, window))
+}
+
+/// Due copies anywhere (or at `locations`) as of `as_of_ms`.
+fn count_due_copies(
+    database: &V2ProjectionDb,
+    locations: Option<&[VerifyLocation]>,
+    selection: VerifySelection,
+    as_of_ms: i64,
+) -> Result<u64, AppError> {
+    let (ids, as_of, all, window) = verify_selection_params(locations, selection, as_of_ms)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            &format!("SELECT COUNT(*) {DUE_COPIES_SQL}")
+                .replace("COPY_OBSERVATION_MATCH", COPY_OBSERVATION_MATCH),
+            params![ids, as_of, all, window],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+/// Copies at one Location due for verification within the default window, and
+/// those already past due, for scan and add summaries.
+fn verification_due_at(
+    database: &V2ProjectionDb,
+    location_id: &str,
+) -> Result<(u64, u64), AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let here = [VerifyLocation {
+        location_id: location_id.to_owned(),
+        root: PathBuf::new(),
+        fingerprint_status: String::new(),
+    }];
+    Ok((
+        count_due_copies(
+            database,
+            Some(&here),
+            VerifySelection::Due {
+                window_days: DEFAULT_VERIFY_WINDOW_DAYS,
+            },
+            now,
+        )?,
+        count_due_copies(
+            database,
+            Some(&here),
+            VerifySelection::Due { window_days: 0 },
+            now,
+        )?,
+    ))
+}
+
+fn print_verification_due(location_name: &str, (due, past_due): (u64, u64)) {
+    if due > 0 {
+        println!(
+            "  {due} copies here are due for verification within {DEFAULT_VERIFY_WINDOW_DAYS} days ({past_due} past due). Next: archive verify {}",
+            shell_quote(location_name)
+        );
+    }
+}
+
+/// Current copies with no content identity yet, e.g. after an inventory-only annex
+/// import. Only a scan can read them, because verification needs a known Object.
+fn count_unidentified_copies(
+    database: &V2ProjectionDb,
+    locations: &[VerifyLocation],
+) -> Result<u64, AppError> {
+    let (ids, _, _, _) = verify_selection_params(Some(locations), VerifySelection::All, 0)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            "SELECT COUNT(*) FROM copy_claims
+             WHERE location_id IN (SELECT value FROM json_each(?1))
+               AND state IN ('present', 'unknown') AND object_id IS NULL",
+            [ids],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+/// Least recently verified first across all given Locations (never verified first).
+fn due_verification_targets(
+    database: &V2ProjectionDb,
+    locations: &[VerifyLocation],
+    selection: VerifySelection,
+    as_of_ms: i64,
+    limit: usize,
+) -> Result<Vec<BackgroundTarget>, AppError> {
+    if locations.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (ids, as_of, all, window) = verify_selection_params(Some(locations), selection, as_of_ms)?;
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
+                    cc.object_id, o.canonical_hash_hex, o.size_bytes,
+                    f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
+                    cc.relative_path_encoding, cc.relative_path_bytes,
+                    cc.relative_path_display, cc.external_identity_id
+             {}
+             ORDER BY COALESCE(cc.last_verified_time_utc_ms, -1), cc.copy_claim_id
+             LIMIT ?5",
+            DUE_COPIES_SQL
+                .replace(
+                    "JOIN objects o ON o.object_id = cc.object_id",
+                    "JOIN objects o ON o.object_id = cc.object_id
+                 JOIN file_refs f ON f.file_ref_id = (
+                     SELECT candidate.file_ref_id FROM path_observations here
+                     JOIN file_refs candidate ON candidate.file_ref_id = here.file_ref_id
+                     JOIN collections c ON c.collection_id = candidate.collection_id
+                                         AND c.status = 'active'
+                     WHERE COPY_OBSERVATION_MATCH
+                       AND candidate.object_id = cc.object_id AND candidate.path_state = 'active'
+                     ORDER BY candidate.collection_id, candidate.logical_path_encoding,
+                              candidate.logical_path_bytes, candidate.file_ref_id
+                     LIMIT 1)",
+                )
+                .replace("COPY_OBSERVATION_MATCH", COPY_OBSERVATION_MATCH)
+        ))
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map(
+            params![
+                ids,
+                as_of,
+                all,
+                window,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let size: i64 = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    u64::try_from(size)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            },
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    rows.into_iter()
+        .map(|row| {
+            let location = locations
+                .iter()
+                .find(|location| location.location_id == row.2)
+                .expect("selected from these Locations");
+            Ok(BackgroundTarget {
+                copy_claim_id: row.0,
+                collection_id: row.1,
+                location_id: row.2,
+                file_ref_id: row.3,
+                object_id: row.4,
+                blake3_hex: row.5,
+                size_bytes: row.6,
+                logical_path: registry_path_from_sql(&row.7, &row.8, &row.9)?,
+                copy_path: registry_path_from_sql(&row.10, &row.11, &row.12)?,
+                external_identity_id: row.13,
+                location_root: location.root.clone(),
+                device_fingerprint_status: location.fingerprint_status.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Mounted filesystem Locations on recognized, confirmed Devices whose identity
+/// currently matches, plus the number of Devices skipped.
+fn background_locations(
     cli: &Cli,
     database: &V2ProjectionDb,
-    limit: usize,
-) -> Result<(Vec<BackgroundTarget>, u64), AppError> {
+) -> Result<(Vec<VerifyLocation>, u64), AppError> {
     let state = database.registry_state(false)?;
-    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
     let connection = v2_cli_connection(database)?;
-    let mut targets = Vec::new();
+    let mut locations = Vec::new();
     let mut skipped_devices = BTreeSet::new();
-
     for location in state
         .locations
         .iter()
         .filter(|location| location.status == "active" && location.kind == "filesystem")
     {
-        if targets.len() >= limit {
-            break;
-        }
         let Some(device_id) = location.device_id.as_deref() else {
             continue;
         };
@@ -9262,103 +9842,21 @@ fn background_targets(
             skipped_devices.insert(device_id.to_owned());
             continue;
         }
-        let (mounted_location, location_root, fingerprint_status) =
-            match v2_mounted_location_by_selector(cli, database, &state, &location.location_id) {
-                Ok(value) => value,
-                Err(AppError::Input(_)) => {
-                    skipped_devices.insert(device_id.to_owned());
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-        if fingerprint_status != "match" {
-            skipped_devices.insert(device_id.to_owned());
-            continue;
-        }
-
-        let remaining = limit.saturating_sub(targets.len());
-        let mut statement = connection
-            .prepare(
-                "SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
-                        cc.object_id, o.canonical_hash_hex, o.size_bytes,
-                        f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
-                        cc.relative_path_encoding, cc.relative_path_bytes,
-                        cc.relative_path_display, cc.external_identity_id
-                 FROM copy_claims cc
-                 JOIN objects o ON o.object_id = cc.object_id
-                 JOIN file_refs f ON f.file_ref_id = (
-                     SELECT candidate.file_ref_id
-                     FROM file_refs candidate
-                     JOIN collections c ON c.collection_id = candidate.collection_id
-                                         AND c.status = 'active'
-                     JOIN policies p ON p.policy_id = c.policy_id
-                                    AND p.status = 'active' AND p.enabled = 1
-                     WHERE candidate.object_id = cc.object_id
-                       AND candidate.path_state = 'active'
-                       AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
-                            ?2 - CAST(json_extract(
-                                p.requirements_json,
-                                '$.max_observation_age_days'
-                            ) AS INTEGER) * 86400000)
-                     ORDER BY candidate.collection_id, candidate.logical_path_encoding,
-                              candidate.logical_path_bytes, candidate.file_ref_id
-                     LIMIT 1
-                 )
-                 WHERE cc.location_id = ?1 AND cc.state = 'present'
-                 ORDER BY COALESCE(cc.last_seen_time_utc_ms, -1), cc.copy_claim_id
-                 LIMIT ?3",
-            )
-            .map_err(|source| v2_cli_sql_error(database, source))?;
-        let rows = statement
-            .query_map(
-                params![
-                    mounted_location.location_id,
-                    now,
-                    i64::try_from(remaining).unwrap_or(i64::MAX)
-                ],
-                |row| {
-                    let size: i64 = row.get(6)?;
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        u64::try_from(size)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, Vec<u8>>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, Vec<u8>>(11)?,
-                        row.get::<_, String>(12)?,
-                        row.get::<_, Option<String>>(13)?,
-                    ))
-                },
-            )
-            .map_err(|source| v2_cli_sql_error(database, source))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|source| v2_cli_sql_error(database, source))?;
-        for row in rows {
-            targets.push(BackgroundTarget {
-                copy_claim_id: row.0,
-                collection_id: row.1,
-                location_id: row.2,
-                file_ref_id: row.3,
-                object_id: row.4,
-                blake3_hex: row.5,
-                size_bytes: row.6,
-                logical_path: registry_path_from_sql(&row.7, &row.8, &row.9)?,
-                copy_path: registry_path_from_sql(&row.10, &row.11, &row.12)?,
-                external_identity_id: row.13,
-                location_root: location_root.clone(),
-                device_fingerprint_status: fingerprint_status.clone(),
-            });
+        match v2_mounted_location_by_selector(cli, database, &state, &location.location_id) {
+            Ok((mounted, root, fingerprint_status)) if fingerprint_status == "match" => locations
+                .push(VerifyLocation {
+                    location_id: mounted.location_id,
+                    root,
+                    fingerprint_status,
+                }),
+            Ok(_) | Err(AppError::Input(_)) => {
+                skipped_devices.insert(device_id.to_owned());
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok((
-        targets,
+        locations,
         u64::try_from(skipped_devices.len()).unwrap_or(u64::MAX),
     ))
 }
@@ -9394,10 +9892,19 @@ fn registry_path_from_sql(
 }
 
 fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppError> {
-    let relative = target.copy_path.to_path_buf().ok_or_else(|| {
+    location_content_path(&target.location_root, &target.copy_path)
+}
+
+/// Resolves a cataloged copy path inside its Location root without following any
+/// symlink, refusing escapes and non-directory parents.
+fn location_content_path(
+    location_root: &Path,
+    copy_path: &RegistryPath,
+) -> Result<PathBuf, AppError> {
+    let relative = copy_path.to_path_buf().ok_or_else(|| {
         AppError::Input(format!(
             "copy path is unavailable on this platform: {}",
-            target.copy_path.display
+            copy_path.display
         ))
     })?;
     if relative.is_absolute()
@@ -9412,11 +9919,11 @@ fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppErro
     {
         return Err(AppError::Input(format!(
             "copy path escapes its Location: {}",
-            target.copy_path.display
+            copy_path.display
         )));
     }
-    let path = target.location_root.join(&relative);
-    let mut checked = target.location_root.clone();
+    let path = location_root.join(&relative);
+    let mut checked = location_root.to_path_buf();
     let component_count = relative.components().count();
     for (index, component) in relative.components().enumerate() {
         checked.push(component.as_os_str());
@@ -9442,10 +9949,10 @@ fn background_content_path(target: &BackgroundTarget) -> Result<PathBuf, AppErro
     let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
         AppError::Input(format!("cannot resolve {}: {error}", parent.display()))
     })?;
-    if !canonical_parent.starts_with(&target.location_root) {
+    if !canonical_parent.starts_with(location_root) {
         return Err(AppError::Input(format!(
             "copy path resolves outside its Location: {}",
-            target.copy_path.display
+            copy_path.display
         )));
     }
     Ok(path)
@@ -9519,152 +10026,1126 @@ fn hash_background_file(path: &Path) -> Result<(u64, String, u64, Option<u64>), 
     ))
 }
 
-fn append_background_verification_failure(
+/// Reads each target and records every outcome in at most two canonical
+/// appends: successful observations, then failures. Callers pass at most
+/// `VERIFY_BATCH_COPIES` targets. Operation keys make a repeated batch a no-op.
+fn verify_copy_batch(
     database: &V2ProjectionDb,
     store: &V2OriginStore,
     job_id: &str,
+    job_type: &str,
     input_version: &str,
-    target: &BackgroundTarget,
-    failure: &BackgroundVerificationFailure<'_>,
+    targets: &[BackgroundTarget],
+    summary: &mut BackgroundRunSummary,
 ) -> Result<(), AppError> {
-    let operation_key = stable_id(
-        "op",
-        &[
-            job_id.as_bytes(),
-            input_version.as_bytes(),
-            target.copy_claim_id.as_bytes(),
-            failure.result.as_bytes(),
-        ],
-    );
-    store.append_batch(
-        "background_verify",
-        1,
-        json!({"job_id": job_id, "job_type": "background_stale"}),
-        json!({}),
-        vec![json!({
-            "kind": "copy_verification_failed",
-            "copy_claim_id": target.copy_claim_id,
-            "object_id": target.object_id,
-            "location_id": target.location_id,
-            "logical_path": target.logical_path,
-            "copy_path": target.copy_path,
-            "result": failure.result,
-            "expected_hash_algo": "blake3",
-            "expected_hash_hex": target.blake3_hex,
-            "observed_hash_hex": failure.observed_hash_hex,
-            "size_bytes": failure.observed_size,
-            "duration_ms": failure.duration_ms,
-            "verified_time_utc_ms": now_utc_ms()?,
-            "device_fingerprint_status": target.device_fingerprint_status,
-            "error_detail": failure.detail,
-            "job_id": job_id,
-            "job_type": "background_stale",
-            "item_type": "copy_claim",
-            "item_key": target.copy_claim_id,
-            "outcome_kind": failure.result,
-            "operation_key": operation_key,
-        })],
-    )?;
-    database.apply(store)?;
+    let mut placements = Vec::new();
+    let mut failures = Vec::new();
+    for target in targets {
+        let outcome = background_content_path(target)
+            .map_err(|error| error.to_string())
+            .and_then(|path| hash_background_file(&path));
+        match outcome {
+            Ok((size, hash, _, modified_time))
+                if size == target.size_bytes && hash == target.blake3_hex =>
+            {
+                summary.bytes_read = summary.bytes_read.saturating_add(size);
+                summary.verified_ok = summary.verified_ok.saturating_add(1);
+                placements.push(archive_ledger::V2Placement {
+                    collection_id: target.collection_id.clone(),
+                    location_id: target.location_id.clone(),
+                    file_ref_id: target.file_ref_id.clone(),
+                    logical_path: target.logical_path.clone(),
+                    copy_path: target.copy_path.clone(),
+                    object_id: target.object_id.clone(),
+                    blake3_hex: target.blake3_hex.clone(),
+                    size_bytes: target.size_bytes,
+                    modified_time_utc_ms: modified_time,
+                    representation: if target.external_identity_id.is_some() {
+                        "annex_locked_symlink".to_owned()
+                    } else {
+                        "ordinary_file".to_owned()
+                    },
+                    external_identity_id: target.external_identity_id.clone(),
+                    device_fingerprint_status: target.device_fingerprint_status.clone(),
+                    job_id: job_id.to_owned(),
+                    job_type: job_type.to_owned(),
+                    input_version: input_version.to_owned(),
+                });
+            }
+            Ok((size, hash, duration_ms, _)) => {
+                summary.bytes_read = summary.bytes_read.saturating_add(size);
+                summary.hash_mismatches = summary.hash_mismatches.saturating_add(1);
+                failures.push(verification_failure_item(
+                    job_id,
+                    job_type,
+                    input_version,
+                    target,
+                    "hash_mismatch",
+                    Some(&hash),
+                    Some(size),
+                    duration_ms,
+                    "file content does not match the recorded Object",
+                )?);
+            }
+            Err(detail) => {
+                summary.read_errors = summary.read_errors.saturating_add(1);
+                failures.push(verification_failure_item(
+                    job_id,
+                    job_type,
+                    input_version,
+                    target,
+                    "read_error",
+                    None,
+                    None,
+                    0,
+                    &detail,
+                )?);
+            }
+        }
+    }
+    archive_ledger::v2_record_placements(store, database, &placements)?;
+    let connection = v2_cli_connection(database)?;
+    let mut pending = Vec::new();
+    for item in failures {
+        let recorded: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operation_outcomes WHERE operation_key = ?1)",
+                [item["operation_key"].as_str().unwrap_or_default()],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if !recorded {
+            pending.push(item);
+        }
+    }
+    if !pending.is_empty() {
+        store.append_batch(
+            "background_verify",
+            1,
+            json!({"job_id": job_id, "job_type": job_type}),
+            json!({}),
+            pending,
+        )?;
+        database.apply(store)?;
+    }
     Ok(())
 }
 
-fn verify_background_target(
-    database: &V2ProjectionDb,
-    store: &V2OriginStore,
+#[allow(clippy::too_many_arguments)]
+fn verification_failure_item(
     job_id: &str,
+    job_type: &str,
     input_version: &str,
     target: &BackgroundTarget,
-    summary: &mut BackgroundRunSummary,
-) -> Result<(), AppError> {
-    let path = match background_content_path(target) {
-        Ok(path) => path,
-        Err(error) => {
-            append_background_verification_failure(
-                database,
-                store,
-                job_id,
-                input_version,
-                target,
-                &BackgroundVerificationFailure {
-                    result: "read_error",
-                    observed_hash_hex: None,
-                    observed_size: None,
-                    duration_ms: 0,
-                    detail: &error.to_string(),
+    result: &str,
+    observed_hash_hex: Option<&str>,
+    observed_size: Option<u64>,
+    duration_ms: u64,
+    detail: &str,
+) -> Result<serde_json::Value, AppError> {
+    Ok(json!({
+        "kind": "copy_verification_failed",
+        "copy_claim_id": target.copy_claim_id,
+        "object_id": target.object_id,
+        "location_id": target.location_id,
+        "logical_path": target.logical_path,
+        "copy_path": target.copy_path,
+        "result": result,
+        "expected_hash_algo": "blake3",
+        "expected_hash_hex": target.blake3_hex,
+        "observed_hash_hex": observed_hash_hex,
+        "size_bytes": observed_size,
+        "duration_ms": duration_ms,
+        "verified_time_utc_ms": now_utc_ms()?,
+        "device_fingerprint_status": target.device_fingerprint_status,
+        "error_detail": detail,
+        "job_id": job_id,
+        "job_type": job_type,
+        "item_type": "copy_claim",
+        "item_key": target.copy_claim_id,
+        "outcome_kind": result,
+        "operation_key": stable_id(
+            "op",
+            &[
+                job_id.as_bytes(),
+                input_version.as_bytes(),
+                target.copy_claim_id.as_bytes(),
+                result.as_bytes(),
+            ],
+        ),
+    }))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RepairSummary {
+    corrupt: u64,
+    repaired: u64,
+    skipped_changed: u64,
+    no_source: u64,
+    failed: u64,
+    bytes_written: u64,
+}
+
+/// A corrupt copy plus the observation at which it was last good.
+struct RepairTarget {
+    copy: BackgroundTarget,
+    observed_size: Option<i64>,
+    observed_mtime: Option<i64>,
+}
+
+/// Corrupt copies at these Locations whose path is currently observed present.
+fn repair_targets(
+    database: &V2ProjectionDb,
+    locations: &[VerifyLocation],
+) -> Result<Vec<RepairTarget>, AppError> {
+    let (ids, _, _, _) = verify_selection_params(Some(locations), VerifySelection::All, 0)?;
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            &"SELECT cc.copy_claim_id, f.collection_id, cc.location_id, f.file_ref_id,
+                    cc.object_id, o.canonical_hash_hex, o.size_bytes,
+                    f.logical_path_encoding, f.logical_path_bytes, f.logical_path_display,
+                    cc.relative_path_encoding, cc.relative_path_bytes, cc.relative_path_display,
+                    cc.external_identity_id, here.observed_size_bytes, here.modified_time_utc_ms
+             FROM copy_claims cc
+             JOIN objects o ON o.object_id = cc.object_id
+             JOIN path_observations here ON here.rowid = (
+                 SELECT here.rowid FROM path_observations here WHERE COPY_OBSERVATION_MATCH
+                 ORDER BY here.observed_path_encoding, here.observed_path_bytes LIMIT 1)
+             JOIN file_refs f ON f.file_ref_id = here.file_ref_id
+                             AND f.object_id = cc.object_id AND f.path_state = 'active'
+             WHERE cc.state = 'corrupt' AND cc.location_id IN (SELECT value FROM json_each(?1))
+             ORDER BY cc.location_id, cc.relative_path_encoding, cc.relative_path_bytes"
+                .replace("COPY_OBSERVATION_MATCH", COPY_OBSERVATION_MATCH),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map([ids], |row| {
+            let size: i64 = row.get(6)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                u64::try_from(size)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, size))?,
+                (
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                    row.get::<_, String>(9)?,
+                ),
+                (
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, String>(12)?,
+                ),
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+            ))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    rows.into_iter()
+        .map(|row| {
+            let location = locations
+                .iter()
+                .find(|location| location.location_id == row.2)
+                .expect("selected from these Locations");
+            Ok(RepairTarget {
+                copy: BackgroundTarget {
+                    copy_claim_id: row.0,
+                    collection_id: row.1,
+                    location_id: row.2,
+                    file_ref_id: row.3,
+                    object_id: row.4,
+                    blake3_hex: row.5,
+                    size_bytes: row.6,
+                    logical_path: registry_path_from_sql(&row.7 .0, &row.7 .1, &row.7 .2)?,
+                    copy_path: registry_path_from_sql(&row.8 .0, &row.8 .1, &row.8 .2)?,
+                    external_identity_id: row.9,
+                    location_root: location.root.clone(),
+                    device_fingerprint_status: location.fingerprint_status.clone(),
                 },
-            )?;
-            summary.read_errors = summary.read_errors.saturating_add(1);
-            return Ok(());
-        }
-    };
-    match hash_background_file(&path) {
-        Ok((size, hash, duration_ms, modified_time)) => {
-            summary.bytes_read = summary.bytes_read.saturating_add(size);
-            if size == target.size_bytes && hash == target.blake3_hex {
-                archive_ledger::v2_record_placements(
-                    store,
-                    database,
-                    &[archive_ledger::V2Placement {
-                        collection_id: target.collection_id.clone(),
-                        location_id: target.location_id.clone(),
-                        file_ref_id: target.file_ref_id.clone(),
-                        logical_path: target.logical_path.clone(),
-                        copy_path: target.copy_path.clone(),
-                        object_id: target.object_id.clone(),
-                        blake3_hex: target.blake3_hex.clone(),
-                        size_bytes: target.size_bytes,
-                        modified_time_utc_ms: modified_time,
-                        representation: if target.external_identity_id.is_some() {
-                            "annex_locked_symlink".to_owned()
-                        } else {
-                            "ordinary_file".to_owned()
-                        },
-                        external_identity_id: target.external_identity_id.clone(),
-                        device_fingerprint_status: target.device_fingerprint_status.clone(),
-                        job_id: job_id.to_owned(),
-                        job_type: "background_stale".to_owned(),
-                        input_version: input_version.to_owned(),
-                    }],
-                )?;
-                summary.verified_ok = summary.verified_ok.saturating_add(1);
-            } else {
-                append_background_verification_failure(
-                    database,
-                    store,
-                    job_id,
-                    input_version,
-                    target,
-                    &BackgroundVerificationFailure {
-                        result: "hash_mismatch",
-                        observed_hash_hex: Some(&hash),
-                        observed_size: Some(size),
-                        duration_ms,
-                        detail: "file content does not match the recorded Object",
-                    },
-                )?;
-                summary.hash_mismatches = summary.hash_mismatches.saturating_add(1);
-            }
-        }
-        Err(detail) => {
-            append_background_verification_failure(
-                database,
-                store,
-                job_id,
-                input_version,
-                target,
-                &BackgroundVerificationFailure {
-                    result: "read_error",
-                    observed_hash_hex: None,
-                    observed_size: None,
-                    duration_ms: 0,
-                    detail: &detail,
+                observed_size: row.10,
+                observed_mtime: row.11,
+            })
+        })
+        .collect()
+}
+
+/// The most recently verified connected good copy of an Object, if any.
+fn repair_source(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    target: &BackgroundTarget,
+    roots: &mut BTreeMap<String, Option<PathBuf>>,
+) -> Result<Option<(String, PathBuf, String)>, AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT location_id, relative_path_encoding, relative_path_bytes, relative_path_display
+             FROM copy_claims
+             WHERE object_id = ?1 AND copy_claim_id != ?2 AND state = 'present'
+               AND last_verification_result = 'ok'
+             ORDER BY last_verified_time_utc_ms DESC, location_id, copy_claim_id",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let candidates = statement
+        .query_map(params![target.object_id, target.copy_claim_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    for (location_id, encoding, bytes, display) in candidates {
+        let root =
+            roots.entry(location_id.clone()).or_insert_with(
+                || match v2_mounted_location_by_selector(cli, database, state, &location_id) {
+                    Ok((_, root, status)) if status != "mismatch" => Some(root),
+                    _ => None,
                 },
-            )?;
-            summary.read_errors = summary.read_errors.saturating_add(1);
+            );
+        let Some(root) = root.clone() else { continue };
+        let copy_path = registry_path_from_sql(&encoding, &bytes, &display)?;
+        let Ok(path) = location_content_path(&root, &copy_path) else {
+            continue;
+        };
+        // A cheap pre-check; the bytes themselves are verified while they are copied.
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == target.size_bytes)
+        {
+            return Ok(Some((location_id, path, display)));
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn filesystem_id(path: &Path) -> Result<u64, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(std::fs::metadata(path)?.dev())
+}
+
+#[cfg(not(unix))]
+fn filesystem_id(_path: &Path) -> Result<u64, AppError> {
+    Ok(0)
+}
+
+/// Creates `root/relative` directory by directory, refusing any symlink or non-directory.
+fn ensure_real_directories(root: &Path, relative: &Path) -> Result<PathBuf, AppError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(AppError::Input(format!(
+                "unsafe quarantine path component in {}",
+                relative.display()
+            )));
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(AppError::Input(format!(
+                    "quarantine path is not a real directory: {}",
+                    current.display()
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(current)
+}
+
+/// Runs `action` with `directory` writable by its owner, restoring its mode after,
+/// as git-annex object directories are read-only.
+#[cfg(unix)]
+fn with_writable_directory<T>(
+    directory: &Path,
+    action: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let original = std::fs::metadata(directory)?.permissions();
+    let locked = original.mode() & 0o200 == 0;
+    if locked {
+        std::fs::set_permissions(
+            directory,
+            std::fs::Permissions::from_mode(original.mode() | 0o200),
+        )?;
+    }
+    let result = action();
+    if locked {
+        // A failed restore is reported only if the action itself succeeded, so it can
+        // never hide what the action did or failed to do.
+        let restored = std::fs::set_permissions(directory, original);
+        if result.is_ok() {
+            restored?;
+        }
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn with_writable_directory<T>(
+    _directory: &Path,
+    action: impl FnOnce() -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    action()
+}
+
+/// Replaces one corrupt copy without ever overwriting: stage verified bytes in
+/// the quarantine area, move the corrupt file into quarantine, then place the
+/// staged file at the original path. Each step is a no-replace move on one
+/// filesystem, so a resumed job recognizes and finishes any interrupted state.
+fn repair_one(
+    target: &BackgroundTarget,
+    source: Option<&Path>,
+    planned: Option<(u64, Option<SystemTime>)>,
+    quarantine: &Path,
+    staged: &Path,
+    destination: &Path,
+) -> Result<u64, AppError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::Input("copy path has no parent".to_owned()))?;
+    let fresh = !quarantine.exists() && !staged.exists();
+    if fresh {
+        // A previous run may already have placed good bytes without recording them.
+        if let Ok(verified) = archive_ledger::verify_existing_file(destination, &target.blake3_hex)
+        {
+            return Ok(verified.bytes_copied);
+        }
+        let source = source.ok_or_else(|| {
+            AppError::Input("no connected verified copy to repair from".to_owned())
+        })?;
+        let original = std::fs::symlink_metadata(destination)?;
+        archive_ledger::copy_verified_no_replace(source, staged, &target.blake3_hex)
+            .map_err(|error| AppError::Input(error.to_string()))?;
+        // Keep the file's dates and permissions as they were.
+        std::fs::File::options()
+            .write(true)
+            .open(staged)?
+            .set_modified(original.modified()?)?;
+        std::fs::set_permissions(staged, original.permissions())?;
+    } else if staged.exists() {
+        archive_ledger::verify_existing_file(staged, &target.blake3_hex)
+            .map_err(|error| AppError::Input(error.to_string()))?;
+    }
+    with_writable_directory(parent, || {
+        if !quarantine.exists() {
+            // The file must still be what was planned: an edit made since then is never
+            // quarantined behind the user's back.
+            if let Some((size, modified)) = planned {
+                let now = std::fs::symlink_metadata(destination)?;
+                if now.len() != size || now.modified().ok() != modified {
+                    let _ = std::fs::remove_file(staged);
+                    return Err(AppError::Input(
+                        "the file changed after the repair was planned; nothing was replaced"
+                            .to_owned(),
+                    ));
+                }
+            }
+            archive_ledger::place_file_no_replace(destination, quarantine)
+                .map_err(|error| AppError::Input(error.to_string()))?;
+        } else if staged.exists() && destination.exists() && same_file(destination, quarantine)? {
+            // Where a no-replace move is a hard link then an unlink, a crash can leave
+            // the corrupt file linked at both paths; the extra link holds no other bytes.
+            std::fs::remove_file(destination)?;
+        }
+        if staged.exists() && !destination.exists() {
+            archive_ledger::place_file_no_replace(staged, destination)
+                .map_err(|error| AppError::Input(error.to_string()))?;
+        }
+        Ok(())
+    })?;
+    let verified = archive_ledger::verify_existing_file(destination, &target.blake3_hex)
+        .map_err(|error| AppError::Input(error.to_string()))?;
+    Ok(verified.bytes_copied)
+}
+
+#[cfg(unix)]
+fn same_file(left: &Path, right: &Path) -> Result<bool, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (left, right) = (
+        std::fs::symlink_metadata(left)?,
+        std::fs::symlink_metadata(right)?,
+    );
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &Path, _right: &Path) -> Result<bool, AppError> {
+    Ok(false)
+}
+
+/// Repairs corrupt copies at one or all connected Locations from the most
+/// recently verified connected good copy, preserving the corrupt bytes in the
+/// Location's `.archive-ledger/quarantine/<job-id>/` area.
+fn execute_v2_repair(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    args: &RepairArgs,
+    resumed_params: Option<serde_json::Value>,
+) -> Result<u8, AppError> {
+    let state = database.registry_state(false)?;
+    let (params, locations) = match resumed_params {
+        Some(params) => {
+            let mut locations = Vec::new();
+            for location in params["locations"].as_array().into_iter().flatten() {
+                let (mut resolved, _) = verify_locations(
+                    cli,
+                    database,
+                    location["location_id"].as_str(),
+                    location["root_path"].as_str().map(Path::new),
+                )?;
+                locations.append(&mut resolved);
+            }
+            (params, locations)
+        }
+        None => {
+            let (locations, _) = verify_locations(
+                cli,
+                database,
+                args.location.as_deref(),
+                args.path.as_deref(),
+            )?;
+            let params = json!({
+                "include_changed": args.include_changed,
+                "locations": locations.iter().map(|location| json!({
+                    "location_id": location.location_id,
+                    "root_path": location.root,
+                })).collect::<Vec<_>>(),
+            });
+            (params, locations)
+        }
+    };
+    for location in &locations {
+        if state
+            .locations
+            .iter()
+            .any(|known| known.location_id == location.location_id && !known.is_writable)
+        {
+            return Err(AppError::Input(format!(
+                "Location {} is registered read-only; repair refuses to change it",
+                location.location_id
+            )));
+        }
+    }
+    let include_changed = params["include_changed"].as_bool().unwrap_or(false);
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let mut roots = BTreeMap::new();
+    let mut summary = RepairSummary::default();
+    let mut items = Vec::new();
+    // Plan: classify every corrupt copy before changing anything.
+    let mut plan = Vec::new();
+    for target in repair_targets(database, &locations)? {
+        let copy = &target.copy;
+        summary.corrupt += 1;
+        let relative = copy.copy_path.to_path_buf().ok_or_else(|| {
+            AppError::Input(format!(
+                "copy path is unavailable: {}",
+                copy.copy_path.display
+            ))
+        })?;
+        let area = copy
+            .location_root
+            .join(".archive-ledger/quarantine")
+            .join(&job_id);
+        let quarantine = area.join(&relative);
+        let staged = area.join(".staged").join(&relative);
+        let destination = copy.location_root.join(&relative);
+        let resuming = quarantine.exists() || staged.exists();
+        let mut planned_state = None;
+        let mut item = json!({
+            "logical_path": copy.logical_path.display,
+            "location_id": copy.location_id,
+            "path": copy.copy_path.display,
+        });
+        if !resuming {
+            let current = match location_content_path(&copy.location_root, &copy.copy_path)
+                .and_then(|path| Ok(std::fs::symlink_metadata(path)?))
+            {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) | Err(_) => {
+                    summary.failed += 1;
+                    item["status"] = json!("failed");
+                    item["detail"] = json!("the corrupt copy is no longer a regular file here");
+                    items.push(item);
+                    continue;
+                }
+            };
+            let current_mtime = current
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .and_then(|time| i64::try_from(time.as_millis()).ok());
+            planned_state = Some((current.len(), current.modified().ok()));
+            let edited = i64::try_from(current.len()).ok() != target.observed_size
+                || current_mtime != target.observed_mtime;
+            if edited && !include_changed {
+                summary.skipped_changed += 1;
+                item["status"] = json!("skipped_changed");
+                item["detail"] =
+                    json!("size or modification time changed, so this may be an intentional edit");
+                items.push(item);
+                continue;
+            }
+        }
+        let source = repair_source(cli, database, &state, copy, &mut roots)?;
+        if source.is_none() && !resuming {
+            summary.no_source += 1;
+            item["status"] = json!("no_source");
+            item["detail"] = json!("no connected verified copy; see archive report integrity");
+            items.push(item);
+            continue;
+        }
+        if let Some((source_location, _, source_path)) = &source {
+            item["source"] = json!({"location_id": source_location, "path": source_path});
+        }
+        plan.push((
+            target,
+            source,
+            planned_state,
+            area,
+            quarantine,
+            staged,
+            destination,
+            item,
+        ));
+    }
+    // Room for every replacement while the corrupt bytes stay in quarantine.
+    // Per filesystem, so Locations sharing one are checked against the same free space.
+    let mut needed = BTreeMap::<u64, (PathBuf, u64)>::new();
+    for (target, ..) in &plan {
+        let root = &target.copy.location_root;
+        let device = filesystem_id(root)?;
+        let entry = needed.entry(device).or_insert_with(|| (root.clone(), 0));
+        entry.1 += target.copy.size_bytes;
+    }
+    for (root, bytes) in needed.values() {
+        if available_space(root)? < bytes.saturating_add(1024 * 1024) {
+            return Err(AppError::Input(format!(
+                "not enough free space at {} to repair while keeping the corrupt bytes ({} needed)",
+                root.display(),
+                format_bytes(*bytes)
+            )));
+        }
+    }
+    let describe = |location_id: &str| {
+        state
+            .locations
+            .iter()
+            .find(|location| location.location_id == location_id)
+            .map_or(location_id.to_owned(), |location| {
+                location.display_name.clone()
+            })
+    };
+    if args.dry_run || plan.is_empty() {
+        for (.., mut item) in plan {
+            item["status"] = json!("planned");
+            items.push(item);
+        }
+        return print_repair(cli, &summary, &items, None, args.dry_run, &describe);
+    }
+    if !args.yes {
+        if args.non_interactive || !std::io::stdin().is_terminal() {
+            return Err(AppError::Input(
+                "repair changes archive content and requires --yes; preview with --dry-run"
+                    .to_owned(),
+            ));
+        }
+        for (target, ..) in &plan {
+            println!(
+                "  {} at {}",
+                target.copy.logical_path.display,
+                describe(&target.copy.location_id)
+            );
+        }
+        if !prompt_confirmation("Replace these corrupt copies, keeping their bytes in quarantine?")?
+        {
+            return Err(AppError::Input("repair cancelled".to_owned()));
+        }
+    }
+    let input_version = v2_local_job(database, &job_id)?
+        .map(|job| job.input_version)
+        .unwrap_or_else(|| format!("repair_{suffix}"));
+    let store = V2OriginStore::open(cli.events_path())?;
+    ensure_v2_job_started(
+        cli,
+        database,
+        &store,
+        &job_id,
+        "repair",
+        &input_version,
+        &params,
+    )?;
+    let mut placements = Vec::new();
+    let mut areas = BTreeSet::new();
+    for (target, source, planned_state, area, quarantine, staged, destination, mut item) in plan {
+        let copy = &target.copy;
+        let relative_parent = copy
+            .copy_path
+            .to_path_buf()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let outcome = (|| {
+            let area_relative = area
+                .strip_prefix(&copy.location_root)
+                .map_err(|_| AppError::Input("quarantine escapes its Location".to_owned()))?
+                .to_path_buf();
+            ensure_real_directories(&copy.location_root, &area_relative.join(&relative_parent))?;
+            ensure_real_directories(
+                &copy.location_root,
+                &area_relative.join(".staged").join(&relative_parent),
+            )?;
+            repair_one(
+                copy,
+                source.as_ref().map(|(_, path, _)| path.as_path()),
+                planned_state,
+                &quarantine,
+                &staged,
+                &destination,
+            )
+        })();
+        match outcome {
+            Ok(bytes) => {
+                let metadata = std::fs::symlink_metadata(&destination)?;
+                summary.repaired += 1;
+                summary.bytes_written += bytes;
+                areas.insert(area.display().to_string());
+                item["status"] = json!("repaired");
+                item["quarantined_to"] = json!(quarantine.display().to_string());
+                placements.push(archive_ledger::V2Placement {
+                    collection_id: copy.collection_id.clone(),
+                    location_id: copy.location_id.clone(),
+                    file_ref_id: copy.file_ref_id.clone(),
+                    logical_path: copy.logical_path.clone(),
+                    copy_path: copy.copy_path.clone(),
+                    object_id: copy.object_id.clone(),
+                    blake3_hex: copy.blake3_hex.clone(),
+                    size_bytes: copy.size_bytes,
+                    modified_time_utc_ms: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .and_then(|time| u64::try_from(time.as_millis()).ok()),
+                    representation: if copy.external_identity_id.is_some() {
+                        "annex_locked_symlink".to_owned()
+                    } else {
+                        "ordinary_file".to_owned()
+                    },
+                    external_identity_id: copy.external_identity_id.clone(),
+                    device_fingerprint_status: copy.device_fingerprint_status.clone(),
+                    job_id: job_id.clone(),
+                    job_type: "repair".to_owned(),
+                    input_version: input_version.clone(),
+                });
+            }
+            Err(error) => {
+                summary.failed += 1;
+                item["status"] = json!("failed");
+                item["detail"] = json!(error.to_string());
+            }
+        }
+        items.push(item);
+    }
+    for batch in placements.chunks(VERIFY_BATCH_COPIES) {
+        archive_ledger::v2_record_placements(&store, database, batch)?;
+    }
+    let status = if summary.failed == 0 {
+        "complete"
+    } else {
+        "partial"
+    };
+    finish_v2_job(
+        database,
+        &store,
+        &job_id,
+        "repair",
+        &input_version,
+        status,
+        &serde_json::to_value(&summary)?,
+    )?;
+    print_repair(
+        cli,
+        &summary,
+        &items,
+        Some((&job_id, &areas)),
+        false,
+        &describe,
+    )
+}
+
+fn print_repair(
+    cli: &Cli,
+    summary: &RepairSummary,
+    items: &[serde_json::Value],
+    job: Option<(&str, &BTreeSet<String>)>,
+    dry_run: bool,
+    describe: &dyn Fn(&str) -> String,
+) -> Result<u8, AppError> {
+    let unresolved = summary.skipped_changed + summary.no_source + summary.failed;
+    let planned = items
+        .iter()
+        .filter(|item| item["status"] == "planned")
+        .count();
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "status": if dry_run { "planned" } else if job.is_some() { "done" } else { "idle" },
+                "job_id": job.map(|(id, _)| id),
+                "summary": summary,
+                "items": items,
+                "quarantine": job.map(|(_, areas)| areas),
+            }))?
+        );
+    } else if summary.corrupt == 0 {
+        println!("No corrupt copies at the selected Locations.");
+    } else {
+        for item in items {
+            let location = describe(item["location_id"].as_str().unwrap_or_default());
+            let path = item["logical_path"].as_str().unwrap_or_default();
+            let source = || {
+                item["source"]["location_id"]
+                    .as_str()
+                    .map(|source| {
+                        format!(
+                            " from {} ({})",
+                            describe(source),
+                            item["source"]["path"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            match item["status"].as_str().unwrap_or_default() {
+                "planned" => println!("  would repair {path} at {location}{}", source()),
+                "repaired" => println!("  repaired {path} at {location}{}", source()),
+                "skipped_changed" => println!(
+                    "  skipped {path} at {location}: its size or modification time changed, so it may be an intentional edit (accept it with collection add --accept-changes, or repair it with --include-changed)"
+                ),
+                "no_source" => println!(
+                    "  cannot repair {path} at {location}: no connected verified copy (see archive report integrity)"
+                ),
+                _ => println!(
+                    "  failed {path} at {location}: {}",
+                    item["detail"].as_str().unwrap_or_default()
+                ),
+            }
+        }
+        if dry_run {
+            println!(
+                "Dry run: nothing changed. {planned} copies would be repaired; corrupt bytes would be kept under .archive-ledger/quarantine in each Location."
+            );
+        } else if let Some((job_id, areas)) = job {
+            if summary.repaired > 0 {
+                println!("Corrupt bytes are kept in:");
+                for area in areas {
+                    println!("  {area}");
+                }
+                println!("Delete them when you are satisfied with the repair (job {job_id}).");
+            }
+        }
+    }
+    Ok(if unresolved > 0 || (dry_run && planned > 0) {
+        EXIT_FINDINGS
+    } else {
+        EXIT_OK
+    })
+}
+
+/// Resolves the Locations a verify job reads. An explicit `--path` must be the
+/// Location root; otherwise the recorded mount is used. Without a Location,
+/// every mounted filesystem Location whose identity does not mismatch is used.
+fn verify_locations(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    location: Option<&str>,
+    path: Option<&Path>,
+) -> Result<(Vec<VerifyLocation>, u64), AppError> {
+    let state = database.registry_state(false)?;
+    let checked = |selected: LocationSnapshot, root: PathBuf, fingerprint_status: String| {
+        if fingerprint_status == "mismatch" {
+            return Err(AppError::Input(format!(
+                "the mounted filesystem does not match {}; verification refuses to read it",
+                selected.display_name
+            )));
+        }
+        Ok(VerifyLocation {
+            location_id: selected.location_id,
+            root,
+            fingerprint_status,
+        })
+    };
+    match (location, path) {
+        (selector, Some(path)) => {
+            let hint = std::fs::canonicalize(path)
+                .map_err(|error| AppError::Input(format!("cannot resolve verify path: {error}")))?;
+            let (selected, root, status) =
+                v2_inventory_location_scope(cli, database, &state, &hint, selector)?;
+            if root != hint {
+                return Err(AppError::Input(
+                    "verify --path must be exactly the registered Location root".to_owned(),
+                ));
+            }
+            Ok((vec![checked(selected, root, status)?], 0))
+        }
+        (Some(selector), None) => {
+            let (selected, root, status) =
+                v2_mounted_location_by_selector(cli, database, &state, selector)?;
+            Ok((vec![checked(selected, root, status)?], 0))
+        }
+        (None, None) => {
+            let mut locations = Vec::new();
+            let mut skipped = 0_u64;
+            for candidate in state
+                .locations
+                .iter()
+                .filter(|location| location.status == "active" && location.kind == "filesystem")
+            {
+                // Without an explicit Location, read only storage proven to be the
+                // registered filesystem: an empty mountpoint must not turn copies unknown.
+                match v2_mounted_location_by_selector(cli, database, &state, &candidate.location_id)
+                {
+                    Ok((selected, root, status)) if status == "match" => {
+                        locations.push(checked(selected, root, status)?)
+                    }
+                    Ok(_) | Err(AppError::Input(_)) => skipped = skipped.saturating_add(1),
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok((locations, skipped))
+        }
+    }
+}
+
+/// Re-reads due copies (or every copy with `--all`) at one or all connected
+/// Locations, least recently verified first, in batched appends.
+fn execute_v2_verify(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    args: &VerifyArgs,
+    resumed_params: Option<serde_json::Value>,
+) -> Result<u8, AppError> {
+    if args.batch_entries == 0 {
+        return Err(AppError::Input(
+            "--batch-entries must be greater than zero".to_owned(),
+        ));
+    }
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let (params, locations, skipped) = match resumed_params {
+        // Resume re-resolves the same Locations from their recorded roots.
+        Some(params) => {
+            let mut locations = Vec::new();
+            for location in params["locations"].as_array().into_iter().flatten() {
+                let (mut resolved, _) = verify_locations(
+                    cli,
+                    database,
+                    location["location_id"].as_str(),
+                    location["root_path"].as_str().map(Path::new),
+                )?;
+                locations.append(&mut resolved);
+            }
+            (params, locations, 0)
+        }
+        None => {
+            let (locations, skipped) = verify_locations(
+                cli,
+                database,
+                args.location.as_deref(),
+                args.path.as_deref(),
+            )?;
+            let params = json!({
+                "mode": if args.all { "all" } else { "due" },
+                "window_days": args.verify_within,
+                "as_of_ms": now,
+                "locations": locations.iter().map(|location| json!({
+                    "location_id": location.location_id,
+                    "root_path": location.root,
+                })).collect::<Vec<_>>(),
+            });
+            (params, locations, skipped)
+        }
+    };
+    let selection = if params["mode"] == "all" {
+        VerifySelection::All
+    } else {
+        VerifySelection::Due {
+            window_days: params["window_days"]
+                .as_u64()
+                .unwrap_or(DEFAULT_VERIFY_WINDOW_DAYS),
+        }
+    };
+    let as_of = params["as_of_ms"].as_i64().unwrap_or(now);
+    let due = count_due_copies(database, Some(&locations), selection, as_of)?;
+    let unidentified = count_unidentified_copies(database, &locations)?;
+    let unidentified_hint = || {
+        if unidentified > 0 {
+            println!(
+                "{unidentified} copies have no verified content identity yet (for example after an inventory-only annex import); run archive location scan to read them."
+            );
+        }
+    };
+    let scope = match locations.len() {
+        0 => "no connected Location".to_owned(),
+        1 => "1 Location".to_owned(),
+        count => format!("{count} Locations"),
+    };
+    if due == 0 && args.job_id.is_none() {
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "version": 2, "status": "idle", "job_id": null, "due": 0,
+                    "locations": locations.len(), "skipped_locations": skipped,
+                    "unidentified_copies": unidentified,
+                }))?
+            );
+        } else {
+            println!("Nothing to verify at {scope}: no copies are due.");
+            unidentified_hint();
+        }
+        return Ok(EXIT_OK);
+    }
+    let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
+    let input_version = v2_local_job(database, &job_id)?
+        .map(|job| job.input_version)
+        .unwrap_or_else(|| format!("verify_{suffix}"));
+    let store = V2OriginStore::open(cli.events_path())?;
+    ensure_v2_job_started(
+        cli,
+        database,
+        &store,
+        &job_id,
+        "verify",
+        &input_version,
+        &params,
+    )?;
+    if !cli.json {
+        eprintln!(
+            "Verify job {job_id}: {due} copies to read. If interrupted, resume with: archive job resume {job_id}"
+        );
+    }
+    let mut summary: BackgroundRunSummary = v2_local_job(database, &job_id)?
+        .and_then(|job| job.progress)
+        .and_then(|progress| serde_json::from_value(progress).ok())
+        .unwrap_or_default();
+    summary.skipped_devices = summary.skipped_devices.max(skipped);
+    let mut read_this_run = 0_usize;
+    let mut attempted = BTreeSet::new();
+    let paused = loop {
+        let budget = args
+            .max_items
+            .map_or(usize::MAX, |limit| limit.saturating_sub(read_this_run));
+        if budget == 0 {
+            break count_due_copies(database, Some(&locations), selection, as_of)? > 0;
+        }
+        let targets = due_verification_targets(
+            database,
+            &locations,
+            selection,
+            as_of,
+            args.batch_entries.min(VERIFY_BATCH_COPIES).min(budget),
+        )?;
+        if targets.is_empty() {
+            break false;
+        }
+        // Each copy is read at most once per run even if its recorded time did not
+        // advance past the job's selection time.
+        if !targets
+            .iter()
+            .any(|target| attempted.insert(target.copy_claim_id.clone()))
+        {
+            break false;
+        }
+        summary.selected = summary
+            .selected
+            .saturating_add(u64::try_from(targets.len()).unwrap_or(u64::MAX));
+        read_this_run = read_this_run.saturating_add(targets.len());
+        verify_copy_batch(
+            database,
+            &store,
+            &job_id,
+            "verify",
+            &input_version,
+            &targets,
+            &mut summary,
+        )?;
+        update_v2_job_progress(database, &job_id, &serde_json::to_value(&summary)?)?;
+    };
+    summary.remaining_stale = count_background_stale(database)?;
+    let status = if paused { "running" } else { "complete" };
+    if !paused {
+        finish_v2_job(
+            database,
+            &store,
+            &job_id,
+            "verify",
+            &input_version,
+            "complete",
+            &serde_json::to_value(&summary)?,
+        )?;
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2, "status": status, "job_id": job_id, "summary": summary,
+                "unidentified_copies": unidentified,
+            }))?
+        );
+    } else {
+        println!(
+            "{} {} copies at {scope}: {} verified; {} mismatches; {} read errors.",
+            if paused {
+                "Verification paused after"
+            } else {
+                "Verified"
+            },
+            summary.selected,
+            summary.verified_ok,
+            summary.hash_mismatches,
+            summary.read_errors
+        );
+        if summary.read_errors > 0 {
+            println!(
+                "Unreadable copies may have been moved or removed; run archive location scan to reconcile the Location."
+            );
+        }
+        unidentified_hint();
+        if skipped > 0 {
+            println!("{skipped} Locations were not connected or did not match and were skipped.");
+        }
+        if paused {
+            println!("Resume with: archive job resume {job_id}");
+        }
+    }
+    Ok(if summary.hash_mismatches > 0 || summary.read_errors > 0 {
+        EXIT_FINDINGS
+    } else {
+        EXIT_OK
+    })
 }
 
 fn execute_v2_background_run(
@@ -9704,11 +11185,34 @@ fn execute_v2_background_run(
         .as_ref()
         .map(|job| job.input_version.clone())
         .unwrap_or_else(|| format!("background_{suffix}"));
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
     let job_params = existing_job
         .as_ref()
         .map(|job| job.params.clone())
-        .unwrap_or_else(|| json!({"max_items": config.max_items}));
-    let (mut targets, skipped_devices) = background_targets(cli, database, limit + 1)?;
+        .unwrap_or_else(|| {
+            json!({
+                "max_items": config.max_items,
+                "as_of_ms": now,
+                "window_days": DEFAULT_VERIFY_WINDOW_DAYS,
+            })
+        });
+    // Jobs started before the selection time was recorded use their start time.
+    let as_of = job_params["as_of_ms"]
+        .as_i64()
+        .or_else(|| {
+            existing_job.as_ref().map(|job| {
+                i64::try_from(job.started_time_utc_ms.unwrap_or(job.created_time_utc_ms))
+                    .unwrap_or(i64::MAX)
+            })
+        })
+        .unwrap_or(now);
+    let selection = VerifySelection::Due {
+        window_days: job_params["window_days"]
+            .as_u64()
+            .unwrap_or(DEFAULT_VERIFY_WINDOW_DAYS),
+    };
+    let (locations, skipped_devices) = background_locations(cli, database)?;
+    let mut targets = due_verification_targets(database, &locations, selection, as_of, limit + 1)?;
     let has_more = targets.len() > limit;
     targets.truncate(limit);
     let mut summary: BackgroundRunSummary = existing_job
@@ -9731,7 +11235,7 @@ fn execute_v2_background_run(
             );
         } else {
             println!(
-                "Background refresh idle: no stale files on recognized connected Devices; {} stale remain elsewhere.",
+                "Background verification idle: no copies due on recognized connected Devices; {} due elsewhere.",
                 summary.remaining_stale
             );
         }
@@ -9747,13 +11251,14 @@ fn execute_v2_background_run(
         &input_version,
         &job_params,
     )?;
-    for target in targets {
-        verify_background_target(
+    for batch in targets.chunks(VERIFY_BATCH_COPIES) {
+        verify_copy_batch(
             database,
             &store,
             &job_id,
+            "background_stale",
             &input_version,
-            &target,
+            batch,
             &mut summary,
         )?;
         update_v2_job_progress(database, &job_id, &serde_json::to_value(&summary)?)?;
@@ -9769,7 +11274,7 @@ fn execute_v2_background_run(
             );
         } else {
             println!(
-                "Background refresh paused after {} Copy claims; {} stale remain.",
+                "Background verification paused after {} Copy claims; {} due remain.",
                 summary.selected, summary.remaining_stale
             );
             println!("Resume with: archive job resume {job_id}");
@@ -9798,7 +11303,7 @@ fn execute_v2_background_run(
         );
     } else {
         println!(
-            "Background refresh complete: {} verified; {} mismatches; {} read errors; {} stale remain.",
+            "Background verification complete: {} verified; {} mismatches; {} read errors; {} due remain.",
             summary.verified_ok,
             summary.hash_mismatches,
             summary.read_errors,
@@ -9812,29 +11317,38 @@ fn execute_v2_background_run(
     })
 }
 
-fn list_v2_jobs(database: &V2ProjectionDb, limit: usize) -> Result<Vec<LocalJob>, AppError> {
+fn query_v2_jobs(
+    database: &V2ProjectionDb,
+    job_id: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+) -> Result<Vec<LocalJob>, AppError> {
     let connection = v2_cli_connection(database)?;
     let mut statement = connection
         .prepare(
             "SELECT job_id, job_type, status, created_time_utc_ms, started_time_utc_ms,
                     finished_time_utc_ms, params_json, progress_json, input_version
-             FROM jobs ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?1",
+             FROM jobs WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_time_utc_ms DESC, job_id DESC LIMIT ?3",
         )
         .map_err(|source| v2_cli_sql_error(database, source))?;
     let rows = statement
-        .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })
+        .query_map(
+            params![job_id, status, i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
         .map_err(|source| v2_cli_sql_error(database, source))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|source| v2_cli_sql_error(database, source))?;
@@ -9856,9 +11370,163 @@ fn list_v2_jobs(database: &V2ProjectionDb, limit: usize) -> Result<Vec<LocalJob>
 }
 
 fn v2_local_job(database: &V2ProjectionDb, job_id: &str) -> Result<Option<LocalJob>, AppError> {
-    Ok(list_v2_jobs(database, 10_000)?
+    Ok(query_v2_jobs(database, Some(job_id), None, 1)?
         .into_iter()
-        .find(|job| job.job_id == job_id))
+        .next())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalOnlyJobState {
+    /// Configuration is readable; `job resume` recreates the row from it.
+    Resumable,
+    /// Another process holds the job lock, normally a run that is still going.
+    InUse,
+    /// No readable configuration, so nothing can resume it.
+    Unrecognized,
+}
+
+impl LocalOnlyJobState {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Resumable => "resumable from its local checkpoint",
+            Self::InUse => "in use by another running process",
+            Self::Unrecognized => "no resumable configuration; kept for inspection",
+        }
+    }
+}
+
+/// A `local/jobs/<id>` directory whose job has no catalog database row, for
+/// example after `db rebuild` or an interruption before the row was written.
+#[derive(Debug, Serialize)]
+struct LocalOnlyJob {
+    job_id: String,
+    job_type: Option<&'static str>,
+    state: LocalOnlyJobState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    path: PathBuf,
+}
+
+fn v2_local_only_jobs(database: &V2ProjectionDb) -> Result<Vec<LocalOnlyJob>, AppError> {
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    let mut jobs = Vec::new();
+    for job_id in archive_ledger::local_job_ids(archive_root)? {
+        jobs.extend(v2_local_only_job(database, &job_id)?);
+    }
+    Ok(jobs)
+}
+
+/// Inspects one local job directory; `None` when it is absent or has a database row.
+fn v2_local_only_job(
+    database: &V2ProjectionDb,
+    job_id: &str,
+) -> Result<Option<LocalOnlyJob>, AppError> {
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    let known: bool = v2_cli_connection(database)?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
+            [job_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    if known {
+        return Ok(None); // A database row, including a terminal one, takes precedence.
+    }
+    let path = archive_root.join("local").join("jobs").join(job_id);
+    let (job_type, state, detail) =
+        match archive_ledger::read_local_job_config(archive_root, job_id) {
+            Ok(Some(config)) => (Some(config.job_type), LocalOnlyJobState::Resumable, None),
+            // Absent, or the owner finished and removed the directory meanwhile.
+            Ok(None) if !path.exists() => return Ok(None),
+            Ok(None) => (None, LocalOnlyJobState::Unrecognized, None),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                (None, LocalOnlyJobState::InUse, None)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => (
+                None,
+                LocalOnlyJobState::Unrecognized,
+                Some(error.to_string()),
+            ),
+            Err(error) => {
+                return Err(AppError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot read local job {job_id}: {error}"),
+                )))
+            }
+        };
+    Ok(Some(LocalOnlyJob {
+        job_id: job_id.to_owned(),
+        job_type,
+        state,
+        detail,
+        path,
+    }))
+}
+
+/// Running database jobs plus local-only jobs that can still be resumed or are in use,
+/// and any error from inspecting local job directories (status must still work).
+fn unfinished_v2_job_ids(
+    database: &V2ProjectionDb,
+) -> Result<(Vec<String>, Option<String>), AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare("SELECT job_id FROM jobs WHERE status = 'running' ORDER BY created_time_utc_ms DESC, job_id DESC")
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let local_error = match v2_local_only_jobs(database) {
+        Ok(jobs) => {
+            ids.extend(
+                jobs.into_iter()
+                    .filter(|job| job.state != LocalOnlyJobState::Unrecognized)
+                    .map(|job| job.job_id),
+            );
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    };
+    Ok((ids, local_error))
+}
+
+/// Last recorded count, written when a run pauses; absent after a crash.
+fn job_progress_count(progress: &serde_json::Value) -> Option<String> {
+    [
+        ("entries_seen", "entries seen"),
+        ("files_processed", "files processed"),
+        ("files_observed", "files observed"),
+    ]
+    .into_iter()
+    .find_map(|(key, label)| {
+        progress
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| format!("{count} {label}"))
+    })
+}
+
+fn job_progress_phase(progress: &serde_json::Value) -> Option<String> {
+    Some(
+        match progress.get("phase").and_then(serde_json::Value::as_str)? {
+            "reading_index" => "reading the annex index",
+            "enumerating" => "scanning files",
+            phase => phase,
+        }
+        .to_owned(),
+    )
+}
+
+fn format_age(then_ms: u64, now_ms: u64) -> String {
+    let seconds = now_ms.saturating_sub(then_ms) / 1000;
+    match seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{}m ago", seconds / 60),
+        3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }
 
 fn job_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> {
@@ -9869,6 +11537,34 @@ fn job_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> 
             .ok_or_else(|| AppError::Input(format!("job parameters lack {key}")))?,
     )
     .map_err(AppError::Json)
+}
+
+fn v2_local_job_config(
+    database: &V2ProjectionDb,
+    job_id: &str,
+) -> Result<Option<archive_ledger::LocalJobConfig>, AppError> {
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    archive_ledger::read_local_job_config(archive_root, job_id).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            AppError::V2Inventory(archive_ledger::V2InventoryError::JobBusy(job_id.to_owned()))
+        } else {
+            AppError::Io(std::io::Error::new(
+                error.kind(),
+                format!("cannot read local job {job_id}: {error}"),
+            ))
+        }
+    })
+}
+
+fn inventory_job_batch_entries(params: &serde_json::Value) -> Result<usize, AppError> {
+    match params.get("batch_entries") {
+        None => Ok(1_000), // Jobs created before scan checkpoints.
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| AppError::Input("inventory job has invalid batch_entries".to_owned())),
+    }
 }
 
 fn job_registry_path(params: &serde_json::Value, key: &str) -> Result<PathBuf, AppError> {
@@ -9907,7 +11603,8 @@ fn execute_v2_report(
     let state = database.registry_state(false)?;
     match command {
         ReportCommand::StalePresence(args) => execute_v2_stale_report(cli, database, &state, args),
-        ReportCommand::Risk(args) | ReportCommand::Integrity(args) => {
+        ReportCommand::Integrity(args) => execute_v2_integrity_report(cli, database, &state, args),
+        ReportCommand::Risk(args) => {
             if args.continuation.is_some() {
                 return Err(AppError::Input(
                     "v2 risk summary does not require a continuation token".to_owned(),
@@ -10063,6 +11760,228 @@ fn execute_v2_report(
     }
 }
 
+/// Corrupt copies (content differs from the catalog) and, for each, where verified
+/// copies of the same content are and whether they are connected now. Read-only.
+fn execute_v2_integrity_report(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    state: &archive_ledger::RegistryState,
+    args: &ReportArgs,
+) -> Result<u8, AppError> {
+    if args.policy.is_some() || args.result.is_some() || args.continuation.is_some() {
+        return Err(AppError::Input(
+            "report integrity accepts --collection and --limit".to_owned(),
+        ));
+    }
+    let collection_id = args
+        .collection
+        .as_deref()
+        .map(|selector| {
+            select_collection(&state.collections, selector)?
+                .map(|collection| collection.collection_id)
+                .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))
+        })
+        .transpose()?;
+    let connection = v2_cli_connection(database)?;
+    let total: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM copy_claims cc
+             WHERE cc.state = 'corrupt' AND (?1 IS NULL OR EXISTS (
+               SELECT 1 FROM file_refs f WHERE f.object_id = cc.object_id
+                 AND f.path_state = 'active' AND f.collection_id = ?1))",
+            [&collection_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut corrupt = connection
+        .prepare(
+            "SELECT cc.copy_claim_id, cc.object_id, cc.location_id, cc.relative_path_display,
+                    cc.last_verified_time_utc_ms, f.file_ref_id, f.collection_id,
+                    f.logical_path_display
+             FROM copy_claims cc
+             JOIN file_refs f ON f.file_ref_id = (
+               SELECT candidate.file_ref_id FROM file_refs candidate
+               WHERE candidate.object_id = cc.object_id AND candidate.path_state = 'active'
+                 AND (?1 IS NULL OR candidate.collection_id = ?1)
+               ORDER BY candidate.collection_id, candidate.logical_path_encoding,
+                        candidate.logical_path_bytes LIMIT 1)
+             WHERE cc.state = 'corrupt'
+             ORDER BY f.collection_id, f.logical_path_encoding, f.logical_path_bytes,
+                      cc.location_id, cc.copy_claim_id
+             LIMIT ?2",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = corrupt
+        .query_map(
+            params![collection_id, i64::try_from(args.limit).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut good = connection
+        .prepare(
+            "SELECT location_id, relative_path_display, last_verified_time_utc_ms
+             FROM copy_claims
+             WHERE object_id = ?1 AND copy_claim_id != ?2 AND state = 'present'
+               AND last_verification_result = 'ok'
+             ORDER BY last_verified_time_utc_ms DESC, location_id, copy_claim_id",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    // Whether a Location is mounted with matching identity right now, probed once each.
+    let mut connected = BTreeMap::<String, bool>::new();
+    let mut is_connected = |location_id: &str| -> bool {
+        *connected.entry(location_id.to_owned()).or_insert_with(|| {
+            matches!(
+                v2_mounted_location_by_selector(cli, database, state, location_id),
+                Ok((_, _, status)) if status == "match"
+            )
+        })
+    };
+    let describe = |location_id: &str| {
+        let location = state
+            .locations
+            .iter()
+            .find(|location| location.location_id == location_id);
+        let device = location
+            .and_then(|location| location.device_id.as_deref())
+            .and_then(|id| state.devices.iter().find(|device| device.device_id == id));
+        let site = location
+            .and_then(|location| location.site_id.as_deref())
+            .and_then(|id| state.sites.iter().find(|site| site.site_id == id));
+        (
+            location.map_or(location_id.to_owned(), |location| {
+                location.display_name.clone()
+            }),
+            device.map(|device| device.display_name.clone()),
+            site.map(|site| site.display_name.clone()),
+        )
+    };
+    let now = now_utc_ms()?;
+    let mut items = Vec::new();
+    for (copy_claim_id, object_id, location_id, path, verified, file_ref_id, collection, logical) in
+        rows
+    {
+        let copies = good
+            .query_map(params![object_id, copy_claim_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|source| v2_cli_sql_error(database, source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| v2_cli_sql_error(database, source))?
+            .into_iter()
+            .map(|(good_location, good_path, good_verified)| {
+                let (name, device, site) = describe(&good_location);
+                json!({
+                    "location_id": good_location,
+                    "location_name": name,
+                    "device_name": device,
+                    "site_name": site,
+                    "path": good_path,
+                    "last_verified_time_utc_ms": good_verified,
+                    "connected": is_connected(&good_location),
+                })
+            })
+            .collect::<Vec<_>>();
+        let (name, device, site) = describe(&location_id);
+        items.push(json!({
+            "file_ref_id": file_ref_id,
+            "collection_id": collection,
+            "logical_path": logical,
+            "object_id": object_id,
+            "corrupt_copy": {
+                "copy_claim_id": copy_claim_id,
+                "location_id": location_id,
+                "location_name": name,
+                "device_name": device,
+                "site_name": site,
+                "path": path,
+                "last_checked_time_utc_ms": verified,
+            },
+            "good_copies": copies,
+        }));
+    }
+    let total = nonnegative_sql_count(total)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "corrupt_copies": total,
+                "items": items,
+                "truncated": (items.len() as u64) < total,
+            }))?
+        );
+    } else if total == 0 {
+        println!("No corrupt copies: every checked copy matches its catalog content.");
+    } else {
+        println!("Corrupt copies (content differs from the catalog): {total}");
+        for item in &items {
+            let corrupt = &item["corrupt_copy"];
+            println!(
+                "  {} at {} ({}), checked {}",
+                item["logical_path"].as_str().unwrap_or_default(),
+                corrupt["location_name"].as_str().unwrap_or_default(),
+                corrupt["path"].as_str().unwrap_or_default(),
+                corrupt["last_checked_time_utc_ms"]
+                    .as_u64()
+                    .map_or("never".to_owned(), |time| format_age(time, now))
+            );
+            let copies = item["good_copies"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if copies.is_empty() {
+                println!("    no verified copy remains in the Archive");
+            }
+            for copy in copies {
+                println!(
+                    "    good copy: {} ({}{}), verified {}, {}",
+                    copy["location_name"].as_str().unwrap_or_default(),
+                    copy["path"].as_str().unwrap_or_default(),
+                    copy["device_name"]
+                        .as_str()
+                        .map(|device| format!(" on {device}"))
+                        .unwrap_or_default(),
+                    copy["last_verified_time_utc_ms"]
+                        .as_u64()
+                        .map_or("never".to_owned(), |time| format_age(time, now)),
+                    if copy["connected"] == true {
+                        "connected"
+                    } else {
+                        "not connected"
+                    }
+                );
+            }
+        }
+        if (items.len() as u64) < total {
+            println!(
+                "  …and {} more; raise --limit to list them",
+                total - items.len() as u64
+            );
+        }
+        println!(
+            "Repair manually: copy the good file back over the corrupt one (keeping a copy of the corrupt bytes if unsure), then run archive verify on that Location to confirm."
+        );
+    }
+    Ok(if total > 0 { EXIT_FINDINGS } else { EXIT_OK })
+}
+
 fn execute_v2_stale_report(
     cli: &Cli,
     database: &V2ProjectionDb,
@@ -10209,6 +12128,63 @@ fn v2_stale_location_count(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
+fn refuse_v2_unfinished_annex_import(
+    database: &V2ProjectionDb,
+    repository: &Path,
+) -> Result<(), AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT job_id, params_json FROM jobs
+             WHERE job_type = 'annex_import' AND status = 'running'
+             ORDER BY created_time_utc_ms, job_id",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    for row in rows {
+        let (job_id, params) = row.map_err(|source| v2_cli_sql_error(database, source))?;
+        let params: serde_json::Value = serde_json::from_str(&params)?;
+        // Import jobs store a canonical, lossless path. Do not resolve unrelated
+        // historical paths: their removable source may currently be unavailable.
+        if job_registry_path(&params, "repo_path")? == repository {
+            return Err(AppError::Input(format!(
+                "this repository has an unfinished annex import; resume it with archive job resume {}",
+                shell_quote(&job_id)
+            )));
+        }
+    }
+    // A canonical rebuild omits unpublished local jobs. Their original config
+    // remains sufficient for resume, so do not start a replacement import.
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    for job_id in archive_ledger::local_job_ids(archive_root)? {
+        let known: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
+                [&job_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if known {
+            continue; // In particular, a terminal database row takes precedence.
+        }
+        if let Some(config) = v2_local_job_config(database, &job_id)? {
+            if config.job_type == "annex_import"
+                && job_registry_path(&config.params, "repo_path")? == repository
+            {
+                return Err(AppError::Input(format!(
+                    "this repository has an unfinished annex import; resume it with archive job resume {}",
+                    shell_quote(&job_id)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn v2_location_has_completed_annex_import(
     database: &V2ProjectionDb,
     collection_id: &str,
@@ -10262,6 +12238,29 @@ fn v2_path_has_completed_annex_import(
         }
     }
     Ok(false)
+}
+
+fn print_v2_inventory_findings(summary: &archive_ledger::V2InventorySummary) {
+    if summary.integrity_mismatches == 0 {
+        return;
+    }
+    println!(
+        "  {} files: content differs from catalog",
+        summary.integrity_mismatches
+    );
+    for path in &summary.integrity_findings {
+        println!("    {}", path.display);
+    }
+    let remaining = summary
+        .integrity_mismatches
+        .saturating_sub(summary.integrity_findings.len() as u64);
+    if remaining > 0 {
+        println!("    ... and {remaining} more; see archive report integrity");
+    }
+    println!("See where verified copies are with: archive report integrity");
+    println!("Restore good bytes and rescan. For intentional ordinary-file edits, preview with:");
+    println!("  archive collection add ROOT --accept-changes FILE --dry-run");
+    println!("FILE is relative to ROOT. Replace --dry-run with --yes to accept; annex identities cannot be accepted this way.");
 }
 
 fn execute_v2_collection_add(
@@ -10330,30 +12329,102 @@ fn execute_v2_collection_add(
         .to_path_buf();
     let prefix = (!relative_prefix.as_os_str().is_empty()).then_some(relative_prefix);
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let config = archive_ledger::V2InventoryConfig {
+        root_path: scan_path,
+        location_prefix: prefix.clone(),
+        logical_prefix: prefix,
+        exclusions: args.exclusions.clone(),
+        accept_changes: args.accept_changes.clone(),
+        collection_id: collection.collection_id.clone(),
+        location_id: location.location_id.clone(),
+        device_fingerprint_status: fingerprint_status,
+        job_id: args
+            .job_id
+            .clone()
+            .unwrap_or_else(|| format!("job_{suffix}")),
+        scan_id: args
+            .scan_id
+            .clone()
+            .unwrap_or_else(|| format!("scan_{suffix}")),
+        scan_mode: ScanMode::Add,
+        batch_entries: args.batch_entries,
+        max_items: args.max_items,
+    };
+    // Without --accept-changes, --dry-run previews the add from metadata only.
+    if args.dry_run && args.accept_changes.is_empty() {
+        let preview = archive_ledger::v2_preview_scan(database, &config)?;
+        let next = format!(
+            "archive collection add {} --collection {} --location {}{}",
+            shell_quote(&config.root_path.to_string_lossy()),
+            shell_quote(&collection.display_name),
+            shell_quote(&location.location_id),
+            exclude_arguments(&args.exclusions)
+        );
+        return print_v2_scan_preview(cli, database, &preview, false, &location, &next);
+    }
+    if !args.accept_changes.is_empty() {
+        if args.dry_run {
+            let preview = archive_ledger::v2_preview_changes(database, &config)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "version": 2,
+                        "status": "planned",
+                        "collection_id": collection.collection_id,
+                        "location_id": location.location_id,
+                        "items": preview,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Intentional content changes in Collection \"{}\":",
+                    collection.display_name
+                );
+                for item in &preview {
+                    println!(
+                        "  {}: {} -> {}{}",
+                        item.path.display,
+                        item.expected_object_id,
+                        item.observed_object_id,
+                        if item.changed { "" } else { " (unchanged)" }
+                    );
+                }
+                println!("Dry run: no changes recorded. Use --yes to accept the selected files.");
+            }
+            return Ok(EXIT_OK);
+        }
+        if !args.yes {
+            if args.non_interactive || !std::io::stdin().is_terminal() {
+                return Err(AppError::Input(
+                    "accepting content changes requires --yes; preview with --dry-run first"
+                        .to_owned(),
+                ));
+            }
+            for path in &args.accept_changes {
+                println!("  {}", path.display());
+            }
+            if !prompt_confirmation(
+                "Accept the current bytes of these files as their cataloged content?",
+            )? {
+                return Err(AppError::Input("acceptance cancelled".to_owned()));
+            }
+        }
+    }
     let store = V2OriginStore::open(cli.events_path())?;
+    let progress = start_v2_inventory_progress(
+        cli,
+        ProgressKind::CollectionAdd,
+        "Collection add",
+        &config.job_id,
+    )?;
     let result = archive_ledger::v2_add_files(
         &store,
         database,
-        &archive_ledger::V2InventoryConfig {
-            root_path: scan_path,
-            location_prefix: prefix.clone(),
-            logical_prefix: prefix,
-            exclusions: args.exclusions.clone(),
-            collection_id: collection.collection_id.clone(),
-            location_id: location.location_id.clone(),
-            device_fingerprint_status: fingerprint_status,
-            job_id: args
-                .job_id
-                .clone()
-                .unwrap_or_else(|| format!("job_{suffix}")),
-            scan_id: args
-                .scan_id
-                .clone()
-                .unwrap_or_else(|| format!("scan_{suffix}")),
-            scan_mode: ScanMode::Add,
-            max_items: args.max_items,
-        },
+        &config,
+        progress.as_ref().map(ProgressReporter::progress),
     )?;
+    finish_v2_inventory_progress(progress, &result.status);
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -10363,27 +12434,39 @@ fn execute_v2_collection_add(
                 result.summary.files_observed,
                 format_bytes(result.summary.bytes_observed)
             );
+            print_v2_inventory_findings(&result.summary);
             println!("Resume with: archive job resume {}", result.job_id);
         }
-        return Ok(EXIT_OK);
+        return Ok(if result.summary.integrity_mismatches > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        });
     }
+    let protection = v2_catalog_protection(cli.events_path());
+    let due = verification_due_at(database, &location.location_id)?;
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        let mut output = serde_json::to_value(&result)?;
+        output["catalog_protection"] = catalog_protection_json(&protection);
+        output["verification_due"] = json!({"due": due.0, "past_due": due.1});
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Added files to Collection \"{}\".", collection.display_name);
         println!(
-            "  {} files observed; {} new to the Collection; {} newly placed at this Location",
-            result.summary.files_observed,
-            result.summary.new_paths,
-            result
-                .summary
-                .new_paths
-                .saturating_add(result.summary.changed_paths)
+            "  {} files observed; {} new paths; {} intentional content changes accepted",
+            result.summary.files_observed, result.summary.new_paths, result.summary.changed_paths
         );
         println!(
             "  {} files confirmed good; {} bytes verified",
             result.summary.confirmed_good, result.summary.bytes_observed
         );
+        if result.summary.unchanged_files > 0 {
+            println!(
+                "  {} unchanged files were not re-read",
+                result.summary.unchanged_files
+            );
+        }
+        print_verification_due(&location.display_name, due);
         if result.summary.ignored_symlinks > 0 {
             println!(
                 "  {} symlinks ignored (symlinks are not Archive Ledger Files)",
@@ -10402,16 +12485,330 @@ fn execute_v2_collection_add(
             );
         }
     }
+    if !cli.json {
+        print_v2_inventory_findings(&result.summary);
+        print_catalog_protection_warning(&protection);
+    }
     Ok(
         if result.summary.read_errors > 0
             || result.summary.concurrent_changes > 0
             || result.summary.traversal_errors > 0
+            || result.summary.integrity_mismatches > 0
         {
             EXIT_FINDINGS
         } else {
             EXIT_OK
         },
     )
+}
+
+/// Starting a fresh scan beside an unfinished one would silently discard its
+/// progress and strand its row and spool. Continuing that exact job is allowed.
+fn refuse_unfinished_v2_scans(
+    database: &V2ProjectionDb,
+    location_name: &str,
+    location_id: &str,
+    collection_id: &str,
+    continuing: Option<&str>,
+) -> Result<(), AppError> {
+    let connection = v2_cli_connection(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT job_id FROM jobs
+             WHERE job_type = 'location_scan' AND status = 'running'
+               AND json_extract(params_json, '$.location_id') = ?1
+               AND json_extract(params_json, '$.collection_id') = ?2
+               AND (?3 IS NULL OR job_id != ?3)
+             ORDER BY created_time_utc_ms DESC, job_id DESC",
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let mut ids = statement
+        .query_map(params![location_id, collection_id, continuing], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| v2_cli_sql_error(database, source))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    let archive_root = database.path().parent().unwrap_or_else(|| Path::new("."));
+    // Rebuild omits unpublished jobs, but their local state remains resumable.
+    for job_id in archive_ledger::local_job_ids(archive_root)? {
+        if continuing == Some(job_id.as_str()) {
+            continue;
+        }
+        let known: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id = ?1)",
+                [&job_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| v2_cli_sql_error(database, source))?;
+        if known {
+            continue; // In particular, a terminal database row takes precedence.
+        }
+        if let Some(config) = v2_local_job_config(database, &job_id)? {
+            if config.job_type == "location_scan"
+                && config
+                    .params
+                    .get("location_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(location_id)
+                && config
+                    .params
+                    .get("collection_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(collection_id)
+            {
+                ids.push(job_id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let jobs = ids
+        .into_iter()
+        .map(|job_id| {
+            // The per-job lock is held only by a live runner.
+            let live = matches!(
+                archive_ledger::read_local_job_config(archive_root, &job_id),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            );
+            (job_id, live)
+        })
+        .collect();
+    Err(AppError::UnfinishedScan {
+        location: format!("Location \"{location_name}\""),
+        jobs,
+    })
+}
+
+/// After a successful command, failing to inspect protection must not turn completed
+/// work into an error; the failure is reported instead of being silent.
+type CatalogProtection = Result<archive_ledger::V2CatalogProtection, String>;
+
+fn v2_catalog_protection(events: &Path) -> CatalogProtection {
+    V2OriginStore::open(events)
+        .and_then(|store| store.catalog_protection())
+        .map_err(|error| error.to_string())
+}
+
+fn catalog_protection_json(protection: &CatalogProtection) -> serde_json::Value {
+    match protection {
+        Ok(protection) => json!({
+            "sync_remotes": protection.sync_remotes,
+            "unsynced_commits": protection.unsynced_commits,
+            "next": catalog_protection_next(*protection),
+            "error": null,
+        }),
+        Err(error) => json!({
+            "sync_remotes": null,
+            "unsynced_commits": null,
+            "next": null,
+            "error": error,
+        }),
+    }
+}
+
+fn catalog_protection_next(
+    protection: archive_ledger::V2CatalogProtection,
+) -> Option<&'static str> {
+    match (protection.unsynced_commits, protection.sync_remotes) {
+        (0, _) => None,
+        (_, 0) => Some("archive sync remote add <name> <locator>, then archive sync"),
+        _ => Some("archive sync"),
+    }
+}
+
+/// One line, only while local catalog history is not known to be on a sync remote
+/// or when that cannot be checked.
+fn print_catalog_protection_warning(protection: &CatalogProtection) {
+    let protection = match protection {
+        Ok(protection) => *protection,
+        Err(error) => {
+            println!("WARNING: cannot check whether catalog history is on a sync remote: {error}");
+            return;
+        }
+    };
+    if let Some(next) = catalog_protection_next(protection) {
+        let commits = match protection.unsynced_commits {
+            1 => "1 catalog commit is".to_owned(),
+            count => format!("{count} catalog commits are"),
+        };
+        println!(
+            "WARNING: {commits} not yet on a sync remote; a local Git commit is not a backup. Next: {next}"
+        );
+    }
+}
+
+/// Copies at a Location whose presence is past the strictest applicable Policy age.
+fn presence_stale_at(database: &V2ProjectionDb, location_id: &str) -> Result<u64, AppError> {
+    let now = i64::try_from(now_utc_ms()?).map_err(|_| AppError::Clock)?;
+    let count: i64 = v2_cli_connection(database)?
+        .query_row(
+            "SELECT COUNT(*) FROM copy_claims cc
+             WHERE cc.location_id = ?1 AND cc.state IN ('present', 'corrupt', 'unknown')
+               AND EXISTS (
+                 SELECT 1 FROM file_refs f
+                 JOIN collections c ON c.collection_id = f.collection_id AND c.status = 'active'
+                 JOIN policies p ON p.policy_id = c.policy_id AND p.status = 'active' AND p.enabled = 1
+                 WHERE f.object_id = cc.object_id AND f.path_state = 'active'
+                   AND (cc.last_seen_time_utc_ms IS NULL OR cc.last_seen_time_utc_ms <
+                        ?2 - CAST(json_extract(p.requirements_json, '$.max_observation_age_days') AS INTEGER) * 86400000))",
+            params![location_id, now],
+            |row| row.get(0),
+        )
+        .map_err(|source| v2_cli_sql_error(database, source))?;
+    nonnegative_sql_count(count)
+}
+
+/// ` --exclude PATH` for each exclusion, so a suggested command covers the same files.
+fn exclude_arguments(exclusions: &[PathBuf]) -> String {
+    exclusions
+        .iter()
+        .map(|path| format!(" --exclude {}", shell_quote(&path.to_string_lossy())))
+        .collect()
+}
+
+/// Prints a read-only scan/add preview. Exit 10 means a real run would record
+/// something other than routine presence refresh.
+fn print_v2_scan_preview(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    preview: &archive_ledger::V2ScanPreview,
+    complete: bool,
+    location: &LocationSnapshot,
+    next: &str,
+) -> Result<u8, AppError> {
+    let presence_stale = presence_stale_at(database, &location.location_id)?;
+    let due = verification_due_at(database, &location.location_id)?;
+    let actionable = preview.actionable();
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 2,
+                "status": "planned",
+                "mode": if complete { "complete" } else { "add" },
+                "location_id": location.location_id,
+                "preview": preview,
+                "presence_stale": presence_stale,
+                "verification_due": {"due": due.0, "past_due": due.1},
+                "actionable": actionable,
+                "next": actionable.then_some(next),
+            }))?
+        );
+    } else {
+        println!(
+            "Dry run for \"{}\" ({}): no file content was read and nothing was recorded.",
+            location.display_name,
+            if complete { "complete scan" } else { "add" }
+        );
+        let category = |label: &str, item: &archive_ledger::V2PreviewCategory| {
+            if item.count == 0 {
+                return;
+            }
+            println!("  {label}: {} ({})", item.count, format_bytes(item.bytes));
+            for path in &item.paths {
+                println!("    {path}");
+            }
+            if item.truncated {
+                println!("    …and {} more", item.count - item.paths.len() as u64);
+            }
+        };
+        category("New files, would be added", &preview.new_files);
+        category(
+            "Known files not recorded at this Location, would be read and recorded",
+            &preview.new_at_location,
+        );
+        category(
+            "Size or modification time changed, would be read (an integrity finding unless the bytes match)",
+            &preview.changed,
+        );
+        category(
+            "Corrupt, unknown, or not yet verified here, would be read",
+            &preview.needs_reading,
+        );
+        category("Not on disk, would be marked missing", &preview.missing);
+        category(
+            "Annex content no longer present",
+            &preview.annex_content_absent,
+        );
+        category(
+            "Cannot tell without reading (small annex-tracked files)",
+            &preview.uncertain,
+        );
+        category(
+            "Annex links that cannot be resolved, would be recorded as read errors",
+            &preview.unreadable,
+        );
+        println!("  Unchanged, not read: {}", preview.unchanged);
+        if preview.recorded_absent > 0 {
+            println!(
+                "  Annex content absent and already recorded (or not recorded by add): {}",
+                preview.recorded_absent
+            );
+        }
+        if preview.without_identity > 0 {
+            println!(
+                "  Annex entries without a known content identity: {}",
+                preview.without_identity
+            );
+        }
+        if !preview.complete_coverage {
+            println!(
+                "  Traversal or read problems ({} traversal errors, {} concurrent changes, {} unresolvable links): a scan would be partial and mark nothing missing.",
+                preview.traversal_errors, preview.concurrent_changes, preview.unreadable.count
+            );
+        }
+        if presence_stale > 0 {
+            println!(
+                "  {presence_stale} copies here are past their presence age{}",
+                if complete {
+                    "; a complete scan refreshes those still on disk"
+                } else {
+                    "; add does not refresh presence, use location scan"
+                }
+            );
+        }
+        print_verification_due(&location.display_name, due);
+        if actionable {
+            println!("Next: {next}");
+            if !preview.new_at_location.paths.is_empty() {
+                println!("To create further copies, archive copy records them as it writes.");
+            }
+        } else {
+            println!("Nothing to record.");
+        }
+    }
+    Ok(if actionable { EXIT_FINDINGS } else { EXIT_OK })
+}
+
+/// Human mode only: announce the job before any long work so an interrupted
+/// scan can be resumed, and show live progress only on an interactive terminal.
+fn start_v2_inventory_progress(
+    cli: &Cli,
+    kind: ProgressKind,
+    label: &str,
+    job_id: &str,
+) -> Result<Option<ProgressReporter>, AppError> {
+    if cli.json {
+        return Ok(None);
+    }
+    eprintln!("{label} job {job_id}. If interrupted, resume with: archive job resume {job_id}");
+    Ok(std::io::stderr()
+        .is_terminal()
+        .then(|| ProgressReporter::start(kind))
+        .transpose()?)
+}
+
+fn finish_v2_inventory_progress(progress: Option<ProgressReporter>, status: &str) {
+    if let Some(progress) = progress {
+        progress.finish(match status {
+            "running" => "Paused",
+            "partial" => "Partial",
+            _ => "Complete",
+        });
+    }
 }
 
 fn execute_v2_location_scan(
@@ -10502,8 +12899,50 @@ fn execute_v2_location_scan(
                 .to_owned(),
         ));
     }
+    // A dry run refuses exactly as the real scan would, so its Next command works.
+    refuse_unfinished_v2_scans(
+        database,
+        &location.display_name,
+        &location.location_id,
+        &collection.collection_id,
+        args.job_id.as_deref(),
+    )?;
+    if args.dry_run {
+        let preview = archive_ledger::v2_preview_scan(
+            database,
+            &archive_ledger::V2InventoryConfig {
+                root_path: location_path.clone(),
+                location_prefix: None,
+                logical_prefix: None,
+                exclusions: args.exclusions.clone(),
+                accept_changes: Vec::new(),
+                collection_id: collection.collection_id.clone(),
+                location_id: location.location_id.clone(),
+                device_fingerprint_status: fingerprint_status.clone(),
+                job_id: "job_preview".to_owned(),
+                scan_id: "scan_preview".to_owned(),
+                scan_mode: ScanMode::Complete,
+                batch_entries: args.batch_entries,
+                max_items: None,
+            },
+        )?;
+        let next = format!(
+            "archive location scan {} --path {} --collection {}{}",
+            shell_quote(&location.display_name),
+            shell_quote(&location_path.to_string_lossy()),
+            shell_quote(&collection.display_name),
+            exclude_arguments(&args.exclusions)
+        );
+        return print_v2_scan_preview(cli, database, &preview, true, &location, &next);
+    }
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
+    let job_id = args
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("job_{suffix}"));
     let store = V2OriginStore::open(cli.events_path())?;
+    let progress =
+        start_v2_inventory_progress(cli, ProgressKind::LocationScan, "Location scan", &job_id)?;
     let result = archive_ledger::v2_add_files(
         &store,
         database,
@@ -10512,21 +12951,22 @@ fn execute_v2_location_scan(
             location_prefix: None,
             logical_prefix: None,
             exclusions: args.exclusions.clone(),
+            accept_changes: Vec::new(),
             collection_id: collection.collection_id.clone(),
-            location_id: location.location_id,
+            location_id: location.location_id.clone(),
             device_fingerprint_status: fingerprint_status,
-            job_id: args
-                .job_id
-                .clone()
-                .unwrap_or_else(|| format!("job_{suffix}")),
+            job_id,
             scan_id: args
                 .scan_id
                 .clone()
                 .unwrap_or_else(|| format!("scan_{suffix}")),
             scan_mode: ScanMode::Complete,
+            batch_entries: args.batch_entries,
             max_items: args.max_items,
         },
+        progress.as_ref().map(ProgressReporter::progress),
     )?;
+    finish_v2_inventory_progress(progress, &result.status);
     if result.status == "running" {
         if cli.json {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -10536,12 +12976,22 @@ fn execute_v2_location_scan(
                 result.summary.files_observed,
                 format_bytes(result.summary.bytes_observed)
             );
+            print_v2_inventory_findings(&result.summary);
             println!("Resume with: archive job resume {}", result.job_id);
         }
-        return Ok(EXIT_OK);
+        return Ok(if result.summary.integrity_mismatches > 0 {
+            EXIT_FINDINGS
+        } else {
+            EXIT_OK
+        });
     }
+    let protection = v2_catalog_protection(cli.events_path());
+    let due = verification_due_at(database, &location.location_id)?;
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        let mut output = serde_json::to_value(&result)?;
+        output["catalog_protection"] = catalog_protection_json(&protection);
+        output["verification_due"] = json!({"due": due.0, "past_due": due.1});
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Location scan complete for \"{}\".", location.display_name);
         println!(
@@ -10554,12 +13004,28 @@ fn execute_v2_location_scan(
             result.summary.confirmed_good
         );
         println!("  {} files now missing", result.summary.missing_paths);
+        if result.summary.unchanged_files > 0 {
+            println!(
+                "  {} unchanged files were not re-read{}",
+                result.summary.unchanged_files,
+                if result.status == "complete" {
+                    "; presence refreshed"
+                } else {
+                    ""
+                }
+            );
+        }
+        print_verification_due(&location.display_name, due);
         if result.summary.ignored_symlinks > 0 {
             println!(
                 "  {} ordinary symlinks ignored",
                 result.summary.ignored_symlinks
             );
         }
+    }
+    if !cli.json {
+        print_v2_inventory_findings(&result.summary);
+        print_catalog_protection_warning(&protection);
     }
     Ok(
         if result.summary.read_errors > 0
@@ -12118,7 +14584,7 @@ fn execute_v2_collection_init(
     let mut setup = args.clone();
     setup.name = Some(name);
     if setup.import_annex {
-        execute_v2_annex_setup(cli, database, &setup, None)
+        execute_v2_annex_setup(cli, database, &setup, None, false)
     } else {
         execute_v2_filesystem_setup(cli, database, &setup, None)
     }
@@ -12140,6 +14606,7 @@ fn prepare_v2_filesystem_setup(
     database: &V2ProjectionDb,
     args: &CollectionInitArgs,
     existing_collection: Option<CollectionSnapshot>,
+    reimport: bool,
 ) -> Result<V2FilesystemSetup, AppError> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     let collection_name = existing_collection
@@ -12149,6 +14616,9 @@ fn prepare_v2_filesystem_setup(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Input("Collection name must be non-empty".to_owned()))?;
     let mounted = archive_ledger::discover_mounted_filesystem(&args.path)?;
+    if args.import_annex {
+        refuse_v2_unfinished_annex_import(database, &mounted.path)?;
+    }
     if mounted.identity_state == "unavailable"
         && !args.allow_unidentified_root
         && (!interactive
@@ -12405,6 +14875,19 @@ fn prepare_v2_filesystem_setup(
         ));
         (collection, Some(policy))
     };
+    if args.import_annex
+        && !reimport
+        && v2_location_has_completed_annex_import(
+            database,
+            &collection.collection_id,
+            &location.location_id,
+        )?
+    {
+        return Err(AppError::Input(format!(
+            "Location {:?} already has a completed annex import for Collection {:?}; use archive location scan for ordinary updates, or location import-annex --reimport for an intentional repeat",
+            location.display_name, collection.display_name
+        )));
+    }
     changes.push(RegistryChange::DeviceMount(DeviceMount {
         mount_id: generated_id("mount"),
         device_id: device.device_id.clone(),
@@ -12437,11 +14920,13 @@ fn prepare_v2_filesystem_setup(
 }
 
 fn print_v2_filesystem_setup(cli: &Cli, setup: &V2FilesystemSetup) -> Result<(), AppError> {
+    let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "version": 2,
+                "catalog_protection": catalog_protection_json(&protection),
                 "collection": setup.collection,
                 "location": setup.location,
                 "device": setup.device,
@@ -12475,6 +14960,7 @@ fn print_v2_filesystem_setup(cli: &Cli, setup: &V2FilesystemSetup) -> Result<(),
             "Next: archive collection add . --collection {}",
             shell_quote(&setup.collection.display_name)
         );
+        print_catalog_protection_warning(&protection);
     }
     Ok(())
 }
@@ -12485,7 +14971,7 @@ fn execute_v2_filesystem_setup(
     args: &CollectionInitArgs,
     existing_collection: Option<CollectionSnapshot>,
 ) -> Result<u8, AppError> {
-    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection)?;
+    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection, false)?;
     print_v2_filesystem_setup(cli, &setup)?;
     Ok(EXIT_OK)
 }
@@ -12495,6 +14981,7 @@ fn execute_v2_annex_setup(
     database: &V2ProjectionDb,
     args: &CollectionInitArgs,
     existing_collection: Option<CollectionSnapshot>,
+    reimport: bool,
 ) -> Result<u8, AppError> {
     validate_setup_source(&args.path, true, SetupCommand::Collection)?;
     if args.batch_entries == 0 {
@@ -12502,8 +14989,8 @@ fn execute_v2_annex_setup(
             "--batch-entries must be greater than zero".to_owned(),
         ));
     }
-    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection)?;
-    let progress = AnnexProgressReporter::start()?;
+    let setup = prepare_v2_filesystem_setup(cli, database, args, existing_collection, reimport)?;
+    let progress = ProgressReporter::start(ProgressKind::AnnexImport)?;
     let suffix = ulid::Ulid::new().to_string().to_ascii_lowercase();
     let job_id = args
         .job_id
@@ -12542,11 +15029,12 @@ fn execute_v2_annex_setup(
     } else {
         "Paused"
     });
+    // A paused import has published nothing, so protection is not reported.
+    let protection = (result.status == AnnexImportStatus::Complete)
+        .then(|| v2_catalog_protection(cli.events_path()));
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "version": 2,
+        let mut output = json!({
+            "version": 2,
                 "collection": setup.collection,
                 "location": setup.location,
                 "device": setup.device,
@@ -12560,8 +15048,11 @@ fn execute_v2_annex_setup(
                     "git_head_commit": result.git_head_commit,
                     "summary": result.summary,
                 }
-            }))?
-        );
+        });
+        if let Some(protection) = &protection {
+            output["catalog_protection"] = catalog_protection_json(protection);
+        }
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         if result.status == AnnexImportStatus::Interrupted {
             println!(
@@ -12595,6 +15086,9 @@ fn execute_v2_annex_setup(
                 "  Integrity findings: {} mismatched; {} read errors",
                 result.summary.mismatched, result.summary.read_errors
             );
+        }
+        if let Some(protection) = &protection {
+            print_catalog_protection_warning(protection);
         }
     }
     Ok(

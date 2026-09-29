@@ -1,0 +1,358 @@
+--- a/src/v2_projection.rs
++++ b/src/v2_projection.rs
+@@ -587,6 +587,74 @@
+     pub applied_frontier_hash: String,
+ }
+ 
++// RESEARCH COPY ONLY. Read-only SQLite counters and process I/O snapshots.
++// Counter high-water values are included as supplied by SQLite; HIT/MISS/
++// WRITE/SPILL totals are connection-local current values, never reset here.
++fn rebuild_diagnostic(phase: &str, connection: Option<&Connection>, details: Value) {
++    use std::io::Write as _;
++    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++    let elapsed = START
++        .get_or_init(std::time::Instant::now)
++        .elapsed()
++        .as_secs_f64();
++    let mut sqlite = serde_json::Map::new();
++    if let Some(connection) = connection {
++        for (name, operation) in [
++            ("cache_hit", rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT),
++            ("cache_miss", rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS),
++            ("cache_write", rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE),
++            ("cache_spill", rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL),
++            (
++                "cache_used_bytes",
++                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
++            ),
++        ] {
++            let mut current = 0;
++            let mut highwater = 0;
++            // SAFETY: this live Connection is borrowed on its owning thread.
++            // sqlite3_db_status reads counters synchronously, resetFlag=0; the
++            // handle and output pointers are not retained or used concurrently.
++            let code = unsafe {
++                rusqlite::ffi::sqlite3_db_status(
++                    connection.handle(),
++                    operation,
++                    &mut current,
++                    &mut highwater,
++                    0,
++                )
++            };
++            sqlite.insert(
++                name.to_owned(),
++                if code == rusqlite::ffi::SQLITE_OK {
++                    json!({"current": current, "highwater": highwater})
++                } else {
++                    json!({"sqlite_error_code": code})
++                },
++            );
++        }
++    }
++    let io: BTreeMap<String, u64> = fs::read_to_string("/proc/self/io")
++        .unwrap_or_default()
++        .lines()
++        .filter_map(|line| {
++            let (key, value) = line.split_once(':')?;
++            Some((key.to_owned(), value.trim().parse().ok()?))
++        })
++        .collect();
++    let event = json!({
++        "rebuild_diagnostic": 1, "pid": std::process::id(), "phase": phase,
++        "elapsed_seconds": elapsed,
++        "unix_seconds": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
++            .ok().map(|duration| duration.as_secs_f64()),
++        "sqlite": sqlite, "process_io": io, "details": details,
++    });
++    // Diagnostics must not turn successful validation into an error or skip it.
++    // In particular, a broken stderr pipe is not allowed to panic the rebuild.
++    if let Ok(line) = serde_json::to_string(&event) {
++        let _ = writeln!(std::io::stderr().lock(), "{line}");
++    }
++}
++
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ enum ReplayMode {
+     Incremental,
+@@ -596,11 +664,34 @@
+ impl ReplayMode {
+     fn configure(self, connection: &Connection, path: &Path) -> Result<()> {
+         if self == Self::Rebuild {
+-            // Bound SQLite's page-cache target rather than retaining event rows.
++            // RESEARCH COPY ONLY: bounded cache candidates, rebuild connection only.
++            let cache_kib = match std::env::var("ARCHIVE_REBUILD_RESEARCH_CACHE_KIB") {
++                Ok(value) => match value.as_str() {
++                    "65536" => 65536_i64,
++                    "131072" => 131072_i64,
++                    "262144" => 262144_i64,
++                    _ => {
++                        return Err(V2ProjectionError::Invalid(
++                            "research cache must be 65536, 131072, or 262144 KiB".to_owned(),
++                        ))
++                    }
++                },
++                Err(std::env::VarError::NotPresent) => 65536_i64,
++                Err(_) => {
++                    return Err(V2ProjectionError::Invalid(
++                        "research cache is not UTF-8".to_owned(),
++                    ))
++                }
++            };
+             connection
+-                .execute_batch("PRAGMA cache_size = -65536;")
++                .pragma_update(None, "cache_size", -cache_kib)
+                 .map_err(|source| sqlite_error(path, source))?;
+             connection.set_prepared_statement_cache_capacity(32);
++            rebuild_diagnostic(
++                "connection_configured",
++                Some(connection),
++                json!({"cache_kib":cache_kib}),
++            );
+         }
+         Ok(())
+     }
+@@ -663,7 +754,13 @@
+         path: impl AsRef<Path>,
+     ) -> Result<V2RebuildStats> {
+         let path = path.as_ref();
++        rebuild_diagnostic("initial_canonical_verification_start", None, json!({}));
+         let verified = store.verify_compact()?;
++        rebuild_diagnostic(
++            "initial_canonical_verification_complete",
++            None,
++            json!({"records": verified.record_count}),
++        );
+         if path.exists() {
+             return Err(V2ProjectionError::Invalid(format!(
+                 "projection target already exists: {}",
+@@ -684,6 +781,7 @@
+         connection
+             .execute_batch(SCHEMA_V6)
+             .map_err(|source| sqlite_error(path, source))?;
++        rebuild_diagnostic("bootstrap_start", Some(&connection), json!({}));
+         let deferred_indexes = defer_rebuild_indexes(&connection, path)?;
+         let bootstrap_hash = verified
+             .frontiers
+@@ -774,6 +872,7 @@
+         transaction
+             .commit()
+             .map_err(|source| sqlite_error(path, source))?;
++        rebuild_diagnostic("bootstrap_complete", Some(&connection), json!({}));
+         drop(connection);
+         // The unpublished database keeps user_version = 0 until every index
+         // and validation is complete. Public open_existing must reject partial
+@@ -784,6 +883,11 @@
+         let applied = database.apply_with_mode(store, ReplayMode::Rebuild)?;
+         let mut connection = database.open()?;
+         ReplayMode::Rebuild.configure(&connection, path)?;
++        rebuild_diagnostic(
++            "deferred_index_creation_start",
++            Some(&connection),
++            json!({"indexes":deferred_indexes.len()}),
++        );
+         let transaction = connection
+             .transaction()
+             .map_err(|source| sqlite_error(path, source))?;
+@@ -795,9 +899,17 @@
+         transaction
+             .commit()
+             .map_err(|source| sqlite_error(path, source))?;
++        rebuild_diagnostic(
++            "deferred_index_creation_complete",
++            Some(&connection),
++            json!({}),
++        );
++        rebuild_diagnostic("optimize_start", Some(&connection), json!({}));
+         connection
+             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
+             .map_err(|source| sqlite_error(path, source))?;
++        rebuild_diagnostic("optimize_complete", Some(&connection), json!({}));
++        rebuild_diagnostic("integrity_check_start", Some(&connection), json!({}));
+         let integrity: String = connection
+             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+             .map_err(|source| sqlite_error(path, source))?;
+@@ -806,6 +918,8 @@
+                 "SQLite integrity_check failed: {integrity}"
+             )));
+         }
++        rebuild_diagnostic("integrity_check_complete", Some(&connection), json!({}));
++        rebuild_diagnostic("foreign_key_check_start", Some(&connection), json!({}));
+         let foreign_key_violation = connection
+             .prepare("PRAGMA foreign_key_check")
+             .map_err(|source| sqlite_error(path, source))?
+@@ -817,8 +931,11 @@
+                 "SQLite foreign_key_check failed".to_owned(),
+             ));
+         }
++        rebuild_diagnostic("foreign_key_check_complete", Some(&connection), json!({}));
+         drop(connection);
++        rebuild_diagnostic("canonical_validation_start", None, json!({}));
+         database.validate_against_verified(&verified)?;
++        rebuild_diagnostic("canonical_validation_complete", None, json!({}));
+         let stats = V2RebuildStats {
+             version: 2,
+             archive_id: verified.genesis.body.archive_id,
+@@ -829,10 +946,12 @@
+         };
+         // Set the completion marker with the ordinary durable connection only
+         // after successful replay, index creation, and integrity verification.
++        rebuild_diagnostic("completion_marker_start", None, json!({}));
+         database
+             .open()?
+             .pragma_update(None, "user_version", V2_SCHEMA_VERSION)
+             .map_err(|source| sqlite_error(path, source))?;
++        rebuild_diagnostic("construction_complete", None, json!({}));
+         Ok(stats)
+     }
+ 
+@@ -908,6 +1027,9 @@
+     fn apply_with_mode(&self, store: &V2OriginStore, mode: ReplayMode) -> Result<V2ApplyStats> {
+         let mut connection = self.open()?;
+         mode.configure(&connection, &self.path)?;
++        if mode == ReplayMode::Rebuild {
++            rebuild_diagnostic("replay_start", Some(&connection), json!({}));
++        }
+         let applied_frontier_hash = meta(&connection, &self.path, "applied_frontier_hash")?;
+         let stored_cursors = connection
+             .prepare("SELECT origin_id, applied_seq, applied_record_hash, applied_segment_manifest_hash FROM projection_origins ORDER BY origin_id")
+@@ -1004,6 +1126,7 @@
+         let records_per_transaction = if mode == ReplayMode::Rebuild { 64 } else { 1 };
+         let mut pending_transaction: Option<Transaction<'_>> = None;
+         let mut pending_records = 0;
++        let mut groups_committed = 0_u64;
+         let verified = store.visit_verified_since_with_clients::<V2ProjectionError, _>(
+             &applied_frontier_hash,
+             &verification_cursors,
+@@ -1088,9 +1211,16 @@
+             }
+             pending_records += 1;
+             if pending_records == records_per_transaction {
++                if mode == ReplayMode::Rebuild {
++                    rebuild_diagnostic("group_before_commit", Some(&connection), json!({"group":groups_committed+1,"group_records":pending_records,"records_projected":records_applied+1}));
++                }
+                 pending_transaction.take().expect("pending transaction")
+                     .commit()
+                     .map_err(|source| sqlite_error(&self.path, source))?;
++                groups_committed += 1;
++                if mode == ReplayMode::Rebuild {
++                    rebuild_diagnostic("group_after_commit", Some(&connection), json!({"group":groups_committed,"group_records":pending_records,"records_projected":records_applied+1}));
++                }
+                 pending_records = 0;
+             }
+             next_sequences.insert(origin_id.clone(), sequence);
+@@ -1102,9 +1232,24 @@
+         )?;
+         // Records remain streamed; on error RAII rolls back the pending group.
+         if let Some(transaction) = pending_transaction.take() {
++            if mode == ReplayMode::Rebuild {
++                rebuild_diagnostic(
++                    "group_before_commit",
++                    Some(&connection),
++                    json!({"group":groups_committed+1,"group_records":pending_records,"records_projected":records_applied}),
++                );
++            }
+             transaction
+                 .commit()
+                 .map_err(|source| sqlite_error(&self.path, source))?;
++            groups_committed += 1;
++            if mode == ReplayMode::Rebuild {
++                rebuild_diagnostic(
++                    "group_after_commit",
++                    Some(&connection),
++                    json!({"group":groups_committed,"group_records":pending_records,"records_projected":records_applied}),
++                );
++            }
+         }
+         drop(pending_transaction);
+         if !validated_context {
+@@ -1140,9 +1285,23 @@
+                 )
+                 .map_err(|source| sqlite_error(&self.path, source))?;
+         }
++        if mode == ReplayMode::Rebuild {
++            rebuild_diagnostic(
++                "replay_finalization_before_commit",
++                Some(&final_transaction),
++                json!({}),
++            );
++        }
+         final_transaction
+             .commit()
+             .map_err(|source| sqlite_error(&self.path, source))?;
++        if mode == ReplayMode::Rebuild {
++            rebuild_diagnostic(
++                "replay_finalization_after_commit",
++                Some(&connection),
++                json!({}),
++            );
++        }
+         let status = self.status()?;
+         if status.accepted_frontier_hash != verified.accepted_frontier_hash {
+             return Err(V2ProjectionError::Invalid(
+@@ -1172,6 +1331,13 @@
+                 )));
+             }
+         }
++        if mode == ReplayMode::Rebuild {
++            rebuild_diagnostic(
++                "replay_complete",
++                Some(&connection),
++                json!({"groups":groups_committed,"records_projected":records_applied}),
++            );
++        }
+         Ok(V2ApplyStats {
+             version: 2,
+             archive_id: verified.genesis.body.archive_id,
+@@ -1226,6 +1392,7 @@
+ 
+     pub fn rebuild(store: &V2OriginStore, target: impl AsRef<Path>) -> Result<V2RebuildStats> {
+         let target = target.as_ref();
++        rebuild_diagnostic("rebuild_start", None, json!({}));
+         let parent = target.parent().ok_or_else(|| {
+             V2ProjectionError::Invalid(format!("{} has no parent directory", target.display()))
+         })?;
+@@ -1234,14 +1401,18 @@
+         let stats = match Self::create_from_store(store, &temp) {
+             Ok(stats) => stats,
+             Err(error) => {
++                rebuild_diagnostic("construction_failed", None, json!({"code":error.code()}));
+                 let _ = fs::remove_file(&temp);
+                 return Err(error);
+             }
+         };
++        rebuild_diagnostic("seal_start", None, json!({}));
+         File::open(&temp)
+             .and_then(|file| file.sync_all())
+             .map_err(|source| io_error(&temp, source))?;
+ 
++        rebuild_diagnostic("seal_complete", None, json!({}));
++        rebuild_diagnostic("installation_start", None, json!({}));
+         let backup = parent.join(format!(".archive-ledger-previous-{}.db", lower_ulid()));
+         let had_target = target.exists();
+         let mut backup_sidecars = Vec::new();
+@@ -1277,6 +1448,8 @@
+             }
+             return Err(io_error(target, source));
+         }
++        rebuild_diagnostic("replacement_renamed", None, json!({}));
++        rebuild_diagnostic("installed_validation_start", None, json!({}));
+         let installed =
+             Self::open_existing(target).and_then(|database| database.validate_against_store(store));
+         if let Err(error) = installed {
+@@ -1291,6 +1464,7 @@
+             }
+             return Err(error);
+         }
++        rebuild_diagnostic("installed_validation_complete", None, json!({}));
+         if had_target {
+             fs::remove_file(&backup).map_err(|source| io_error(&backup, source))?;
+             for (_, backup_sidecar) in &backup_sidecars {
+@@ -1301,6 +1475,7 @@
+         File::open(parent)
+             .and_then(|directory| directory.sync_all())
+             .map_err(|source| io_error(parent, source))?;
++        rebuild_diagnostic("rebuild_complete", None, json!({}));
+         Ok(stats)
+     }
+ 

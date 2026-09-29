@@ -1,7 +1,6 @@
 //! Core library for Archive Ledger.
 
 pub mod annex;
-pub mod annex_progress;
 pub mod app_integration;
 pub mod catalog;
 pub mod discovery;
@@ -12,6 +11,7 @@ mod git;
 mod job;
 pub mod metadata;
 pub mod policy;
+pub mod progress;
 pub mod projection;
 pub mod registry;
 pub mod review;
@@ -57,7 +57,7 @@ pub use genesis::{
 pub use git::{
     managed_git_command, validate_git_ref, validate_git_remote_locator, validate_git_remote_name,
 };
-pub use job::validate_job_id;
+pub use job::{local_job_ids, read_local_job_config, validate_job_id, LocalJobConfig};
 pub use metadata::{
     initialize_metadata_repository, restore_check, IndependenceAssessment,
     MetadataCheckpointResult, MetadataDestinationSnapshot, MetadataDestinationState, MetadataError,
@@ -84,8 +84,8 @@ pub use review::{
     ObjectHashReview, ObjectReview, ReviewError, V2HistoryEntry, V2HistoryPage,
 };
 pub use safe_copy::{
-    copy_verified_no_replace, place_directory_no_replace, verify_existing_file, SafeCopyError,
-    VerifiedCopy,
+    copy_verified_no_replace, place_directory_no_replace, place_file_no_replace,
+    verify_existing_file, SafeCopyError, VerifiedCopy,
 };
 pub use scan::{
     LocationScanner, ScanConfig, ScanError, ScanMode, ScanResult, ScanStatus, ScanSummary,
@@ -114,8 +114,10 @@ pub use v2_fsck::{
     fsck_v2_archive, V2FsckCheck, V2FsckError, V2FsckOptions, V2FsckReport, V2TableDigest,
 };
 pub use v2_inventory::{
-    add_files as v2_add_files, record_placements as v2_record_placements, V2InventoryConfig,
-    V2InventoryError, V2InventoryResult, V2InventorySummary, V2Placement,
+    add_files as v2_add_files, cancel_job as v2_cancel_job, preview_changes as v2_preview_changes,
+    preview_scan as v2_preview_scan, record_placements as v2_record_placements, V2ChangePreview,
+    V2InventoryConfig, V2InventoryError, V2InventoryResult, V2InventorySummary, V2Placement,
+    V2PreviewCategory, V2ScanPreview,
 };
 pub use v2_projection::{
     V2ApplyStats, V2ProjectionDb, V2ProjectionError, V2ProjectionStatus, V2RebuildStats,
@@ -127,6 +129,7 @@ pub use v2_snapshot::{
 pub use v2_store::{
     initialize_v2_archive, is_v2_event_tree, EnrollmentRequestBody, PortableSnapshotManifestBody,
     SignedEnrollmentRequest, SignedPortableSnapshotManifest, V2AppendResult,
-    V2ArchiveInitialization, V2CanonicalCursor, V2CoordinationLease, V2OriginCursor, V2OriginStore,
-    V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport, VerifiedV2Client,
+    V2ArchiveInitialization, V2CanonicalCursor, V2CatalogProtection, V2CoordinationLease,
+    V2OriginCursor, V2OriginStore, V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport,
+    VerifiedV2Client,
 };

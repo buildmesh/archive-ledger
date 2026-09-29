@@ -40,6 +40,13 @@ const COORDINATION_LEASE_VERSION: u32 = 1;
 const PORTABLE_SNAPSHOT_VERSION: u32 = 1;
 const DEFAULT_COORDINATION_LEASE_MS: u64 = 120_000;
 
+mod publication;
+#[cfg(test)]
+mod publication_tests;
+mod recovery;
+#[cfg(test)]
+mod recovery_tests;
+
 pub type Result<T> = std::result::Result<T, V2StoreError>;
 
 struct RemoveOnDrop {
@@ -67,6 +74,10 @@ impl Drop for RemoveOnDrop {
 
 #[derive(Debug, Error)]
 pub enum V2StoreError {
+    #[error("pending publication recovery refused: {0}; preserve the files, resolve unrelated Git changes, and inspect with archive fsck before retrying")]
+    PublicationRecoveryRefused(String),
+    #[error("unpublished append recovery refused: {0}; preserve the files and inspect with archive fsck")]
+    AppendRecoveryRefused(String),
     #[error("version 2 event tree is invalid: {0}")]
     Invalid(String),
     #[error("{operation} failed for {path}: {source}")]
@@ -106,6 +117,8 @@ pub enum V2StoreError {
 impl V2StoreError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::PublicationRecoveryRefused(_) => "v2_publication_recovery_refused",
+            Self::AppendRecoveryRefused(_) => "v2_append_recovery_refused",
             Self::Io { .. } => "v2_store_io",
             Self::Json { .. } => "v2_store_json_invalid",
             Self::Git { .. } => "v2_store_git",
@@ -396,6 +409,14 @@ pub struct V2ArchiveInitialization {
     pub git_commit: String,
 }
 
+/// Ephemeral append progress; never stored in canonical history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2AppendProgress {
+    Verifying,
+    ReadingSpool { bytes_read: u64, total_bytes: u64 },
+    Publishing,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct V2AppendResult {
     pub version: u32,
@@ -408,6 +429,9 @@ pub struct V2AppendResult {
     pub segment_manifest_hash: String,
     pub accepted_frontier_hash: String,
     pub git_commit: String,
+    /// Preserved unpublished evidence from an interrupted append, when recovered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_append: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -424,6 +448,17 @@ pub struct V2SyncResult {
     pub pushed: bool,
     pub merged: bool,
 }
+
+/// Whether local catalog history is known to exist on a sync remote.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct V2CatalogProtection {
+    pub sync_remotes: usize,
+    /// Local canonical commits not known to be on any configured sync remote.
+    pub unsynced_commits: u64,
+}
+
+const SYNCED_REF_PREFIX: &str = "refs/archive-ledger/synced/";
+const FETCHED_REF_PREFIX: &str = "refs/archive-ledger/fetched/";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct V2SyncRemote {
@@ -689,7 +724,9 @@ impl V2OriginStore {
             &self.root,
             "add synchronization remote",
             &["remote", "add", name, locator],
-        )
+        )?;
+        // A reused name may point somewhere new; earlier knowledge must not count.
+        self.forget_remote_state(name)
     }
 
     pub fn remove_sync_remote(&self, name: &str) -> Result<()> {
@@ -698,6 +735,40 @@ impl V2OriginStore {
             &self.root,
             "remove synchronization remote",
             &["remote", "remove", name],
+        )?;
+        self.forget_remote_state(name)
+    }
+
+    fn forget_remote_state(&self, name: &str) -> Result<()> {
+        for prefix in [SYNCED_REF_PREFIX, FETCHED_REF_PREFIX] {
+            let reference = format!("{prefix}{name}");
+            let listed = git_stdout(
+                &self.root,
+                "list synchronization refs",
+                &["for-each-ref", "--format=%(refname)", &reference],
+            )?;
+            if listed.lines().any(|line| line == reference) {
+                run_git(
+                    &self.root,
+                    "forget synchronization ref",
+                    &["update-ref", "-d", &reference],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Records that `remote` holds the current local commit, e.g. right after cloning from it.
+    pub fn record_synced_head(&self, remote: &str) -> Result<()> {
+        validate_remote_name(remote)?;
+        run_git(
+            &self.root,
+            "record synchronized commit",
+            &[
+                "update-ref",
+                &format!("{SYNCED_REF_PREFIX}{remote}"),
+                "HEAD",
+            ],
         )
     }
 
@@ -772,6 +843,7 @@ impl V2OriginStore {
         Ok(appended)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_coordinated_jsonl_batch(
         &self,
         remote: &str,
@@ -780,18 +852,20 @@ impl V2OriginStore {
         mut context: Value,
         defaults: Value,
         spool_path: impl AsRef<Path>,
+        progress: Option<&mut dyn FnMut(V2AppendProgress)>,
     ) -> Result<V2AppendResult> {
         let lease = self.acquire_archive_lease(remote)?;
         let context_object = context.as_object_mut().ok_or_else(|| {
             V2StoreError::Invalid("coordinated batch context must be an object".to_owned())
         })?;
         context_object.insert("coordination".to_owned(), lease_context(&lease));
-        let appended = match self.append_jsonl_batch(
+        let appended = match self.append_jsonl_batch_with_progress(
             operation_kind,
             item_schema_version,
             context,
             defaults,
             spool_path,
+            progress,
         ) {
             Ok(appended) => appended,
             Err(error) => {
@@ -804,13 +878,64 @@ impl V2OriginStore {
         Ok(appended)
     }
 
+    /// Synchronizes with `remote`, then records the accepted commit, which every
+    /// successful path leaves on the remote, so protection can be reported offline.
     pub fn sync_remote(&self, remote: &str) -> Result<V2SyncResult> {
+        let result = self.sync_remote_unrecorded(remote)?;
+        // Advisory only: the sync already succeeded, and a missing record merely
+        // makes the protection warning more cautious.
+        let _ = run_git(
+            &self.root,
+            "record synchronized commit",
+            &[
+                "update-ref",
+                &format!("{SYNCED_REF_PREFIX}{remote}"),
+                &result.accepted_commit,
+            ],
+        );
+        Ok(result)
+    }
+
+    /// Local canonical commits not known to be on any configured sync remote.
+    /// Known means reachable from the commit recorded after a successful sync,
+    /// or from the remote state last fetched. Computed without network access.
+    pub fn catalog_protection(&self) -> Result<V2CatalogProtection> {
+        let remotes = self.sync_remotes()?;
+        let mut known = Vec::new();
+        for remote in &remotes {
+            for prefix in [SYNCED_REF_PREFIX, FETCHED_REF_PREFIX] {
+                let name = format!("{prefix}{}", remote.name);
+                let listed = git_stdout(
+                    &self.root,
+                    "list synchronization refs",
+                    &["for-each-ref", "--format=%(refname)", &name],
+                )?;
+                if listed.lines().any(|line| line == name) {
+                    known.push(name);
+                }
+            }
+        }
+        let mut args = vec!["rev-list", "--count", "HEAD"];
+        if !known.is_empty() {
+            args.push("--not");
+            args.extend(known.iter().map(String::as_str));
+        }
+        let count = git_stdout(&self.root, "count unsynchronized commits", &args)?;
+        Ok(V2CatalogProtection {
+            sync_remotes: remotes.len(),
+            unsynced_commits: count.trim().parse().map_err(|_| {
+                V2StoreError::Invalid("git rev-list returned an invalid count".to_owned())
+            })?,
+        })
+    }
+
+    fn sync_remote_unrecorded(&self, remote: &str) -> Result<V2SyncResult> {
         configured_remote_locator(&self.root, remote)?;
         ensure_git_clean(&self.root)?;
         let local_verified = self.verify_compact()?;
         let local_before =
             git_stdout(&self.root, "read local sync commit", &["rev-parse", "HEAD"])?;
-        let remote_ref = format!("refs/archive-ledger/fetched/{remote}");
+        let remote_ref = format!("{FETCHED_REF_PREFIX}{remote}");
         for _attempt in 0..4 {
             let remote_before = remote_archive_commit(&self.root, remote)?;
             let Some(remote_commit) = remote_before.clone() else {
@@ -2066,16 +2191,86 @@ impl V2OriginStore {
         defaults: Value,
         spool_path: impl AsRef<Path>,
     ) -> Result<V2AppendResult> {
+        self.append_jsonl_batch_with_progress(
+            operation_kind,
+            item_schema_version,
+            context,
+            defaults,
+            spool_path,
+            None,
+        )
+    }
+
+    /// Like `append_jsonl_batch`, with bounded progress notifications on the
+    /// calling thread. Spool byte counts include original line delimiters.
+    pub fn append_jsonl_batch_with_progress(
+        &self,
+        operation_kind: &str,
+        item_schema_version: u32,
+        context: Value,
+        defaults: Value,
+        spool_path: impl AsRef<Path>,
+        mut progress: Option<&mut dyn FnMut(V2AppendProgress)>,
+    ) -> Result<V2AppendResult> {
+        if let Some(report) = progress.as_mut() {
+            report(V2AppendProgress::Verifying);
+        }
         let spool_path = spool_path.as_ref().to_path_buf();
         let file = File::open(&spool_path)
             .map_err(|source| io_error("open batch item spool", &spool_path, source))?;
-        let items = BufReader::new(file).lines().map(|line| {
-            let line =
-                line.map_err(|source| io_error("read batch item spool", &spool_path, source))?;
-            serde_json::from_str::<Value>(&line).map_err(|source| V2StoreError::Json {
-                path: spool_path.clone(),
-                source,
-            })
+        let total_bytes = file
+            .metadata()
+            .map_err(|source| io_error("stat batch item spool", &spool_path, source))?
+            .len();
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut bytes_read = 0_u64;
+        let mut last_reported = 0_u64;
+        let mut started = false;
+        let items = std::iter::from_fn(|| {
+            if !started {
+                started = true;
+                if let Some(report) = progress.as_mut() {
+                    report(V2AppendProgress::ReadingSpool {
+                        bytes_read: 0,
+                        total_bytes,
+                    });
+                }
+            }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    if let Some(report) = progress.as_mut() {
+                        if bytes_read != last_reported {
+                            report(V2AppendProgress::ReadingSpool {
+                                bytes_read,
+                                total_bytes,
+                            });
+                        }
+                        report(V2AppendProgress::Publishing);
+                    }
+                    None
+                }
+                Ok(length) => {
+                    bytes_read += length as u64;
+                    if bytes_read - last_reported >= 64 * 1024 {
+                        if let Some(report) = progress.as_mut() {
+                            report(V2AppendProgress::ReadingSpool {
+                                bytes_read,
+                                total_bytes,
+                            });
+                        }
+                        last_reported = bytes_read;
+                    }
+                    Some(serde_json::from_str::<Value>(&line).map_err(|source| {
+                        V2StoreError::Json {
+                            path: spool_path.clone(),
+                            source,
+                        }
+                    }))
+                }
+                Err(source) => Some(Err(io_error("read batch item spool", &spool_path, source))),
+            }
         });
         self.append_batch_iter(
             operation_kind,
@@ -2107,6 +2302,24 @@ impl V2OriginStore {
                 "batch context and defaults must be JSON objects".to_owned(),
             ));
         }
+        let (lock, lock_path) = self.acquire_append_lock()?;
+        let result = self.append_batch_locked(
+            operation_kind,
+            item_schema_version,
+            context,
+            defaults,
+            items,
+        );
+        let unlock = FileExt::unlock(&lock)
+            .map_err(|source| io_error("unlock canonical append", &lock_path, source));
+        match (result, unlock) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(())) => Ok(result),
+        }
+    }
+
+    fn acquire_append_lock(&self) -> Result<(File, PathBuf)> {
         let local = self.root.parent().ok_or_else(|| {
             V2StoreError::Invalid("canonical event tree has no Archive parent".to_owned())
         })?;
@@ -2124,20 +2337,7 @@ impl V2OriginStore {
             .map_err(|source| io_error("open append lock", &lock_path, source))?;
         lock.lock_exclusive()
             .map_err(|source| io_error("lock canonical append", &lock_path, source))?;
-        let result = self.append_batch_locked(
-            operation_kind,
-            item_schema_version,
-            context,
-            defaults,
-            items,
-        );
-        let unlock = FileExt::unlock(&lock)
-            .map_err(|source| io_error("unlock canonical append", &lock_path, source));
-        match (result, unlock) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(result), Ok(())) => Ok(result),
-        }
+        Ok((lock, lock_path))
     }
 
     fn append_batch_locked<I>(
@@ -2152,6 +2352,7 @@ impl V2OriginStore {
         I: Iterator<Item = Result<Value>>,
     {
         validate_item_defaults(item_schema_version, &defaults)?;
+        self.recover_pending_publication_locked()?;
         let origin_id = self.active_origin_id()?;
         let genesis_path = self.root.join("genesis.json");
         let genesis: SignedGenesis = parse_json(&genesis_path, &read_file(&genesis_path)?)?;
@@ -2207,12 +2408,11 @@ impl V2OriginStore {
         fs::create_dir_all(segment_parent).map_err(|source| {
             io_error("create origin segment directory", segment_parent, source)
         })?;
-        if segment_path.exists() {
-            return Err(V2StoreError::Invalid(format!(
-                "immutable segment already exists: {}",
-                segment_path.display()
-            )));
-        }
+        let recovered_append = self.recover_unpublished_append(
+            &origin_id,
+            first_seq,
+            &verified.accepted_frontier_hash,
+        )?;
         let segment_temp = segment_parent.join(format!(".segment-{}.tmp", lower_ulid()));
         let mut segment_temp_guard = RemoveOnDrop::new(segment_temp.clone());
         let mut segment_file = OpenOptions::new()
@@ -2486,6 +2686,7 @@ impl V2OriginStore {
             segment_manifest_hash: manifest_hash,
             accepted_frontier_hash,
             git_commit,
+            recovered_append,
         })
     }
 
@@ -4081,6 +4282,10 @@ fn commit_canonical_tree(root: &Path, operation_kind: &str) -> Result<String> {
         "stage canonical mutation",
         &["add", "--", "events", "manifests", "frontiers"],
     )?;
+    commit_staged_canonical_tree(root, operation_kind)
+}
+
+fn commit_staged_canonical_tree(root: &Path, operation_kind: &str) -> Result<String> {
     let message = format!("Archive Ledger: {operation_kind}");
     let output = managed_git_command()
         .arg("-C")
@@ -5330,14 +5535,66 @@ mod tests {
         let spool = temp.path().join("items.jsonl");
         let mut spool_file = File::create(&spool).unwrap();
         for index in 0..10_001_u64 {
-            writeln!(spool_file, "{{\"index\":{index},\"kind\":\"test_fact\"}}").unwrap();
+            // Exercise LF, CRLF, and an unterminated final line.
+            let delimiter = if index == 10_000 {
+                ""
+            } else if index % 2 == 0 {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            write!(
+                spool_file,
+                "{{\"index\":{index},\"kind\":\"test_fact\"}}{delimiter}"
+            )
+            .unwrap();
         }
         spool_file.sync_all().unwrap();
 
         let store = V2OriginStore::open(root.join("canonical")).unwrap();
+        let mut progress = Vec::new();
         let appended = store
-            .append_jsonl_batch("stream_test", 1, json!({}), json!({}), &spool)
+            .append_jsonl_batch_with_progress(
+                "stream_test",
+                1,
+                json!({}),
+                json!({}),
+                &spool,
+                Some(&mut |event| progress.push(event)),
+            )
             .unwrap();
+        let total_bytes = fs::metadata(&spool).unwrap().len();
+        assert_eq!(progress.first(), Some(&V2AppendProgress::Verifying));
+        assert_eq!(
+            progress[1],
+            V2AppendProgress::ReadingSpool {
+                bytes_read: 0,
+                total_bytes
+            }
+        );
+        assert_eq!(
+            progress[progress.len() - 2],
+            V2AppendProgress::ReadingSpool {
+                bytes_read: total_bytes,
+                total_bytes
+            }
+        );
+        assert_eq!(progress.last(), Some(&V2AppendProgress::Publishing));
+        let mut previous = 0;
+        for event in &progress[2..progress.len() - 1] {
+            let V2AppendProgress::ReadingSpool {
+                bytes_read,
+                total_bytes: reported_total,
+            } = event
+            else {
+                panic!("unexpected spool phase");
+            };
+            assert_eq!(*reported_total, total_bytes);
+            assert!(*bytes_read > previous);
+            assert!(*bytes_read - previous >= 64 * 1024 || *bytes_read == total_bytes);
+            previous = *bytes_read;
+        }
+        assert!(progress.len() <= (total_bytes / (64 * 1024)) as usize + 4);
 
         assert_eq!(appended.items_written, 10_001);
         assert_eq!(appended.records_written, 13);
@@ -5358,6 +5615,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn invalid_spool_never_reports_publication_or_advances_history() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("archive");
+        initialize_v2_archive(&root, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(root.join("canonical")).unwrap();
+        let before = store.canonical_commit().unwrap();
+        let spool = temp.path().join("items.jsonl");
+        fs::write(&spool, "{invalid json}\n").unwrap();
+        let mut progress = Vec::new();
+        assert!(store
+            .append_jsonl_batch_with_progress(
+                "stream_test",
+                1,
+                json!({}),
+                json!({}),
+                &spool,
+                Some(&mut |event| progress.push(event)),
+            )
+            .is_err());
+        assert_eq!(progress.first(), Some(&V2AppendProgress::Verifying));
+        assert!(!progress.contains(&V2AppendProgress::Publishing));
+        assert_eq!(store.canonical_commit().unwrap(), before);
     }
 
     #[test]
