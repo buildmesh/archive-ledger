@@ -153,6 +153,14 @@ other options: it takes the original repository, Collection, Location, and setti
 A resumed import repeats the repository metadata checks, which can take a while on a large
 repository, then continues from its last checkpoint.
 
+If an import stops during catalog projection, its events are already saved. Keep
+the Archive directory, SQLite sidecars, and local job files intact. Resume replays
+the saved events, recognizes committed records, and retries the interrupted
+transaction group. This also works for imports interrupted on an earlier version.
+Projection progress advances in groups of up to 64 canonical records, each of
+which can contain many files; the counter is not a file count. `job resume` uses
+incremental replay, not `db rebuild`.
+
 Do not re-run `collection init --import-annex` or `location import-annex` to continue. While the
 import is unfinished they refuse and name the job, and `--reimport` does not bypass it. A
 `location scan` prints its job ID when it starts. A new scan of the same Location is refused

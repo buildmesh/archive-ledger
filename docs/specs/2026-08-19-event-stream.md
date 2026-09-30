@@ -505,6 +505,14 @@ batch completions have projected. A failure leaves every affected cursor before
 the failing transaction. Neither normal apply nor synchronization reconstructs
 the complete database or copies rows from another database.
 
+Incremental apply and rebuild share a replay engine that streams up to 64 canonical
+records per transaction, uses a 64 MiB SQLite page-cache target, and reuses annex
+projection statements. Records are decoded one at a time; the cache target is
+not a process-memory limit. Incremental apply keeps every index and preserves
+normal journaling and synchronization. Progress advances after a group commits;
+interruption rolls back only the current group. Resume recognizes already committed
+records, including chunks committed individually by earlier versions.
+
 The projector classifies every supported batch operation/item kind through one
 versioned, exhaustive policy-input table. Collection, site, device,
 mount/check-in, archive-root, location, risk-domain/assignment, policy,
@@ -522,14 +530,12 @@ streams canonical history in bounded sequential passes, verifies the final
 cursor, and atomically installs the replacement. It does not delete the only
 usable database before the replacement succeeds.
 
-New-database reconstruction streams up to 64 canonical records per transaction
-with a 64 MiB SQLite page-cache target and reusable statements on the annex
-projection path. The cache target is not a process-memory limit. Primary-key,
-uniqueness, and replay lookup indexes remain active; selected reporting indexes
-are built after replay, before integrity and foreign-key validation. Normal
-rollback journaling and synchronization remain enabled. These are rebuild
-defaults, not user configuration flags; incremental apply retains its bounded
-per-record transactions.
+New-database reconstruction uses the same bounded replay settings as incremental
+apply. Primary-key, uniqueness, and replay lookup indexes remain active; selected
+reporting indexes are built after replay, before integrity and foreign-key validation. Normal
+rollback journaling and synchronization remain enabled. These are internal
+defaults, not user configuration flags. Index deferral applies only to a replacement
+database, never to incremental replay of a live projection.
 
 An unfinished database keeps SQLite's `user_version` at zero. The supported
 schema version is written only after reconstruction, index creation, and final
