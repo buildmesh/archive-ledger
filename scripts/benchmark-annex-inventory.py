@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure disposable, distinct-key annex inventory imports and canonical rebuilds.
+"""Measure disposable, distinct-key annex imports and canonical rebuilds.
 
 Linux /proc measurements cover the CLI process, with separate live process-tree
 memory peaks. No git-annex installation or real archive/content is needed. Results
@@ -231,7 +231,7 @@ def assert_equivalent_databases(reference, target, *, ignore_local_state=False):
         connection.close()
 
 
-def fixture(stage, size, env, timeout):
+def fixture(stage, size, env, timeout, full_content=False):
     repo = stage / "annex-repo"
     repo.mkdir()
     for index, args in enumerate([["init", "-b", "main"], ["config", "user.name", "Benchmark"],
@@ -246,8 +246,13 @@ def fixture(stage, size, env, timeout):
         directory = repo / f"files-{index // 1000:04}"
         if index % 1000 == 0:
             directory.mkdir()
-        digest = hashlib.sha256(f"benchmark-{index}".encode()).hexdigest()
+        content = f"benchmark-{index}".encode().ljust(1024, b"\0")
+        digest = hashlib.sha256(content if full_content else f"benchmark-{index}".encode()).hexdigest()
         key = f"SHA256E-s1024--{digest}.dat"
+        if full_content:
+            object_path = repo / ".git/annex/objects/aa/bb" / key / key
+            object_path.parent.mkdir(parents=True)
+            object_path.write_bytes(content)
         (directory / f"file-{index:08}.dat").symlink_to(f"../.git/annex/objects/aa/bb/{key}/{key}")
     for label, args in [("git-add", ["add", "."]), ("git-commit", ["commit", "-m", "Disposable annex fixture"])]:
         run_command(["git", "-C", repo, *args], stage, label, env, timeout)
@@ -258,23 +263,26 @@ def benchmark(args, size):
     stage = args.work_dir / f"annex-{size}"
     stage.mkdir()  # Exclusive: never reuse or overwrite an existing workload.
     print(f"{stage.name}: creating {size} disposable annex references", file=sys.stderr, flush=True)
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ARCHIVE_")}
     env.update(XDG_DATA_HOME=str(stage / "data"), XDG_CONFIG_HOME=str(stage / "config"),
                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
     start = time.monotonic()
-    repo = fixture(stage, size, env, args.timeout)
+    repo = fixture(stage, size, env, args.timeout, args.full_content)
     fixture_seconds = time.monotonic() - start
     run_command([args.binary, "init", "Benchmark", "--archive-id", "arc_benchmark", "--non-interactive"],
                 stage, "archive-init", env, args.timeout)
     archive = stage / "data/archive-ledger/archives/arc_benchmark"
-    imported = run_command([args.binary, "--json", "collection", "init", repo, "--name", "Files",
+    import_command = [args.binary, "--json", "collection", "init", repo, "--name", "Files",
                             "--device", "Fixture", "--site", "Fixture", "--allow-unidentified-root",
-                            "--non-interactive", "--import-annex", "--inventory-only", "--job-id", "job_benchmark"],
+                            "--non-interactive", "--import-annex", "--job-id", "job_benchmark"]
+    if not args.full_content:
+        import_command.append("--inventory-only")
+    imported = run_command(import_command,
                            stage, "import", env, args.timeout, archive)
     before = database_state(archive / "archive.db")
     assert before["counts"]["external_identities"] == size, before["counts"]
     assert before["counts"]["file_refs"] == size, before["counts"]
-    assert before["counts"]["objects"] == before["counts"]["verification_results"] == 0, before["counts"]
+    assert before["counts"]["objects"] == before["counts"]["verification_results"] == (size if args.full_content else 0), before["counts"]
     # A SQLite backup also handles a future WAL import without losing sidecars.
     reference = stage / "before-rebuild.db"
     source_connection = connect_readonly(archive / "archive.db")
@@ -304,7 +312,7 @@ def benchmark(args, size):
     if "publication_done_seconds" in boundaries:
         phases["publication_seconds"] = boundaries["publication_done_seconds"] - boundaries["spool_ready_seconds"]
         phases["projection_and_finalization_seconds"] = imported["seconds"] - boundaries["publication_done_seconds"]
-    result = {"size": size, "stage": str(stage), "fixture_seconds": fixture_seconds,
+    result = {"size": size, "full_content": args.full_content, "stage": str(stage), "fixture_seconds": fixture_seconds,
               "import_seconds": imported["seconds"], "rebuild_seconds": rebuilt["seconds"], "approximate_import_phases": phases,
               "baseline_rebuild_seconds": baseline["seconds"] if baseline else None,
               "baseline_rebuild_peaks": baseline["root_process_peaks"] if baseline else None,
@@ -339,7 +347,7 @@ def compare_cache(args):
     work = args.work_dir / f"cache-{size}"
     work.mkdir()  # Refuse reuse: every variant starts from the same pristine base.
     canonical = work / "canonical"
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ARCHIVE_")}
     env.update(XDG_DATA_HOME=str(work / "data"), XDG_CONFIG_HOME=str(work / "config"),
                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
     run_command(["git", "clone", "--quiet", "--no-hardlinks", "--", source, canonical],
@@ -394,6 +402,7 @@ def compare_cache(args):
                   "measurement_notes": [
                       "Each variant applies the same import onto a copy of the projection rebuilt at HEAD^.",
                       "default_cache_size is a deprecated persistent diagnostic technique, not a production configuration recommendation.",
+                      "An explicit application cache_size overrides default_cache_size; current replay uses 64 MiB, so these variants do not vary its effective cache.",
                       "All observer connections retain default FULL synchronous=2; synchronous is connection-local, not a persistent DB setting.",
                       "Fresh application connections use their normal synchronization policy; this experiment does not weaken durability.",
                       "Sequential warm-cache measurements include a final default repeat to expose order-related timing variation."]}
@@ -413,6 +422,8 @@ def main():
     mode.add_argument("--compare-cache-at", type=int, metavar="N",
                       help="Compare replay cache/journal variants using existing work-dir/annex-N artifacts")
     parser.add_argument("--timeout", type=float, default=600, help="Timeout seconds per command")
+    parser.add_argument("--full-content", action="store_true",
+                        help="Create valid 1024-byte annex contents and verify them during collection init")
     args = parser.parse_args()
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must be an absolute path to an existing executable")
