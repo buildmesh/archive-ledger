@@ -10,7 +10,10 @@ use crate::frontier::{FRONTIER_VERSION, INITIAL_ITEM_PROJECTION_VERSION};
 use crate::v2_event::V2_RECORD_VERSION;
 
 pub const GENESIS_VERSION: u32 = 2;
+/// Schema identifier in signed canonical genesis documents; independent of SQLite storage.
 pub const V2_SCHEMA_VERSION: u32 = 6;
+/// Current local SQLite projection format, rebuilt from unchanged canonical history.
+pub const V2_SQLITE_SCHEMA_VERSION: u32 = 7;
 
 pub type Result<T> = std::result::Result<T, GenesisError>;
 
@@ -173,6 +176,23 @@ mod tests {
             genesis.genesis_hash().unwrap(),
             "blake3:e54929326fdac82c9c547ff8d17dba898c074d3ebf5e61725f54b09e3d55c786"
         );
+    }
+
+    #[test]
+    fn sqlite_schema_upgrade_still_accepts_signed_schema_six_genesis() {
+        let (key, mut genesis) = fixture();
+        // Sign the historical body directly so this does not depend on the
+        // schema selected by GenesisBody::new or SignedGenesis::create.
+        genesis.body.schema_v = 6;
+        genesis.signature = STANDARD_NO_PAD.encode(
+            key.sign(&serde_json::to_vec(&genesis.body).unwrap())
+                .to_bytes(),
+        );
+        let original = serde_json::to_vec(&genesis).unwrap();
+        let loaded: SignedGenesis = serde_json::from_slice(&original).unwrap();
+        loaded.verify().unwrap();
+        assert_eq!(loaded.canonical_bytes().unwrap(), original);
+        assert!(V2_SQLITE_SCHEMA_VERSION > loaded.body.schema_v);
     }
 
     #[test]

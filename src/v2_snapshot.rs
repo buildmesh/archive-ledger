@@ -10,7 +10,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use ulid::Ulid;
 
-use crate::genesis::V2_SCHEMA_VERSION;
+use crate::genesis::V2_SQLITE_SCHEMA_VERSION;
 use crate::safe_copy::place_directory_no_replace;
 use crate::v2_projection::{Result, V2ProjectionDb, V2ProjectionError};
 use crate::v2_store::{
@@ -165,7 +165,8 @@ pub fn inspect_portable_snapshot(
     let bytes = fs::read(&manifest_path).map_err(|source| io_error(&manifest_path, source))?;
     let signed: SignedPortableSnapshotManifest = serde_json::from_slice(&bytes)?;
     store.verify_portable_snapshot_manifest(&signed)?;
-    if signed.body.schema_version != V2_SCHEMA_VERSION || signed.body.projector_version == 0 {
+    if signed.body.schema_version != V2_SQLITE_SCHEMA_VERSION || signed.body.projector_version == 0
+    {
         return Err(V2ProjectionError::Invalid(format!(
             "portable snapshot uses unsupported schema/projector version {}/{}",
             signed.body.schema_version, signed.body.projector_version
@@ -420,5 +421,38 @@ mod tests {
         let target = temp.path().join("clone/archive.db");
         assert!(install_portable_snapshot(&store, &artifact, &target).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn snapshot_rejects_signed_schema_six_manifest_without_installing() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("source");
+        initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let database_path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &database_path).unwrap();
+        let database = V2ProjectionDb::open_existing(&database_path).unwrap();
+        let artifact = temp.path().join("portable");
+        create_portable_snapshot(&database, &store, &artifact).unwrap();
+        let manifest_path = artifact.join(SNAPSHOT_MANIFEST_FILE);
+        let signed: SignedPortableSnapshotManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let mut old_body = signed.body;
+        old_body.schema_version = 6;
+        let signed = store.sign_portable_snapshot_manifest(old_body).unwrap();
+        store.verify_portable_snapshot_manifest(&signed).unwrap();
+        fs::write(&manifest_path, serde_json::to_vec(&signed).unwrap()).unwrap();
+
+        let original_database = fs::read(artifact.join(SNAPSHOT_DATABASE_FILE)).unwrap();
+        let target = temp.path().join("clone/archive.db");
+        let error = install_portable_snapshot(&store, &artifact, &target).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported schema/projector version 6/"));
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read(artifact.join(SNAPSHOT_DATABASE_FILE)).unwrap(),
+            original_database
+        );
     }
 }

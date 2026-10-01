@@ -1669,6 +1669,23 @@ struct KnownAnnexEntry {
 /// the File's expected content. Such a file needs no read: its presence is
 /// refreshed when a complete scan finishes, and integrity belongs to verify.
 /// A missing mtime, a corrupt or unknown Copy, or any other doubt means read it.
+const COPY_UNCHANGED_SQL: &str = "SELECT EXISTS(
+               SELECT 1 FROM file_objects f
+               JOIN file_locations p ON p.file_id=f.id
+               JOIN copy_bindings c ON c.content_id=f.content_id AND c.state='present'
+                 AND c.location_id=p.location_id
+               JOIN checks v ON v.id=c.latest_integrity AND v.integrity=1
+               JOIN file_locations owner ON owner.id=c.owner
+               JOIN file_objects physical ON physical.id=owner.file_id
+               WHERE f.collection_id=(SELECT id FROM collections WHERE collection_id=?6)
+                 AND f.active=1 AND f.path_encoding=?2 AND f.path_bytes=?3
+                 AND p.location_id=(SELECT id FROM locations WHERE location_id=?1)
+                 AND p.presence=1 AND p.observed_size=?4 AND p.modified_time=?5
+                 AND f.content_id IS NOT NULL AND p.content_id=f.content_id
+                 AND ((COALESCE(c.locator_encoding,physical.path_encoding)=f.path_encoding
+                       AND COALESCE(c.locator_bytes,physical.path_bytes)=f.path_bytes)
+                   OR (p.representation='annex_locked_symlink' AND c.external_id=p.external_id)))";
+
 fn copy_unchanged(
     connection: &Connection,
     database: &Path,
@@ -1686,20 +1703,7 @@ fn copy_unchanged(
     };
     connection
         .query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM path_observations p
-               JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-               JOIN copy_claims c ON c.object_id = f.object_id AND c.state = 'present'
-                 AND c.location_id = p.location_id AND c.last_verification_result = 'ok'
-                 AND ((c.relative_path_encoding = p.observed_path_encoding
-                       AND c.relative_path_bytes = p.observed_path_bytes)
-                   OR (p.representation = 'annex_locked_symlink'
-                       AND c.external_identity_id = p.external_identity_id))
-               WHERE p.location_id = ?1 AND p.observed_path_encoding = ?2
-                 AND p.observed_path_bytes = ?3 AND p.state = 'present'
-                 AND p.observed_size_bytes = ?4 AND p.modified_time_utc_ms = ?5
-                 AND f.collection_id = ?6 AND f.path_state = 'active'
-                 AND f.object_id IS NOT NULL AND p.object_id = f.object_id)",
+            COPY_UNCHANGED_SQL,
             params![
                 location_id,
                 path.encoding.as_str(),
@@ -1713,6 +1717,29 @@ fn copy_unchanged(
         .map_err(|source| inventory_sqlite_error(database, source))
 }
 
+const KNOWN_ANNEX_ENTRY_SQL: &str = "SELECT p.representation, f.canonical_id, e.canonical_id,
+                    CASE WHEN h.digest IS NOT NULL THEN lower(hex(h.digest)) END,
+                    e.expected_size, content.object_id, c.canonical_id,
+                    COALESCE(c.locator_encoding,physical.path_encoding),
+                    COALESCE(c.locator_bytes,physical.path_bytes),
+                    CASE WHEN c.locator_bytes IS NOT NULL
+                      THEN COALESCE(c.locator_display,CAST(c.locator_bytes AS TEXT))
+                      ELSE COALESCE(physical.path_display,CAST(physical.path_bytes AS TEXT)) END,
+                    h.algorithm, e.source_key
+             FROM file_objects f
+             JOIN file_locations p ON p.file_id=f.id
+             JOIN source_identities e ON e.id=f.external_id
+             LEFT JOIN checksums h ON h.id=e.expected_checksum
+             LEFT JOIN content_objects content ON content.id=e.content_id
+             LEFT JOIN copy_bindings c ON c.external_id=e.id
+               AND c.location_id=p.location_id AND c.state!='superseded'
+             LEFT JOIN file_locations owner ON owner.id=c.owner
+             LEFT JOIN file_objects physical ON physical.id=owner.file_id
+             WHERE f.collection_id=(SELECT id FROM collections WHERE collection_id=?1)
+               AND p.location_id=(SELECT id FROM locations WHERE location_id=?2)
+               AND f.path_encoding=?3 AND f.path_bytes=?4 AND f.active=1
+             ORDER BY c.canonical_id LIMIT 1";
+
 fn known_annex_entry(
     connection: &Connection,
     database: &Path,
@@ -1722,19 +1749,7 @@ fn known_annex_entry(
 ) -> Result<Option<KnownAnnexEntry>> {
     let row = connection
         .query_row(
-            "SELECT p.representation, f.file_ref_id, e.external_identity_id,
-                    e.expected_hash_hex, e.expected_size_bytes, e.object_id,
-                    c.copy_claim_id, c.relative_path_encoding, c.relative_path_bytes,
-                    c.relative_path_display, e.expected_hash_algo, e.external_key
-             FROM file_refs f
-             JOIN path_observations p ON p.file_ref_id = f.file_ref_id
-             JOIN external_identities e ON e.external_identity_id = f.external_identity_id
-             LEFT JOIN copy_claims c ON c.external_identity_id = e.external_identity_id
-               AND c.location_id = ?2 AND c.state != 'superseded'
-             WHERE f.collection_id = ?1 AND p.location_id = ?2
-               AND f.logical_path_encoding = ?3 AND f.logical_path_bytes = ?4
-               AND f.path_state = 'active'
-             ORDER BY c.copy_claim_id LIMIT 1",
+            KNOWN_ANNEX_ENTRY_SQL,
             params![
                 collection_id,
                 location_id,

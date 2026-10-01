@@ -34,6 +34,105 @@ mod unix {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
+    fn compact_checks(temp: &TempDir) -> Vec<(i64, i64, i64, i64, i64)> {
+        rusqlite::Connection::open(root(temp).join("archive.db"))
+            .unwrap()
+            .prepare("SELECT id, file_location_id, checked_at, presence, integrity FROM checks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    // Presence and integrity can initially share one check. Split the fixture's
+    // selected pointer so aging one clock does not accidentally age the other.
+    fn age_copy_checks(
+        database: &rusqlite::Connection,
+        path: Option<&str>,
+        seen: Option<i64>,
+        verified: Option<i64>,
+    ) {
+        let copies = database
+            .prepare("SELECT b.id FROM copy_bindings b JOIN copy_claims c ON c.copy_claim_id = b.canonical_id WHERE ?1 IS NULL OR c.relative_path_display = ?1")
+            .unwrap()
+            .query_map([path], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!copies.is_empty());
+        for copy in copies {
+            for (pointer, time) in [("latest_presence", seen), ("latest_integrity", verified)] {
+                if let Some(time) = time {
+                    assert_eq!(database.execute(
+                        &format!("INSERT INTO checks(file_location_id, checked_at, presence, integrity) SELECT c.file_location_id, ?2, c.presence, c.integrity FROM checks c JOIN copy_bindings b ON c.id = b.{pointer} WHERE b.id = ?1"),
+                        rusqlite::params![copy, time],
+                    ).unwrap(), 1);
+                    database
+                        .execute(
+                            &format!("UPDATE copy_bindings SET {pointer} = ?2 WHERE id = ?1"),
+                            rusqlite::params![copy, database.last_insert_rowid()],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    // Detailed hash evidence remains canonical; compact checks retain only the
+    // outcome. Inspect authenticated items to keep the algorithm/hash regression.
+    fn canonical_hash_results(
+        temp: &TempDir,
+        algorithm: &str,
+        result: &str,
+        object: Option<&str>,
+    ) -> usize {
+        let store = archive_ledger::V2OriginStore::open(root(temp).join("canonical")).unwrap();
+        let mut defaults = std::collections::BTreeMap::<String, Value>::new();
+        let mut count = 0;
+        store
+            .visit_verified(|record| {
+                let envelope = &record.record.envelope;
+                let payload = &envelope.payload;
+                if let Some(value) = payload.get("defaults") {
+                    defaults.insert(envelope.batch_id.clone(), value.clone());
+                }
+                if let Some(items) = payload.get("items").and_then(Value::as_array) {
+                    for raw in items {
+                        let mut item = defaults
+                            .get(&envelope.batch_id)
+                            .and_then(|value| value.get(raw["kind"].as_str().unwrap()))
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default();
+                        item.extend(raw.as_object().unwrap().clone());
+                        let item = Value::Object(item);
+                        let observed_result = item
+                            .get("verification_result")
+                            .or_else(|| item.get("result"));
+                        if item["expected_hash_algo"] != algorithm
+                            || observed_result.and_then(Value::as_str) != Some(result)
+                            || object.is_some_and(|object| item["object_id"] != object)
+                        {
+                            continue;
+                        }
+                        let expected = item["expected_hash_hex"].as_str().unwrap();
+                        let observed = item
+                            .get("observed_hash_hex")
+                            .or_else(|| item.get(format!("{algorithm}_hex")))
+                            .and_then(Value::as_str)
+                            .unwrap();
+                        assert_eq!(observed.len(), if algorithm == "sha512" { 128 } else { 64 });
+                        assert_eq!(expected == observed, result == "ok");
+                        count += 1;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        count
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_guide_does_not_use_the_callers_selected_archive() {
@@ -364,7 +463,7 @@ mod unix {
         assert_eq!(initialized["archive_name"], "Personal");
 
         let before = json(&success(archive(&temp).args(["--json", "status"])));
-        assert_eq!(before["schema_version"], 6);
+        assert_eq!(before["schema_version"], 7);
         assert_eq!(before["event_tree_version"], 2);
         assert_eq!(before["records"], 3);
         assert_eq!(before["collections"], serde_json::json!([]));
@@ -468,6 +567,54 @@ mod unix {
         fs::remove_file(root(&temp).join("archive.db")).unwrap();
         let still_listed = json(&success(archive(&temp).args(["--json", "list"])));
         assert_eq!(still_listed["archives"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn older_schema_projection_can_be_rebuilt_through_archive_path() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let archive_root = root(&temp);
+        let database = archive_root.join("archive.db");
+        // This tests dispatch around an unsupported projection header. Rebuild
+        // derives its contents from canonical history, not the old table layout.
+        rusqlite::Connection::open(&database).unwrap().execute_batch(
+            "PRAGMA user_version = 6; UPDATE archive_meta SET value = '6' WHERE key = 'schema_version';",
+        ).unwrap();
+        let previous = fs::read(&database).unwrap();
+        let genesis_path = archive_root.join("canonical/genesis.json");
+        let genesis = fs::read(&genesis_path).unwrap();
+        let refused = archive(&temp)
+            .arg("--archive")
+            .arg(&archive_root)
+            .args(["collection", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("db rebuild"));
+        assert!(!String::from_utf8_lossy(&refused.stderr).contains("pre-v2"));
+        let rebuilt = json(&success(
+            archive(&temp)
+                .arg("--archive")
+                .arg(&archive_root)
+                .args(["--json", "db", "rebuild"]),
+        ));
+        let retained = rebuilt["previous_database"].as_str().unwrap();
+        assert_eq!(fs::read(retained).unwrap(), previous);
+        assert_eq!(fs::read(genesis_path).unwrap(), genesis);
+        let current = json(&success(
+            archive(&temp)
+                .arg("--archive")
+                .arg(&archive_root)
+                .args(["--json", "status"]),
+        ));
+        assert_eq!(current["schema_version"], 7);
+        assert_eq!(current["records"], 3);
     }
 
     #[test]
@@ -911,7 +1058,7 @@ mod unix {
         assert_eq!(
             replica_database
                 .query_row(
-                    "SELECT COUNT(*) FROM verification_results WHERE result = 'ok'",
+                    "SELECT COUNT(*) FROM checks WHERE integrity = 1",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -1908,19 +2055,15 @@ mod unix {
                 .unwrap()
         };
         let age = |seen: i64, verified: i64| {
-            rusqlite::Connection::open(&database_path)
-                .unwrap()
-                .execute(
-                    "UPDATE copy_claims SET last_seen_time_utc_ms = ?1, last_verified_time_utc_ms = ?2",
-                    rusqlite::params![seen, verified],
-                )
-                .unwrap();
+            let database = rusqlite::Connection::open(&database_path).unwrap();
+            age_copy_checks(&database, None, Some(seen), Some(verified));
         };
         // An unreadable but unchanged file proves the scan does not read it.
         let locked = content.join("b.txt");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
         age(1_000, 2_000);
+        let original_checks = compact_checks(&temp);
         let added = json(&success(archive(&temp).args([
             "--json",
             "collection",
@@ -1931,6 +2074,11 @@ mod unix {
         ])));
         assert_eq!(added["summary"]["unchanged_files"], 3);
         assert_eq!(added["summary"]["read_errors"], 0);
+        assert_eq!(
+            compact_checks(&temp),
+            original_checks,
+            "add does not invent a check for an unchanged file"
+        );
         assert_eq!(
             times("a.txt"),
             (1_000, 2_000),
@@ -1959,6 +2107,15 @@ mod unix {
         let (seen, verified) = times("a.txt");
         assert!(seen > 1_000, "a complete scan refreshes presence");
         assert_eq!(verified, 2_000, "only reading bytes refreshes verification");
+        let presence_checks = compact_checks(&temp);
+        assert_eq!(&presence_checks[..original_checks.len()], &original_checks);
+        assert_eq!(presence_checks.len(), original_checks.len() + 3);
+        assert!(
+            presence_checks[original_checks.len()..]
+                .iter()
+                .all(|check| check.3 == 1 && check.4 == 0),
+            "complete coverage appends presence-only checks"
+        );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
 
         // Human output names the next step; replay reproduces the refreshed presence.
@@ -2042,10 +2199,12 @@ mod unix {
                 .clone();
             (fs::read(&database_path).unwrap(), records)
         };
-        rusqlite::Connection::open(&database_path)
-            .unwrap()
-            .execute("UPDATE copy_claims SET last_seen_time_utc_ms = 1000 WHERE relative_path_display = 'c.txt'", [])
-            .unwrap();
+        age_copy_checks(
+            &rusqlite::Connection::open(&database_path).unwrap(),
+            Some("c.txt"),
+            Some(1000),
+            None,
+        );
         for index in 0..25 {
             fs::write(content.join(format!("new-{index:02}.txt")), b"n").unwrap();
         }
@@ -2589,13 +2748,20 @@ mod unix {
             "file_refs",
             "path_observations",
             "copy_claims",
-            "verification_results",
+            "file_checks",
             "objects",
         ]
         .into_iter()
         .map(|table| {
+            // Logical views exclude locally allocated integer identities.
+            let query = format!("SELECT * FROM {table}");
+            let columns = database.prepare(&query).unwrap().column_count();
+            let ordering = (1..=columns)
+                .map(|column| column.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             let mut statement = database
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2, 3"))
+                .prepare(&format!("{query} ORDER BY {ordering}"))
                 .unwrap();
             let columns = statement.column_count();
             statement
@@ -2631,6 +2797,7 @@ mod unix {
     fn immutable_scan_reports_corruption_preserves_identity_and_recovers_restored_bytes() {
         let (temp, content) = immutable_files_fixture();
         let expected = immutable_file_object(&temp, "a.txt");
+        let original_checks = compact_checks(&temp);
         fs::write(content.join("a.txt"), b"different and longer contents").unwrap();
         // A metadata-only change must still confirm the same content identity.
         fs::File::options()
@@ -2666,6 +2833,15 @@ mod unix {
         // b.txt changed only its mtime, so it is re-read; c.txt is unchanged and skipped.
         assert_eq!(summary["confirmed_good"], 1);
         assert_eq!(summary["unchanged_files"], 1);
+        let checked = compact_checks(&temp);
+        assert_eq!(
+            &checked[..original_checks.len()],
+            &original_checks,
+            "new observations never overwrite prior checks"
+        );
+        let appended = &checked[original_checks.len()..];
+        assert_eq!(appended.iter().filter(|check| check.4 == 1).count(), 1);
+        assert_eq!(appended.iter().filter(|check| check.4 == 2).count(), 1);
         assert_eq!(immutable_file_object(&temp, "a.txt"), expected);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         let corrupt: (String, String, String, Option<String>) = database.query_row(
@@ -2677,12 +2853,28 @@ mod unix {
             (&expected, "corrupt", "hash_mismatch")
         );
         assert!(corrupt.3.is_some());
-        assert_eq!(database.query_row(
-            "SELECT COUNT(*) FROM verification_results WHERE result = 'hash_mismatch' AND object_id = ?1 AND expected_hash_algo = 'blake3' AND expected_hash_hex != observed_hash_hex",
-            [&expected], |row| row.get::<_, i64>(0),
-        ).unwrap(), 1);
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT COUNT(*) FROM checks WHERE integrity = 2",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            canonical_hash_results(&temp, "blake3", "hash_mismatch", Some(&expected)),
+            1
+        );
         drop(database);
         let before = immutable_projection_state(&temp);
+        success(archive(&temp).args(["db", "apply"]));
+        assert_eq!(
+            compact_checks(&temp),
+            checked,
+            "reapplying committed events must not duplicate checks"
+        );
         success(archive(&temp).args(["db", "rebuild"]));
         assert_eq!(immutable_projection_state(&temp), before);
 
@@ -2863,7 +3055,7 @@ mod unix {
         assert_eq!(immutable_file_object(&temp, "c.txt"), original_objects[2]);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         assert_eq!(database.query_row(
-            "SELECT COUNT(*) FROM verification_results WHERE path_observed_display = 'c.txt'", [], |row| row.get::<_, i64>(0),
+            "SELECT COUNT(*) FROM checks c JOIN file_locations p ON p.id = c.file_location_id JOIN file_objects f ON f.id = p.file_id WHERE f.path_encoding = 'utf8' AND f.path_bytes = CAST('c.txt' AS BLOB) AND c.integrity != 0", [], |row| row.get::<_, i64>(0),
         ).unwrap(), 1, "unselected changed file was hashed during acceptance");
         drop(database);
         for name in ["a.txt", "b.txt", "c.txt"] {
@@ -3651,7 +3843,7 @@ mod unix {
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         let counts: (i64, i64, i64) = database
             .query_row(
-                "SELECT (SELECT COUNT(*) FROM file_refs), (SELECT COUNT(*) FROM copy_claims WHERE state = 'present'), (SELECT COUNT(*) FROM verification_results WHERE result = 'ok')",
+                "SELECT (SELECT COUNT(*) FROM file_refs), (SELECT COUNT(*) FROM copy_claims WHERE state = 'present'), (SELECT COUNT(*) FROM checks WHERE integrity = 1)",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -3964,9 +4156,7 @@ mod unix {
         assert!(String::from_utf8_lossy(&root_identity.stderr)
             .contains("identifies a filesystem/Archive Root"));
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
-        database
-            .execute("UPDATE copy_claims SET last_seen_time_utc_ms = 0", [])
-            .unwrap();
+        age_copy_checks(&database, None, Some(0), None);
         drop(database);
         let stale = archive(&temp)
             .args([
@@ -4198,6 +4388,7 @@ mod unix {
 
         // Both the immediate projection and canonical replay must preserve
         // uncertainty rather than treating indexed references as verified bytes.
+        let metadata_state = immutable_projection_state(&temp);
         for rebuild in [false, true] {
             if rebuild {
                 success(archive(&temp).args(["db", "rebuild"]));
@@ -4206,12 +4397,25 @@ mod unix {
             let inventory: (i64, i64, i64, i64, i64) = database.query_row(
                 "SELECT (SELECT COUNT(*) FROM file_refs),
                         (SELECT COUNT(*) FROM objects),
-                        (SELECT COUNT(*) FROM verification_results),
+                        (SELECT COUNT(*) FROM checks WHERE integrity != 0),
                         (SELECT COUNT(*) FROM copy_claims WHERE state = 'unknown' AND claim_basis = 'source_metadata'),
                         (SELECT COUNT(*) FROM external_identities WHERE resolution_state = 'unresolved' AND object_id IS NULL)",
                 [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             ).unwrap();
             assert_eq!(inventory, (5, 0, 0, 4, 4));
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT COUNT(*) FROM copy_bindings WHERE latest_integrity IS NOT NULL",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "metadata inventory must not record an integrity check"
+            );
+            drop(database);
+            assert_eq!(immutable_projection_state(&temp), metadata_state);
         }
 
         // Removing one logical reference must not withdraw the shared CAS
@@ -5075,12 +5279,19 @@ mod unix {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!(absent, ("sha512".to_owned(), digests[2].clone(), None));
-        assert_eq!(database.query_row(
-            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'ok' AND expected_hash_hex = observed_hash_hex", [], |row| row.get::<_, i64>(0)
-        ).unwrap(), 2);
-        assert_eq!(database.query_row(
-            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'hash_mismatch' AND expected_hash_hex != observed_hash_hex AND length(observed_hash_hex) = 128", [], |row| row.get::<_, i64>(0)
-        ).unwrap(), 1);
+        assert_eq!(canonical_hash_results(&temp, "sha512", "ok", None), 2);
+        assert_eq!(
+            canonical_hash_results(&temp, "sha512", "hash_mismatch", None),
+            1
+        );
+        let integrity_counts: (i64, i64) = database
+            .query_row(
+                "SELECT SUM(integrity = 1), SUM(integrity = 2) FROM checks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(integrity_counts, (2, 1));
         drop(database);
 
         // Recovered absent bytes resolve from the recorded SHA512 key. Both
@@ -5103,7 +5314,7 @@ mod unix {
         // Re-import fills checksum metadata missing from an older projection
         // while preserving the same Location and Collection File identities.
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
-        database.execute("UPDATE external_identities SET expected_hash_algo = NULL, expected_hash_hex = NULL, object_id = NULL, resolution_state = 'unresolved' WHERE namespace = 'git-annex'", []).unwrap();
+        database.execute("UPDATE source_identities SET expected_checksum = NULL, content_id = NULL, resolution = 'unresolved' WHERE namespace = 'git-annex'", []).unwrap();
         drop(database);
         let reimported = json(&success(archive(&temp).args([
             "--json",
@@ -5188,12 +5399,24 @@ mod unix {
             ).unwrap(), 1);
         }
         // Scans check the original annex SHA512; verify checks the established BLAKE3 identity.
-        assert_eq!(rebuilt.query_row(
-            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'sha512' AND result = 'hash_mismatch' AND length(observed_hash_hex) = 128 AND expected_hash_hex != observed_hash_hex", [], |row| row.get::<_, i64>(0)
-        ).unwrap(), 3);
-        assert_eq!(rebuilt.query_row(
-            "SELECT COUNT(*) FROM verification_results WHERE expected_hash_algo = 'blake3' AND result = 'hash_mismatch' AND expected_hash_hex != observed_hash_hex", [], |row| row.get::<_, i64>(0)
-        ).unwrap(), 2);
+        assert_eq!(
+            canonical_hash_results(&temp, "sha512", "hash_mismatch", None),
+            3
+        );
+        assert_eq!(
+            canonical_hash_results(&temp, "blake3", "hash_mismatch", None),
+            2
+        );
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT COUNT(*) FROM checks WHERE integrity = 2",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            5
+        );
         // Prove this fixture would trigger the filter under the old snapshot
         // command, rather than merely configuring an unused filter.
         fs::remove_file(repo.join(".git/index")).unwrap();
@@ -6010,13 +6233,8 @@ mod unix {
                 .unwrap()
         };
         let age = |name: &str, time: i64| {
-            rusqlite::Connection::open(&database_path)
-                .unwrap()
-                .execute(
-                    "UPDATE copy_claims SET last_verified_time_utc_ms = ?2 WHERE relative_path_display = ?1",
-                    rusqlite::params![name, time],
-                )
-                .unwrap();
+            let database = rusqlite::Connection::open(&database_path).unwrap();
+            age_copy_checks(&database, Some(name), None, Some(time));
         };
 
         // Freshly added copies are not due.
@@ -6153,9 +6371,7 @@ mod unix {
 
         let database_path = root(&temp).join("archive.db");
         let database = rusqlite::Connection::open(&database_path).unwrap();
-        database
-            .execute("UPDATE copy_claims SET last_seen_time_utc_ms = 0", [])
-            .unwrap();
+        age_copy_checks(&database, None, Some(0), None);
         drop(database);
         let original_one = fs::read(content.join("one.txt")).unwrap();
         let original_two = fs::read(content.join("two.txt")).unwrap();
@@ -6213,12 +6429,7 @@ mod unix {
         assert_eq!(fs::read(content.join("two.txt")).unwrap(), original_two);
 
         let database = rusqlite::Connection::open(&database_path).unwrap();
-        database
-            .execute(
-                "UPDATE copy_claims SET last_seen_time_utc_ms = 0 WHERE relative_path_display = 'one.txt'",
-                [],
-            )
-            .unwrap();
+        age_copy_checks(&database, Some("one.txt"), Some(0), None);
         drop(database);
         success(archive(&temp).args(["device", "identity", "Test Device", "--conflict"]));
         let before_idle = json(&success(
@@ -6257,12 +6468,7 @@ mod unix {
 
         fs::write(content.join("two.txt"), b"tampered\n").unwrap();
         let database = rusqlite::Connection::open(&database_path).unwrap();
-        database
-            .execute(
-                "UPDATE copy_claims SET last_seen_time_utc_ms = 0 WHERE relative_path_display = 'two.txt'",
-                [],
-            )
-            .unwrap();
+        age_copy_checks(&database, Some("two.txt"), Some(0), None);
         drop(database);
         let mismatch = archive(&temp)
             .args(["--json", "background", "run"])
@@ -6530,7 +6736,7 @@ mod unix {
 
         let database = rusqlite::Connection::open(&database_path).unwrap();
         database
-            .execute("UPDATE copy_claims SET state = 'missing'", [])
+            .execute("UPDATE copy_bindings SET state = 'missing'", [])
             .unwrap();
         drop(database);
         let unavailable = json(&success(archive(&temp).args([

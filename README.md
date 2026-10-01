@@ -11,7 +11,7 @@ policy and disaster risks, protects its own catalog history, and can make verifi
 registered Locations. It does not move, delete, repair, or drop archive content.
 
 > Development status: new Archives use the signed version 2 event tree and a
-> rebuildable schema-6 SQLite projection. Setup, inventory, git-annex import,
+> rebuildable compact schema-7 SQLite projection. Setup, inventory, git-annex import,
 > Location scanning and verification, staging, verified copy, resumable jobs,
 > opt-in targeted background verification, status, risk reporting, enrollment,
 > verified Git synchronization, and portable
@@ -892,11 +892,37 @@ Clone verifies the snapshot signature, database checksum, Archive and genesis ID
 commit, frontier, schema, and projector version before use. It applies only the newer event ranges
 in the cloned Git history. If the snapshot is absent or rejected, clone safely rebuilds SQLite from
 canonical events instead. It never stores the SQLite database in the canonical Git repository.
+Schema-6 snapshots are rejected by the current reader and use this canonical-replay fallback.
 
 After cloning, run `archive sync enroll --name <this-computer>`, approve that public request on an
 already enrolled installation, and synchronize both installations before the new one writes. The
 request never contains the private key. To stop a lost installation from making future writes, use
 `archive sync revoke <client-id> --yes`; previously accepted history remains intact.
+
+### Upgrade an existing schema-6 catalog
+
+After installing the new binary, stop commands writing the selected Archive and allow enough
+space for a replacement database alongside the existing one. Rebuild its local SQLite catalog:
+
+```bash
+archive events verify
+archive db rebuild
+archive fsck --full
+```
+
+This creates schema 7 from the existing signed history. The canonical genesis schema remains 6;
+the event tree is unchanged. Rebuild does not re-import an annex repository or rehash archive
+contents. It retains the previous schema database beside `archive.db` as
+`.archive-ledger-previous-<id>.db` and reports its exact path (`previous_database` in JSON).
+Keep that backup and any accompanying SQLite sidecars until you have checked the rebuilt catalog
+and recovered any unfinished work. Rebuilding an already-current schema does not retain this
+additional backup.
+
+Local job checkpoints remain under `local/jobs/`. Resume unfinished work with
+`archive job resume <job-id>` after the rebuild; unpublished database job rows can be recreated
+from those local files. Ordinary `db apply` does not upgrade an older schema.
+
+### Check and rebuild the current catalog
 
 Verify history, update SQLite, rebuild a disposable projection, and rehearse recovery:
 
@@ -917,8 +943,8 @@ verifies every signed origin journal and accepted frontier, runs SQLite
 and origin cursors. It does not bring a stale projection current; a finding tells
 you to run `archive db apply` explicitly. `--full` additionally creates a unique
 disposable clone and database at the live projection's captured frontier, checks
-the rebuild's SQLite integrity and foreign keys, compares every classified
-event-derived table, then removes only that tool-owned rebuild. A behind
+the rebuild's SQLite integrity and foreign keys, compares classified control tables and logical
+domain views without database-local integer IDs, then removes only that tool-owned rebuild. A behind
 projection can therefore pass logical comparison through its applied frontier
 while separately telling you to run `archive db apply`. Use `--keep-rebuild` to
 retain the diagnostic database or `--rebuild-dir <directory>` to select a volume

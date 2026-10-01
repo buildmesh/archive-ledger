@@ -21,6 +21,22 @@ import time
 
 
 INTERVAL = 0.1
+COMPACT_TABLES = {
+    "content_objects", "checksums", "content_checksums", "source_identities",
+    "annex_sources", "source_availability", "file_objects", "file_locations",
+    "copy_bindings", "checks", "check_errors",
+}
+LOCAL_METADATA = (
+    "projection_generation", "policy_input_generation", "last_verified_checkpoint_id",
+    "last_verified_checkpoint_frontier_hash",
+)
+# Deliberately omitted by schema 7, rather than silently intersecting columns.
+RETIRED_COLUMNS = {
+    "objects": {"media_type"},
+    "external_identities": {"source_detail_json"},
+    "file_refs": {"created_time_utc_ms"},
+    "copy_claims": {"last_verified_record_id"},
+}
 
 
 def read_text(path):
@@ -192,7 +208,7 @@ def database_state(path):
     connection = connect_readonly(path)
     try:
         tables = [row[0] for row in connection.execute(
-            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            "SELECT name FROM sqlite_schema WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name"
         )]
         counts = {table: connection.execute('SELECT COUNT(*) FROM "' + table.replace('"', '""') + '"').fetchone()[0]
                   for table in tables}
@@ -202,33 +218,73 @@ def database_state(path):
         foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
         if integrity != [("ok",)] or foreign_keys:
             raise RuntimeError(f"Database integrity failed: {integrity!r}, {foreign_keys[:5]!r}")
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if schema_version not in (6, 7):
+            raise RuntimeError(f"Unsupported benchmark projection schema: {schema_version}")
+        integrity_matches = connection.execute(
+            "SELECT COUNT(*) FROM checks WHERE integrity=1" if schema_version == 7
+            else "SELECT COUNT(*) FROM verification_results WHERE result='ok'"
+        ).fetchone()[0]
         return {"counts": counts, "settings_on_observer_connection": settings, "bytes": path.stat().st_size,
+                "schema_version": schema_version, "integrity_matches": integrity_matches,
                 "integrity_check": "ok", "foreign_key_check": "ok"}
     finally:
         connection.close()
 
 
-def assert_equivalent_databases(reference, target, *, ignore_local_state=False):
-    """Check exact logical contents, including the schema, outside timed work."""
+def assert_equivalent_databases(reference, target, *, ignore_local_state=False, allow_schema_change=False):
+    """Compare logical row multisets; physical allocation IDs are not canonical facts."""
     expected = database_state(reference)
     actual = database_state(target)
-    # Match v2_fsck's distinction between canonical facts and local job caches.
-    tables = [table for table in actual["counts"]
-              if not ignore_local_state or table not in ("jobs", "job_items")]
-    assert actual["counts"].keys() == expected["counts"].keys(), "Table names differ"
+    cross_schema = actual["schema_version"] != expected["schema_version"]
+    if cross_schema:
+        assert allow_schema_change, "Different schemas require --compare-baseline-core-facts"
+        assert {actual["schema_version"], expected["schema_version"]} == {6, 7}, "Unsupported schema comparison"
+    excluded = set(COMPACT_TABLES)
+    if ignore_local_state or cross_schema:
+        excluded.update(("jobs", "job_items"))
+    if cross_schema:
+        excluded.update(("verification_results", "file_checks"))
+    tables = sorted(set(actual["counts"]) - excluded)
+    assert set(tables) == set(expected["counts"]) - excluded, "Logical model names differ"
     assert all(actual["counts"][table] == expected["counts"][table] for table in tables), "Table counts differ"
+    assert actual["integrity_matches"] == expected["integrity_matches"], "Successful integrity-check counts differ"
     connection = connect_readonly(target)
     try:
         connection.execute("ATTACH DATABASE ? AS reference", (reference.as_uri() + "?mode=ro",))
         schema = "SELECT type, name, tbl_name, sql FROM {}.sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-        assert connection.execute(schema.format("main")).fetchall() == connection.execute(schema.format("reference")).fetchall(), "Schema differs"
+        if not cross_schema:
+            assert connection.execute(schema.format("main")).fetchall() == connection.execute(schema.format("reference")).fetchall(), "Schema differs"
         for table in tables:
             quoted = '"' + table.replace('"', '""') + '"'
-            where = " WHERE key NOT IN ('projection_generation', 'policy_input_generation', 'last_verified_checkpoint_id', 'last_verified_checkpoint_frontier_hash')" if table == "archive_meta" and ignore_local_state else ""
+            ignored_columns = {"id"} if table in ("records", "collections", "locations") else set()
+            if table in ("path_observations", "file_checks"):
+                ignored_columns.update(("id", "rowid"))
+            if cross_schema:
+                ignored_columns.update(RETIRED_COLUMNS.get(table, ()))
+            columns = {}
+            for database in ("main", "reference"):
+                columns[database] = [row[1] for row in connection.execute(f"PRAGMA {database}.table_info({quoted})")
+                                     if row[1] not in ignored_columns]
+            assert columns["main"] == columns["reference"], (table, "Logical columns differ")
+            selected = ",".join(
+                "CASE WHEN claim_basis='source_metadata' THEN NULL ELSE last_seen_time_utc_ms END"
+                if cross_schema and table == "copy_claims" and name == "last_seen_time_utc_ms"
+                else '"' + name.replace('"', '""') + '"'
+                for name in columns["main"])
+            # Schema 6 dated an unchecked inventory claim. Schema 7 deliberately
+            # leaves physical presence freshness unknown until an actual check.
+            ignored_metadata = list(LOCAL_METADATA) if ignore_local_state or cross_schema else []
+            if cross_schema:
+                ignored_metadata.append("schema_version")
+            where = " WHERE key NOT IN (" + ",".join("'" + key + "'" for key in ignored_metadata) + ")" if table == "archive_meta" and ignored_metadata else ""
+            # GROUP BY preserves duplicate multiplicities in semantic check history.
+            query = f"SELECT {selected},COUNT(*) FROM {{}}.{quoted}{where} GROUP BY {selected}"
             for left, right in [("main", "reference"), ("reference", "main")]:
-                assert connection.execute(f"SELECT * FROM {left}.{quoted}{where} EXCEPT SELECT * FROM {right}.{quoted}{where} LIMIT 1").fetchone() is None, (table, left)
+                assert connection.execute(query.format(left) + " EXCEPT " + query.format(right) + " LIMIT 1").fetchone() is None, (table, left)
     finally:
         connection.close()
+    return "cross_schema_retained_facts" if cross_schema else "same_schema_logical_rows_and_schema"
 
 
 def fixture(stage, size, env, timeout, full_content=False):
@@ -282,7 +338,9 @@ def benchmark(args, size):
     before = database_state(archive / "archive.db")
     assert before["counts"]["external_identities"] == size, before["counts"]
     assert before["counts"]["file_refs"] == size, before["counts"]
-    assert before["counts"]["objects"] == before["counts"]["verification_results"] == (size if args.full_content else 0), before["counts"]
+    assert before["counts"]["objects"] == before["integrity_matches"] == (size if args.full_content else 0), before
+    if before["schema_version"] == 7:
+        assert before["counts"]["checks"] == (size if args.full_content else 0), before["counts"]
     # A SQLite backup also handles a future WAL import without losing sidecars.
     reference = stage / "before-rebuild.db"
     source_connection = connect_readonly(archive / "archive.db")
@@ -294,17 +352,20 @@ def benchmark(args, size):
         source_connection.close()
     canonical_head = git_commit_ref(archive / "canonical")
     baseline = None
+    baseline_comparison = None
     if args.baseline_binary:
         baseline_target = stage / "baseline.db"
         baseline = run_command([args.baseline_binary, "--json", "--database", reference,
                                 "--events", archive / "canonical", "db", "rebuild", "--target", baseline_target],
                                stage, "baseline-rebuild", env, args.timeout, stage, True)
-        assert_equivalent_databases(reference, baseline_target, ignore_local_state=True)
+        baseline_comparison = assert_equivalent_databases(
+            reference, baseline_target, ignore_local_state=True, allow_schema_change=args.compare_baseline_core_facts)
     rebuilt = run_command([args.binary, "--json", "db", "rebuild"], stage, "rebuild", env, args.timeout, archive, True)
     after = database_state(archive / "archive.db")
     assert_equivalent_databases(reference, archive / "archive.db", ignore_local_state=True)
     if baseline:
-        assert_equivalent_databases(baseline_target, archive / "archive.db")
+        assert_equivalent_databases(baseline_target, archive / "archive.db",
+                                    allow_schema_change=args.compare_baseline_core_facts)
     assert git_commit_ref(archive / "canonical") == canonical_head, "Rebuild changed canonical HEAD"
     run_command([args.binary, "--json", "fsck"], stage, "fsck", env, args.timeout)
     boundaries = imported["boundaries"]
@@ -316,16 +377,18 @@ def benchmark(args, size):
               "import_seconds": imported["seconds"], "rebuild_seconds": rebuilt["seconds"], "approximate_import_phases": phases,
               "baseline_rebuild_seconds": baseline["seconds"] if baseline else None,
               "baseline_rebuild_peaks": baseline["root_process_peaks"] if baseline else None,
-              "all_derived_rows_and_schema_equal": True,
+              "logical_rows_and_schema_equal": True,
               "ignored_live_tables": ["jobs", "job_items"],
               "ignored_live_metadata_keys": ["projection_generation", "policy_input_generation",
                                              "last_verified_checkpoint_id", "last_verified_checkpoint_frontier_hash"],
-              "baseline_all_rows_equal": True if baseline else None, "canonical_head_unchanged": True,
+              "baseline_comparison": baseline_comparison, "canonical_head_unchanged": True,
               "measurement_notes": ["Phase boundaries are observed at 100 ms intervals, include scheduling delay, and may be missed.",
                                     "Spool-ready observes complete final JSONL, before fsync completion; frontier-written precedes final verification and Git commit.",
                                     "Publication-done observes the canonical Git commit ref advance; Git command finalization may overlap the next phase estimate.",
                                     "CPU and IO counters cover the root CLI only; tree peaks sum currently live processes, not reaped children.",
                                     "Observer connection cache_size and synchronous may differ from application connection settings.",
+                                    "Schema-7 equality compares logical views, semantic file_checks (including duplicate counts), and control tables without local integer IDs; physical integrity/FKs are checked separately.",
+                                    "Cross-schema baseline mode compares retained logical facts and successful-check counts, not physical schemas or historical verification/check rows; omitted columns are explicitly listed in RETIRED_COLUMNS, and unchecked source-metadata presence dates are normalized to NULL.",
                                     "Rebuild follows import on a warm filesystem cache; host VM counters include unrelated processes."],
               "before_rebuild": before, "after_rebuild": after,
               "canonical_bytes": sum(path.stat().st_size for path in (archive / "canonical").rglob("*") if path.is_file()),
@@ -393,6 +456,7 @@ def compare_cache(args):
         after = database_state(database)
         if after["counts"] != expected:
             raise RuntimeError(f"{label} replay table counts differ from original full rebuild")
+        assert_equivalent_databases(source.parent / "archive.db", database, ignore_local_state=True)
         if git_commit_ref(canonical) != source_tip or git_commit_ref(source) != source_tip:
             raise RuntimeError("Canonical HEAD changed during replay")
         result = {"size": size, "label": label, "stage": str(stage), "settings": settings,
@@ -416,6 +480,8 @@ def main():
     parser.add_argument("--binary", type=Path, required=True, help="Absolute path to a built archive CLI")
     parser.add_argument("--baseline-binary", type=Path,
                         help="Optional original CLI to time rebuilding the same canonical history")
+    parser.add_argument("--compare-baseline-core-facts", action="store_true",
+                        help="Allow schema 6/7 baseline comparison of retained logical facts, excluding changed check history")
     parser.add_argument("--work-dir", type=Path, required=True, help="Existing, task-owned disposable staging directory")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--sizes", type=int, nargs="+", default=[5000, 10000, 25000, 50000])
@@ -429,6 +495,8 @@ def main():
         parser.error("--binary must be an absolute path to an existing executable")
     if args.baseline_binary and (not args.baseline_binary.is_absolute() or not args.baseline_binary.is_file()):
         parser.error("--baseline-binary must be an absolute path to an existing executable")
+    if args.compare_baseline_core_facts and not args.baseline_binary:
+        parser.error("--compare-baseline-core-facts requires --baseline-binary")
     args.work_dir = args.work_dir.resolve(strict=True)
     if not args.work_dir.is_dir() or args.timeout <= 0 or any(size <= 0 for size in args.sizes):
         parser.error("work directory must exist, and sizes/timeout must be positive")

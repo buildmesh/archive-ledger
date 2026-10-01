@@ -41,7 +41,7 @@ struct Cli {
     #[arg(long, global = true)]
     archive: Option<String>,
 
-    /// Explicit schema-6 SQLite path for diagnostics (requires --events).
+    /// Explicit SQLite projection path for diagnostics (requires --events).
     #[arg(long, global = true)]
     database: Option<PathBuf>,
 
@@ -134,17 +134,21 @@ fn inspect_archive_root(selector: &str) -> Result<archive_ledger::KnownArchive, 
     })?;
     let database_path = root.join("archive.db");
     let events_path = root.join("canonical");
-    if let Ok(database) = V2ProjectionDb::open_existing(&database_path) {
-        let status = database.status()?;
-        return Ok(archive_ledger::KnownArchive {
-            archive_id: status.archive_id,
-            display_name: status.archive_name,
-            root,
-        });
+    match V2ProjectionDb::open_existing(&database_path) {
+        Ok(database) => {
+            let status = database.status()?;
+            return Ok(archive_ledger::KnownArchive {
+                archive_id: status.archive_id,
+                display_name: status.archive_name,
+                root,
+            });
+        }
+        Err(error) if archive_ledger::is_v2_event_tree(&events_path) => return Err(error.into()),
+        Err(_) => {}
     }
     if !events_path.is_dir() {
         return Err(AppError::Input(format!(
-            "Archive directory {} has neither a schema-6 projection nor a canonical event store",
+            "Archive directory {} has neither a supported SQLite projection nor a canonical event store",
             root.display()
         )));
     }
@@ -2160,7 +2164,8 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
     if let Command::Status = &cli.command {
         return execute_v2_status(cli);
     }
-    if let Ok(database) = V2ProjectionDb::open_existing(cli.database_path()) {
+    if archive_ledger::is_v2_event_tree(cli.events_path()) {
+        let database = V2ProjectionDb::open_existing(cli.database_path())?;
         if let Command::File { command } = &cli.command {
             return execute_v2_file(&database, cli.events_path(), command, cli.json);
         }
@@ -2876,6 +2881,12 @@ fn execute_db(cli: &Cli, command: &DbCommand) -> Result<u8, AppError> {
                         "Rebuilt SQLite from {} verified canonical records.",
                         stats.records_applied
                     );
+                    if let Some(previous) = &stats.previous_database {
+                        println!(
+                            "Previous SQLite database retained at {}",
+                            previous.display()
+                        );
+                    }
                 }
             }
         }
@@ -10209,9 +10220,15 @@ fn repair_targets(
                     cc.external_identity_id, here.observed_size_bytes, here.modified_time_utc_ms
              FROM copy_claims cc
              JOIN objects o ON o.object_id = cc.object_id
-             JOIN path_observations here ON here.rowid = (
-                 SELECT here.rowid FROM path_observations here WHERE COPY_OBSERVATION_MATCH
-                 ORDER BY here.observed_path_encoding, here.observed_path_bytes LIMIT 1)
+             JOIN path_observations here ON (
+                 here.file_ref_id, here.location_id,
+                 here.observed_path_encoding, here.observed_path_bytes
+             ) = (
+                 SELECT here.file_ref_id, here.location_id,
+                        here.observed_path_encoding, here.observed_path_bytes
+                 FROM path_observations here WHERE COPY_OBSERVATION_MATCH
+                 ORDER BY here.observed_path_encoding, here.observed_path_bytes,
+                          here.file_ref_id LIMIT 1)
              JOIN file_refs f ON f.file_ref_id = here.file_ref_id
                              AND f.object_id = cc.object_id AND f.path_state = 'active'
              WHERE cc.state = 'corrupt' AND cc.location_id IN (SELECT value FROM json_each(?1))
