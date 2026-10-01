@@ -46,7 +46,7 @@ const DERIVED_TABLES: &[(&str, Option<&str>)] = &[
     ("file_refs", None),
     ("path_observations", None),
     ("copy_claims", None),
-    ("verification_results", None),
+    ("file_checks", None),
     ("scan_runs", None),
     ("scan_missing_candidates", None),
     ("scan_pending_completions", None),
@@ -739,7 +739,7 @@ fn foreign_key_findings(connection: &Connection, path: &Path) -> Result<FindingS
 
 fn validate_table_classification(connection: &Connection, path: &Path) -> Result<()> {
     let mut actual = connection
-        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .prepare("SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .map_err(|source| sqlite_error(path, source))?
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|source| sqlite_error(path, source))?
@@ -748,6 +748,11 @@ fn validate_table_classification(connection: &Connection, path: &Path) -> Result
     let mut classified = DERIVED_TABLES
         .iter()
         .map(|(table, _)| (*table).to_owned())
+        .chain(
+            crate::v2_projection::COMPACT_TABLES
+                .iter()
+                .map(|name| (*name).to_owned()),
+        )
         .chain(
             LOCAL_OPERATIONAL_TABLES
                 .iter()
@@ -760,6 +765,20 @@ fn validate_table_classification(connection: &Connection, path: &Path) -> Result
         return Err(V2FsckError::Invalid(format!(
             "schema table classification is incomplete: actual={actual:?}, classified={classified:?}"
         )));
+    }
+    for name in crate::v2_projection::COMPACT_VIEWS {
+        let kind: String = connection
+            .query_row(
+                "SELECT type FROM sqlite_schema WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(path, source))?;
+        if kind != "view" {
+            return Err(V2FsckError::Invalid(format!(
+                "logical model {name} must be a view"
+            )));
+        }
     }
     Ok(())
 }
@@ -812,6 +831,9 @@ fn table_digest(
     }
     let quoted = columns
         .iter()
+        .filter(|column| {
+            !(column.as_str() == "id" && matches!(table, "records" | "collections" | "locations"))
+        })
         .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
         .collect::<Vec<_>>();
     let mut sql = format!("SELECT {} FROM \"{table}\"", quoted.join(","));
@@ -832,7 +854,7 @@ fn table_digest(
     hasher.update(table.as_bytes());
     let mut count = 0_u64;
     while let Some(row) = rows.next().map_err(|source| sqlite_error(path, source))? {
-        for index in 0..columns.len() {
+        for index in 0..quoted.len() {
             let value = row
                 .get_ref(index)
                 .map_err(|source| sqlite_error(path, source))?;

@@ -53,6 +53,7 @@ pub use frontier::{
 };
 pub use genesis::{
     client_id, GenesisBody, GenesisError, SignedGenesis, GENESIS_VERSION, V2_SCHEMA_VERSION,
+    V2_SQLITE_SCHEMA_VERSION,
 };
 pub use git::{
     managed_git_command, validate_git_ref, validate_git_remote_locator, validate_git_remote_name,

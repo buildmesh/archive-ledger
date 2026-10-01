@@ -1,6 +1,41 @@
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn per_file_inventory_queries_use_the_complete_path_index() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("archive");
+    crate::v2_store::initialize_v2_archive(&root, "arc_test", "Test", 1_782_000_000_000).unwrap();
+    let store = V2OriginStore::open(root.join("canonical")).unwrap();
+    let database = root.join("archive.db");
+    V2ProjectionDb::create_from_store(&store, &database).unwrap();
+    let connection = Connection::open(database).unwrap();
+    for sql in [COPY_UNCHANGED_SQL, KNOWN_ANNEX_ENTRY_SQL] {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let values = vec![rusqlite::types::Value::Null; statement.parameter_count()];
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("compact_file_path")
+                && step.contains("collection_id=? AND path_encoding=? AND path_bytes=?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.starts_with("SCAN ") && !step.contains("CONSTANT ROW")),
+            "{plan:?}"
+        );
+    }
+}
+
 fn open_seen(path: &Path) -> Connection {
     let seen = Connection::open(path).unwrap();
     seen.execute_batch(

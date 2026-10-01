@@ -1856,27 +1856,24 @@ mod tests {
                   collection_id, display_name, description, home_site_id, policy_id,
                   status, last_record_id
                 ) VALUES ('collection_1', 'Photos', NULL, NULL, NULL, 'active', 'seed');
-                INSERT INTO objects(
-                  object_id, canonical_hash_algo, canonical_hash_hex, size_bytes,
-                  media_type, extension_hint, first_seen_record_id, first_seen_time_utc_ms
-                ) VALUES ('{object_id}', 'blake3', '{hash}', 42,
-                          'image/jpeg', 'jpg', 'seed', 100);
-                INSERT INTO object_hashes(
-                  object_id, hash_algo, hash_hex, source, verified_record_id
-                ) VALUES ('{object_id}', 'sha256', 'bbbb', 'import', 'seed');
-                INSERT INTO file_refs(
-                  file_ref_id, collection_id, logical_path_bytes, logical_path_encoding,
-                  logical_path_display, object_id, external_identity_id, identity_state,
-                  path_state, created_time_utc_ms, modified_time_utc_ms,
-                  observed_size_bytes, first_seen_record_id, last_seen_record_id,
-                  removed_record_id
-                ) VALUES
-                  ('file_a', 'collection_1', X'612e6a7067', 'utf8', 'a.jpg',
-                   '{object_id}', NULL, 'resolved', 'active', 100, 100, 42,
-                   'seed', 'seed', NULL),
-                  ('file_b', 'collection_1', X'622e6a7067', 'utf8', 'b.jpg',
-                   '{object_id}', NULL, 'resolved', 'active', 100, 100, 42,
-                   'seed', 'seed', NULL);
+                INSERT INTO content_objects(digest, size_bytes, extension_hint, first_record, first_time)
+                VALUES (X'{hash}', 42, 'jpg', (SELECT MIN(id) FROM records), 100);
+                INSERT INTO checksums(algorithm, digest) VALUES ('sha256', X'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+                INSERT INTO content_checksums(content_id, checksum_id, source, record_id)
+                SELECT c.id, h.id, 'import', (SELECT MIN(id) FROM records)
+                FROM content_objects c, checksums h;
+                INSERT INTO file_objects(
+                  canonical_id, collection_id, path_bytes, path_encoding, path_display,
+                  content_id, identity_state, modified_time, observed_size, first_record, last_record
+                ) SELECT 'file_a', l.id, X'612e6a7067', 'utf8', 'a.jpg',
+                         c.id, 'resolved', 100, 42, r.id, r.id
+                  FROM collections l, content_objects c, records r WHERE r.id = (SELECT MIN(id) FROM records);
+                INSERT INTO file_objects(
+                  canonical_id, collection_id, path_bytes, path_encoding, path_display,
+                  content_id, identity_state, modified_time, observed_size, first_record, last_record
+                ) SELECT 'file_b', l.id, X'622e6a7067', 'utf8', 'b.jpg',
+                         c.id, 'resolved', 100, 42, r.id, r.id
+                  FROM collections l, content_objects c, records r WHERE r.id = (SELECT MIN(id) FROM records);
                 "#
             ))
             .unwrap();

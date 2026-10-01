@@ -1,6 +1,6 @@
 [package]
 name = "archive-ledger"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Local-first preservation inventory and disaster-risk ledger"
 license = "AGPL-3.0-only"

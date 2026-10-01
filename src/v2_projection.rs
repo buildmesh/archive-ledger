@@ -1,4 +1,4 @@
-//! Direct schema-6 SQLite projection for the version 2 event tree.
+//! Compact SQLite projection rebuilt from the unchanged version 2 event tree.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -10,11 +10,11 @@ use ed25519_dalek::VerifyingKey;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::genesis::V2_SCHEMA_VERSION;
+use crate::genesis::V2_SQLITE_SCHEMA_VERSION;
 use crate::registry::{
     registry_path_bytes, ArchiveRootSnapshot, CollectionSnapshot, DeviceCheckIn, DeviceMount,
     DeviceSnapshot, LocationSnapshot, PolicySnapshot, RiskAssignment, RiskDomainSnapshot,
@@ -26,13 +26,42 @@ use crate::v2_store::{
     VerifiedV2Client, VerifiedV2Record,
 };
 
-const SCHEMA_V6: &str = r#"
+#[path = "compact_projection.rs"]
+mod compact;
+
+// Physical domain storage and logical read models are classified separately by fsck.
+pub(crate) const COMPACT_TABLES: &[&str] = &[
+    "content_objects",
+    "checksums",
+    "content_checksums",
+    "source_identities",
+    "annex_sources",
+    "source_availability",
+    "file_objects",
+    "file_locations",
+    "copy_bindings",
+    "checks",
+    "check_errors",
+];
+pub(crate) const COMPACT_VIEWS: &[&str] = &[
+    "objects",
+    "object_hashes",
+    "external_identities",
+    "external_availability",
+    "file_refs",
+    "path_observations",
+    "copy_claims",
+    "file_checks",
+];
+
+const CONTROL_SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
 CREATE TABLE archive_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 ) STRICT;
 CREATE TABLE records (
+    id INTEGER PRIMARY KEY,
     origin_id TEXT NOT NULL,
     origin_seq INTEGER NOT NULL CHECK (origin_seq > 0),
     record_id TEXT NOT NULL UNIQUE,
@@ -44,7 +73,7 @@ CREATE TABLE records (
     previous_record_hash TEXT,
     record_hash TEXT NOT NULL,
     payload_json TEXT,
-    PRIMARY KEY (origin_id, origin_seq)
+    UNIQUE (origin_id, origin_seq)
 ) STRICT;
 CREATE INDEX records_kind_time ON records(record_kind, record_time_utc_ms);
 CREATE INDEX records_batch_dot ON records(batch_id, origin_id, origin_seq);
@@ -128,7 +157,8 @@ CREATE TABLE policies (
 ) STRICT;
 CREATE INDEX policies_status_name ON policies(status, display_name, policy_id);
 CREATE TABLE collections (
-    collection_id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
+    collection_id TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     description TEXT,
     home_site_id TEXT REFERENCES sites(site_id),
@@ -191,7 +221,8 @@ CREATE UNIQUE INDEX archive_roots_confirmed_fingerprint
     WHERE status = 'active' AND identity_state = 'confirmed' AND filesystem_fingerprint IS NOT NULL;
 CREATE INDEX archive_roots_status_name ON archive_roots(status, display_name, archive_root_id);
 CREATE TABLE locations (
-    location_id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
+    location_id TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('filesystem', 'service')),
     archive_root_id TEXT REFERENCES archive_roots(archive_root_id),
@@ -246,144 +277,6 @@ CREATE TABLE entity_risk_domains (
     assigned_record_id TEXT NOT NULL,
     PRIMARY KEY (entity_type, entity_id, risk_domain_id)
 ) STRICT;
-CREATE TABLE objects (
-    object_id TEXT PRIMARY KEY,
-    canonical_hash_algo TEXT NOT NULL CHECK (canonical_hash_algo = 'blake3'),
-    canonical_hash_hex TEXT NOT NULL UNIQUE,
-    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
-    media_type TEXT,
-    extension_hint TEXT,
-    first_seen_record_id TEXT NOT NULL,
-    first_seen_time_utc_ms INTEGER NOT NULL CHECK (first_seen_time_utc_ms >= 0)
-) STRICT;
-CREATE TABLE object_hashes (
-    object_id TEXT NOT NULL REFERENCES objects(object_id),
-    hash_algo TEXT NOT NULL,
-    hash_hex TEXT NOT NULL,
-    source TEXT NOT NULL,
-    verified_record_id TEXT,
-    PRIMARY KEY (object_id, hash_algo, hash_hex)
-) STRICT;
-CREATE INDEX object_hashes_lookup ON object_hashes(hash_algo, hash_hex);
-CREATE TABLE external_identities (
-    external_identity_id TEXT PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    external_key TEXT NOT NULL,
-    expected_hash_algo TEXT,
-    expected_hash_hex TEXT,
-    expected_size_bytes INTEGER,
-    object_id TEXT REFERENCES objects(object_id),
-    resolution_state TEXT NOT NULL CHECK (resolution_state IN ('unresolved', 'resolved', 'conflict', 'unsupported')),
-    source_detail_json TEXT,
-    first_seen_record_id TEXT NOT NULL,
-    resolved_record_id TEXT,
-    UNIQUE (namespace, external_key)
-) STRICT;
-CREATE TABLE external_availability (
-    external_identity_id TEXT NOT NULL REFERENCES external_identities(external_identity_id),
-    source_repo_id TEXT NOT NULL,
-    source_remote_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('present', 'missing', 'unknown')),
-    location_id TEXT REFERENCES locations(location_id),
-    observed_time_utc_ms INTEGER NOT NULL,
-    observed_record_id TEXT NOT NULL,
-    PRIMARY KEY (external_identity_id, source_repo_id, source_remote_id)
-) STRICT;
-CREATE TABLE file_refs (
-    file_ref_id TEXT PRIMARY KEY,
-    collection_id TEXT NOT NULL REFERENCES collections(collection_id),
-    logical_path_bytes BLOB NOT NULL,
-    logical_path_encoding TEXT NOT NULL CHECK (logical_path_encoding IN ('utf8', 'unix_bytes', 'windows_utf16le')),
-    logical_path_display TEXT NOT NULL,
-    object_id TEXT REFERENCES objects(object_id),
-    external_identity_id TEXT REFERENCES external_identities(external_identity_id),
-    identity_state TEXT NOT NULL CHECK (identity_state IN ('resolved', 'unresolved', 'conflict', 'unknown')),
-    path_state TEXT NOT NULL CHECK (path_state IN ('active', 'removed')),
-    created_time_utc_ms INTEGER,
-    modified_time_utc_ms INTEGER,
-    observed_size_bytes INTEGER,
-    first_seen_record_id TEXT NOT NULL,
-    last_seen_record_id TEXT,
-    removed_record_id TEXT,
-    CHECK (object_id IS NOT NULL OR external_identity_id IS NOT NULL OR identity_state IN ('unknown', 'conflict'))
-) STRICT;
-CREATE UNIQUE INDEX file_refs_active_path ON file_refs(collection_id, logical_path_encoding, logical_path_bytes) WHERE path_state = 'active';
-CREATE INDEX file_refs_object ON file_refs(object_id) WHERE object_id IS NOT NULL;
-CREATE INDEX file_refs_external_identity ON file_refs(external_identity_id) WHERE external_identity_id IS NOT NULL;
-CREATE INDEX file_refs_collection_state_object ON file_refs(collection_id, path_state, object_id);
-CREATE TABLE path_observations (
-    file_ref_id TEXT NOT NULL REFERENCES file_refs(file_ref_id),
-    location_id TEXT NOT NULL REFERENCES locations(location_id),
-    observed_path_bytes BLOB NOT NULL,
-    observed_path_encoding TEXT NOT NULL,
-    observed_path_display TEXT NOT NULL,
-    representation TEXT NOT NULL,
-    object_id TEXT REFERENCES objects(object_id),
-    external_identity_id TEXT REFERENCES external_identities(external_identity_id),
-    state TEXT NOT NULL CHECK (state IN ('present', 'missing')),
-    first_seen_record_id TEXT NOT NULL,
-    last_seen_record_id TEXT,
-    last_seen_time_utc_ms INTEGER NOT NULL,
-    last_complete_scan_id TEXT,
-    observed_size_bytes INTEGER,
-    modified_time_utc_ms INTEGER,
-    PRIMARY KEY (file_ref_id, location_id, observed_path_encoding, observed_path_bytes)
-) STRICT;
-CREATE INDEX path_observations_location_path ON path_observations(location_id, observed_path_encoding, observed_path_bytes, file_ref_id);
-CREATE TABLE copy_claims (
-    copy_claim_id TEXT PRIMARY KEY,
-    location_id TEXT NOT NULL REFERENCES locations(location_id),
-    relative_path_bytes BLOB NOT NULL,
-    relative_path_encoding TEXT NOT NULL,
-    relative_path_display TEXT NOT NULL,
-    object_id TEXT REFERENCES objects(object_id),
-    external_identity_id TEXT REFERENCES external_identities(external_identity_id),
-    claim_basis TEXT NOT NULL CHECK (claim_basis IN ('observed_bytes', 'observed_metadata', 'source_metadata')),
-    state TEXT NOT NULL CHECK (state IN ('present', 'missing', 'corrupt', 'unknown', 'superseded')),
-    state_origin_id TEXT NOT NULL,
-    state_origin_seq INTEGER NOT NULL CHECK (state_origin_seq > 0),
-    state_record_id TEXT NOT NULL,
-    first_seen_record_id TEXT NOT NULL,
-    last_seen_record_id TEXT,
-    last_seen_time_utc_ms INTEGER,
-    last_complete_scan_id TEXT,
-    last_verified_record_id TEXT,
-    last_verified_time_utc_ms INTEGER,
-    last_verification_result TEXT,
-    last_error_code TEXT,
-    last_error_detail TEXT,
-    CHECK (object_id IS NOT NULL OR external_identity_id IS NOT NULL OR state = 'unknown')
-) STRICT;
-CREATE UNIQUE INDEX copy_claims_active_path ON copy_claims(location_id, relative_path_encoding, relative_path_bytes) WHERE state != 'superseded';
-CREATE INDEX copy_claims_object_state ON copy_claims(object_id, state);
-CREATE INDEX copy_claims_external_state ON copy_claims(external_identity_id, state);
-CREATE INDEX copy_claims_location_state ON copy_claims(location_id, state);
-CREATE INDEX copy_claims_verification_age ON copy_claims(last_verified_time_utc_ms, last_verification_result);
-CREATE INDEX copy_claims_risk_eligible ON copy_claims(state, last_verification_result, last_seen_time_utc_ms, last_verified_time_utc_ms, object_id, location_id);
-CREATE TABLE verification_results (
-    verification_id TEXT PRIMARY KEY,
-    record_id TEXT NOT NULL,
-    item_index INTEGER NOT NULL,
-    job_id TEXT,
-    copy_claim_id TEXT NOT NULL REFERENCES copy_claims(copy_claim_id),
-    object_id TEXT REFERENCES objects(object_id),
-    location_id TEXT NOT NULL REFERENCES locations(location_id),
-    result TEXT NOT NULL CHECK (result IN ('ok', 'hash_mismatch', 'read_error', 'identity_mismatch')),
-    expected_hash_algo TEXT,
-    expected_hash_hex TEXT,
-    observed_hash_hex TEXT,
-    size_bytes INTEGER,
-    bytes_read INTEGER,
-    duration_ms INTEGER,
-    verified_time_utc_ms INTEGER NOT NULL,
-    path_observed_bytes BLOB NOT NULL,
-    path_observed_encoding TEXT NOT NULL,
-    path_observed_display TEXT NOT NULL,
-    device_fingerprint_status TEXT NOT NULL,
-    error_code TEXT,
-    error_detail TEXT,
-    UNIQUE (record_id, item_index)
-) STRICT;
 CREATE TABLE scan_runs (
     scan_id TEXT PRIMARY KEY,
     job_id TEXT,
@@ -428,8 +321,8 @@ CREATE TABLE scan_missing_candidates (
     record_hash TEXT NOT NULL,
     scan_id TEXT NOT NULL REFERENCES scan_runs(scan_id),
     candidate_kind TEXT NOT NULL CHECK (candidate_kind IN ('path', 'copy')),
-    file_ref_id TEXT REFERENCES file_refs(file_ref_id),
-    copy_claim_id TEXT REFERENCES copy_claims(copy_claim_id),
+    file_ref_id TEXT REFERENCES file_objects(canonical_id),
+    copy_claim_id TEXT REFERENCES copy_bindings(canonical_id),
     location_id TEXT NOT NULL REFERENCES locations(location_id),
     path_bytes BLOB NOT NULL,
     path_encoding TEXT NOT NULL,
@@ -520,7 +413,7 @@ pub type Result<T> = std::result::Result<T, V2ProjectionError>;
 pub enum V2ProjectionError {
     #[error("version 2 event verification failed: {0}")]
     Store(#[from] V2StoreError),
-    #[error("schema-6 projection is invalid: {0}")]
+    #[error("SQLite projection is invalid: {0}")]
     Invalid(String),
     #[error("SQLite operation failed for {path}: {source}{}", sqlite_error_details(.source))]
     Sqlite {
@@ -575,6 +468,9 @@ pub struct V2RebuildStats {
     pub records_applied: u64,
     pub origins_applied: u64,
     pub applied_frontier_hash: String,
+    /// Previous projection retained when upgrading its physical schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_database: Option<PathBuf>,
 }
 
 /// Ephemeral replay progress. Counts advance only after a transaction commits.
@@ -610,7 +506,7 @@ fn configure_replay(connection: &Connection, path: &Path) -> Result<()> {
     Ok(())
 }
 
-// Retain all PK/UNIQUE indexes and the five complete-scan replay lookups.
+// Retain uniqueness constraints and the complete-scan replay lookups.
 // These report indexes are rebuilt in bulk before the replacement is validated.
 const DEFERRED_REBUILD_INDEXES: &[&str] = &[
     "records_kind_time",
@@ -627,13 +523,6 @@ const DEFERRED_REBUILD_INDEXES: &[&str] = &[
     "device_mounts_root_time",
     "device_mounts_device_time",
     "risk_domains_status_name",
-    "object_hashes_lookup",
-    "file_refs_object",
-    "file_refs_external_identity",
-    "copy_claims_object_state",
-    "copy_claims_external_state",
-    "copy_claims_verification_age",
-    "copy_claims_risk_eligible",
     "scan_runs_location_finished",
     "scan_runs_status",
     "scan_candidates_copy_claim",
@@ -643,7 +532,10 @@ const DEFERRED_REBUILD_INDEXES: &[&str] = &[
 
 fn defer_rebuild_indexes(connection: &Connection, path: &Path) -> Result<Vec<String>> {
     let mut definitions = Vec::with_capacity(DEFERRED_REBUILD_INDEXES.len());
-    for name in DEFERRED_REBUILD_INDEXES {
+    for name in DEFERRED_REBUILD_INDEXES
+        .iter()
+        .chain(compact::DEFERRED_INDEXES)
+    {
         let sql: String = connection.query_row(
             "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1 AND sql LIKE 'CREATE INDEX %'",
             [name], |row| row.get(0),
@@ -686,7 +578,7 @@ impl V2ProjectionDb {
         let mut connection = Connection::open(path).map_err(|source| sqlite_error(path, source))?;
         configure_replay(&connection, path)?;
         connection
-            .execute_batch(SCHEMA_V6)
+            .execute_batch(&format!("{CONTROL_SCHEMA}\n{}", compact::SCHEMA))
             .map_err(|source| sqlite_error(path, source))?;
         let deferred_indexes = defer_rebuild_indexes(&connection, path)?;
         let bootstrap_hash = verified
@@ -750,7 +642,7 @@ impl V2ProjectionDb {
                 "archive_display_name",
                 verified.genesis.body.archive_display_name.clone(),
             ),
-            ("schema_version", V2_SCHEMA_VERSION.to_string()),
+            ("schema_version", V2_SQLITE_SCHEMA_VERSION.to_string()),
             ("event_tree_version", "2".to_owned()),
             ("genesis_hash", verified.genesis_hash.clone()),
             ("accepted_frontier_hash", bootstrap_hash.clone()),
@@ -830,12 +722,13 @@ impl V2ProjectionDb {
             origins_applied: u64::try_from(verified.accepted_frontier.origins.len())
                 .map_err(|_| V2ProjectionError::Invalid("origin count overflow".to_owned()))?,
             applied_frontier_hash: verified.accepted_frontier_hash,
+            previous_database: None,
         };
         // Set the completion marker with the ordinary durable connection only
         // after successful replay, index creation, and integrity verification.
         database
             .open()?
-            .pragma_update(None, "user_version", V2_SCHEMA_VERSION)
+            .pragma_update(None, "user_version", V2_SQLITE_SCHEMA_VERSION)
             .map_err(|source| sqlite_error(path, source))?;
         Ok(stats)
     }
@@ -844,7 +737,7 @@ impl V2ProjectionDb {
         let path = path.as_ref().to_path_buf();
         if !path.is_file() {
             return Err(V2ProjectionError::Invalid(format!(
-                "schema-6 SQLite projection not found at {}",
+                "SQLite projection not found at {}",
                 path.display()
             )));
         }
@@ -888,9 +781,9 @@ impl V2ProjectionDb {
                 Some("state = 'unresolved'"),
             )?,
         };
-        if status.schema_version != V2_SCHEMA_VERSION || status.event_tree_version != 2 {
+        if status.schema_version != V2_SQLITE_SCHEMA_VERSION || status.event_tree_version != 2 {
             return Err(V2ProjectionError::Invalid(format!(
-                "unsupported SQLite projection format {}/{}; expected event tree 2 and schema {V2_SCHEMA_VERSION}",
+                "unsupported SQLite projection format {}/{}; expected event tree 2 and schema {V2_SQLITE_SCHEMA_VERSION}",
                 status.event_tree_version, status.schema_version
             )));
         }
@@ -1274,7 +1167,7 @@ impl V2ProjectionDb {
         })?;
         fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
         let temp = parent.join(format!(".archive-ledger-rebuild-{}.db", lower_ulid()));
-        let stats = match Self::create_from_store(store, &temp) {
+        let mut stats = match Self::create_from_store(store, &temp) {
             Ok(stats) => stats,
             Err(error) => {
                 let _ = fs::remove_file(&temp);
@@ -1288,9 +1181,14 @@ impl V2ProjectionDb {
         let backup = parent.join(format!(".archive-ledger-previous-{}.db", lower_ulid()));
         let had_target = target.exists();
         let mut backup_sidecars = Vec::new();
+        let mut retain_previous = false;
         if had_target {
             let existing =
                 Connection::open(target).map_err(|source| sqlite_error(target, source))?;
+            let old_version: u32 = existing
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .map_err(|source| sqlite_error(target, source))?;
+            retain_previous = old_version != V2_SQLITE_SCHEMA_VERSION;
             existing
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                 .map_err(|source| sqlite_error(target, source))?;
@@ -1334,7 +1232,10 @@ impl V2ProjectionDb {
             }
             return Err(error);
         }
-        if had_target {
+        if had_target && retain_previous {
+            stats.previous_database = Some(backup.clone());
+        }
+        if had_target && !retain_previous {
             fs::remove_file(&backup).map_err(|source| io_error(&backup, source))?;
             for (_, backup_sidecar) in &backup_sidecars {
                 fs::remove_file(backup_sidecar)
@@ -1366,9 +1267,9 @@ impl V2ProjectionDb {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|source| sqlite_error(&self.path, source))?;
-        if version != V2_SCHEMA_VERSION {
+        if version != V2_SQLITE_SCHEMA_VERSION {
             return Err(V2ProjectionError::Invalid(format!(
-                "unsupported SQLite schema {version}; expected schema {V2_SCHEMA_VERSION}. Pre-v2 development Archives must be recreated"
+                "unsupported SQLite schema {version}; expected schema {V2_SQLITE_SCHEMA_VERSION}. Run archive db rebuild to rebuild from the existing canonical records"
             )));
         }
         Ok(())
@@ -1555,10 +1456,23 @@ fn project_batch_chunk(
                 project_registry_item(transaction, item, record, path)?;
             }
             "content_observed" => {
-                project_content_observed(transaction, item, record, item_index, verified, path)?;
+                compact::project_content_observed(
+                    transaction,
+                    item,
+                    record,
+                    item_index,
+                    verified,
+                    path,
+                )?;
             }
             "copy_verification_failed" => {
-                project_copy_verification_failed(transaction, item, record, item_index, path)?;
+                compact::project_copy_verification_failed(
+                    transaction,
+                    item,
+                    record,
+                    item_index,
+                    path,
+                )?;
             }
             "scan_started" => project_scan_started(transaction, item, record, path)?,
             "scan_missing_candidate" => {
@@ -1569,7 +1483,7 @@ fn project_batch_chunk(
                 project_annex_import_started(transaction, item, record, path)?
             }
             "annex_entry_observed" => {
-                project_annex_entry(transaction, item, record, item_index, path)?;
+                compact::project_annex_entry(transaction, item, record, item_index, path)?;
             }
             "annex_import_completed" => {
                 project_annex_import_completed(transaction, item, record, path)?
@@ -1578,7 +1492,7 @@ fn project_batch_chunk(
             "job_finished" => project_job_finished(transaction, item, record, path)?,
             kind => {
                 return Err(V2ProjectionError::Invalid(format!(
-                    "unsupported schema-6 item kind {kind:?}"
+                    "unsupported projection item kind {kind:?}"
                 )))
             }
         }
@@ -1968,183 +1882,6 @@ fn project_annex_import_started(
     Ok(())
 }
 
-fn project_annex_entry(
-    transaction: &Transaction<'_>,
-    item: &serde_json::Map<String, Value>,
-    record: &VerifiedV2Record,
-    item_index: u64,
-    database_path: &Path,
-) -> Result<()> {
-    let record_id = &record.record.envelope.record_id;
-    let observed_time = sql_i64(record.record.envelope.time_utc_ms, "annex observation time")?;
-    let external_id = string(item, "external_identity_id")?;
-    let resolution_state = string(item, "resolution_state")?;
-    let expected_size = item
-        .get("expected_size_bytes")
-        .and_then(Value::as_u64)
-        .map(|value| sql_i64(value, "annex expected size"))
-        .transpose()?;
-    execute_projected(transaction,
-            "INSERT INTO external_identities(external_identity_id, namespace, external_key, expected_hash_algo, expected_hash_hex, expected_size_bytes, object_id, resolution_state, source_detail_json, first_seen_record_id, resolved_record_id)
-             VALUES (?1, 'git-annex', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, NULL)
-             ON CONFLICT(external_identity_id) DO UPDATE SET expected_hash_algo = excluded.expected_hash_algo, expected_hash_hex = excluded.expected_hash_hex, expected_size_bytes = excluded.expected_size_bytes",
-            params![
-                external_id,
-                string(item, "external_key")?,
-                item.get("expected_hash_algo").and_then(Value::as_str),
-                item.get("expected_hash_hex").and_then(Value::as_str),
-                expected_size,
-                resolution_state,
-                serde_json::to_string(&json!({"backend": string(item, "backend")?, "source_repo_id": string(item, "source_repo_id")?}))?,
-                record_id,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    let object_id = item.get("object_id").and_then(Value::as_str);
-    if let Some(object_id) = object_id {
-        let hash = item
-            .get("blake3_hex")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                V2ProjectionError::Invalid("resolved annex entry lacks BLAKE3".to_owned())
-            })?;
-        if object_id != format!("blake3:{hash}") {
-            return Err(V2ProjectionError::Invalid(
-                "resolved annex Object ID does not match BLAKE3".to_owned(),
-            ));
-        }
-        let size = item
-            .get("observed_size_bytes")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                V2ProjectionError::Invalid("resolved annex entry lacks size".to_owned())
-            })?;
-        execute_projected(transaction,
-                "INSERT OR IGNORE INTO objects(object_id, canonical_hash_algo, canonical_hash_hex, size_bytes, media_type, extension_hint, first_seen_record_id, first_seen_time_utc_ms)
-                 VALUES (?1, 'blake3', ?2, ?3, NULL, NULL, ?4, ?5)",
-                params![object_id, hash, sql_i64(size, "annex object size")?, record_id, observed_time],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-        for algorithm in ["sha256", "sha512"] {
-            if let Some(hash) = item
-                .get(&format!("{algorithm}_hex"))
-                .and_then(Value::as_str)
-            {
-                execute_projected(transaction,
-                        "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, ?2, ?3, 'annex_import', ?4)",
-                        params![object_id, algorithm, hash, record_id],
-                    )
-                    .map_err(|source| sqlite_error(database_path, source))?;
-            }
-        }
-        execute_projected(transaction,
-                "UPDATE external_identities SET object_id = ?2, resolution_state = 'resolved', resolved_record_id = ?3 WHERE external_identity_id = ?1 AND resolution_state != 'conflict'",
-                params![external_id, object_id, record_id],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-    }
-    let logical: crate::registry::RegistryPath =
-        serde_json::from_value(required(item, "logical_path")?.clone()).map_err(|error| {
-            V2ProjectionError::Invalid(format!("annex logical path is invalid: {error}"))
-        })?;
-    let logical_bytes = registry_path_bytes(&logical)
-        .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
-    let file_ref_id = string(item, "file_ref_id")?;
-    // A git-annex key identifies the same content across partial repositories.
-    // Importing a repository where that key is absent must not regress a File
-    // that another repository already resolved.
-    let sql = "SELECT object_id FROM external_identities WHERE external_identity_id = ?1";
-    let resolved_object_id: Option<String> = transaction
-        .prepare_cached(sql)
-        .and_then(|mut statement| statement.query_row([external_id], |row| row.get(0)))
-        .map_err(|source| sqlite_error(database_path, source))?;
-    let file_object_id = object_id.or(resolved_object_id.as_deref());
-    execute_projected(transaction,
-            "INSERT INTO file_refs(file_ref_id, collection_id, logical_path_bytes, logical_path_encoding, logical_path_display, object_id, external_identity_id, identity_state, path_state, created_time_utc_ms, modified_time_utc_ms, observed_size_bytes, first_seen_record_id, last_seen_record_id, removed_record_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', NULL, ?9, ?10, ?11, ?11, NULL)
-             ON CONFLICT(file_ref_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, identity_state = excluded.identity_state, path_state = 'active', modified_time_utc_ms = excluded.modified_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes, last_seen_record_id = excluded.last_seen_record_id",
-            params![
-                file_ref_id,
-                string(item, "collection_id")?,
-                logical_bytes,
-                logical.encoding,
-                logical.display,
-                file_object_id,
-                external_id,
-                if file_object_id.is_some() { "resolved" } else if resolution_state == "unsupported" { "unknown" } else { resolution_state },
-                item.get("modified_time_utc_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex modified time")).transpose()?,
-                item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex observed size")).transpose()?,
-                record_id,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    execute_projected(transaction,
-            "INSERT INTO path_observations(file_ref_id, location_id, observed_path_bytes, observed_path_encoding, observed_path_display, representation, object_id, external_identity_id, state, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, observed_size_bytes, modified_time_utc_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, NULL, ?12, ?13)
-             ON CONFLICT(file_ref_id, location_id, observed_path_encoding, observed_path_bytes) DO UPDATE SET representation = excluded.representation, object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, state = excluded.state, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes, modified_time_utc_ms = excluded.modified_time_utc_ms",
-            params![
-                file_ref_id,
-                string(item, "worktree_location_id")?,
-                logical_bytes,
-                logical.encoding,
-                logical.display,
-                string(item, "representation")?,
-                object_id,
-                external_id,
-                string(item, "path_state")?,
-                record_id,
-                observed_time,
-                item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex observed size")).transpose()?,
-                item.get("modified_time_utc_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex modified time")).transpose()?,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    execute_projected(transaction,
-            "INSERT INTO external_availability(external_identity_id, source_repo_id, source_remote_id, state, location_id, observed_time_utc_ms, observed_record_id)
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(external_identity_id, source_repo_id, source_remote_id) DO UPDATE SET state = excluded.state, location_id = excluded.location_id, observed_time_utc_ms = excluded.observed_time_utc_ms, observed_record_id = excluded.observed_record_id WHERE excluded.state != 'unknown'",
-            params![external_id, string(item, "source_repo_id")?, string(item, "local_availability")?, string(item, "cas_location_id")?, observed_time, record_id],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    if let (Some(copy_claim_id), Some(location_id), Some(copy_value)) = (
-        item.get("copy_claim_id").and_then(Value::as_str),
-        item.get("copy_location_id").and_then(Value::as_str),
-        item.get("copy_path").filter(|value| !value.is_null()),
-    ) {
-        let copy: crate::registry::RegistryPath = serde_json::from_value(copy_value.clone())
-            .map_err(|error| {
-                V2ProjectionError::Invalid(format!("annex copy path is invalid: {error}"))
-            })?;
-        let copy_bytes = registry_path_bytes(&copy)
-            .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
-        let state = string(item, "copy_state")?;
-        // Inventory contributes only new unknown claims. Reimporting metadata must
-        // preserve prior content observations, including confirmed absence.
-        execute_projected(transaction,
-                "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding, relative_path_display, object_id, external_identity_id, claim_basis, state, state_origin_id, state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, last_verified_record_id, last_verified_time_utc_ms, last_verification_result, last_error_code, last_error_detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?11, ?11, ?12, NULL, NULL, NULL, NULL, NULL, ?13)
-                 ON CONFLICT(copy_claim_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = excluded.external_identity_id, state = excluded.state, state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_error_detail = excluded.last_error_detail, claim_basis = excluded.claim_basis WHERE excluded.claim_basis != 'source_metadata'",
-                params![copy_claim_id, location_id, copy_bytes, copy.encoding, copy.display, object_id, external_id, state, record.record.envelope.origin_id, sql_i64(record.record.envelope.origin_seq, "annex copy origin sequence")?, record_id, observed_time, item.get("error_detail").and_then(Value::as_str), item.get("claim_basis").and_then(Value::as_str).unwrap_or("observed_bytes")],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-        if let Some(result) = item.get("verification_result").and_then(Value::as_str) {
-            let verification_id = format!("verify_{}_{item_index}", record_id);
-            execute_projected(transaction,
-                    "INSERT INTO verification_results(verification_id, record_id, item_index, job_id, copy_claim_id, object_id, location_id, result, expected_hash_algo, expected_hash_hex, observed_hash_hex, size_bytes, bytes_read, duration_ms, verified_time_utc_ms, path_observed_bytes, path_observed_encoding, path_observed_display, device_fingerprint_status, error_code, error_detail)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'not_checked', ?19, ?20)",
-                    params![verification_id, record_id, sql_i64(item_index, "annex item index")?, string(item, "job_id")?, copy_claim_id, object_id, location_id, result, item.get("expected_hash_algo").and_then(Value::as_str), item.get("expected_hash_hex").and_then(Value::as_str), item.get("expected_hash_algo").and_then(Value::as_str).and_then(|algo| item.get(&format!("{algo}_hex"))).and_then(Value::as_str), expected_size, item.get("observed_size_bytes").and_then(Value::as_u64).map(|value| sql_i64(value, "annex bytes read")).transpose()?, item.get("duration_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "annex duration")).transpose()?, observed_time, copy_bytes, copy.encoding, copy.display, (result != "ok").then_some("annex_content_error"), item.get("error_detail").and_then(Value::as_str)],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            execute_projected(transaction,
-                    "UPDATE copy_claims SET last_verified_record_id = ?2, last_verified_time_utc_ms = ?3, last_verification_result = ?4, last_error_code = ?5 WHERE copy_claim_id = ?1",
-                    params![copy_claim_id, record_id, observed_time, result, (result != "ok").then_some("annex_content_error")],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-        }
-    }
-    Ok(())
-}
-
 fn project_annex_import_completed(
     transaction: &Transaction<'_>,
     item: &serde_json::Map<String, Value>,
@@ -2311,257 +2048,6 @@ fn project_scan_completed(
     Ok(())
 }
 
-fn project_content_observed(
-    transaction: &Transaction<'_>,
-    item: &serde_json::Map<String, Value>,
-    record: &VerifiedV2Record,
-    item_index: u64,
-    verified: &V2VerificationContext,
-    database_path: &Path,
-) -> Result<()> {
-    let record_id = &record.record.envelope.record_id;
-    let origin_id = &record.record.envelope.origin_id;
-    let origin_seq = sql_i64(record.record.envelope.origin_seq, "content origin sequence")?;
-    let observed_time = sql_i64(number(item, "observed_time_utc_ms")?, "observation time")?;
-    let collection_id = string(item, "collection_id")?;
-    let location_id = string(item, "location_id")?;
-    let object_id = string(item, "object_id")?;
-    let hash_hex = string(item, "blake3_hex")?;
-    if object_id != format!("blake3:{hash_hex}")
-        || hash_hex.len() != 64
-        || !hash_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(V2ProjectionError::Invalid(
-            "content object ID and BLAKE3 hash do not agree".to_owned(),
-        ));
-    }
-    let size = sql_i64(number(item, "size_bytes")?, "object size")?;
-    let logical: crate::registry::RegistryPath =
-        serde_json::from_value(required(item, "logical_path")?.clone()).map_err(|error| {
-            V2ProjectionError::Invalid(format!("logical path is invalid: {error}"))
-        })?;
-    let copy: crate::registry::RegistryPath =
-        serde_json::from_value(required(item, "copy_path")?.clone()).map_err(|error| {
-            V2ProjectionError::Invalid(format!("copy path is invalid: {error}"))
-        })?;
-    let logical_bytes = registry_path_bytes(&logical)
-        .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
-    let copy_bytes = registry_path_bytes(&copy)
-        .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
-    let file_ref_id = string(item, "file_ref_id")?;
-    let copy_claim_id = string(item, "copy_claim_id")?;
-    let external_identity_id = item.get("external_identity_id").and_then(Value::as_str);
-    let representation = string(item, "representation")?;
-    let modified_time = item
-        .get("modified_time_utc_ms")
-        .and_then(Value::as_u64)
-        .map(|value| sql_i64(value, "modified time"))
-        .transpose()?;
-
-    transaction
-        .execute(
-            "INSERT OR IGNORE INTO objects(object_id, canonical_hash_algo, canonical_hash_hex, size_bytes, media_type, extension_hint, first_seen_record_id, first_seen_time_utc_ms)
-             VALUES (?1, 'blake3', ?2, ?3, NULL, ?4, ?5, ?6)",
-            params![
-                object_id,
-                hash_hex,
-                size,
-                item.get("extension_hint").and_then(Value::as_str),
-                record_id,
-                observed_time,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    let stored_object: (String, i64) = transaction
-        .query_row(
-            "SELECT canonical_hash_hex, size_bytes FROM objects WHERE object_id = ?1",
-            [object_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    if stored_object != (hash_hex.to_owned(), size) {
-        return Err(V2ProjectionError::Invalid(format!(
-            "conflicting content identity for {object_id}"
-        )));
-    }
-    for algorithm in ["sha256", "sha512"] {
-        if let Some(hash) = item
-            .get(&format!("{algorithm}_hex"))
-            .and_then(Value::as_str)
-        {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO object_hashes(object_id, hash_algo, hash_hex, source, verified_record_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![object_id, algorithm, hash, string(item, "representation")?, record_id],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-        }
-    }
-    if ["sha256_hex", "sha512_hex"]
-        .iter()
-        .any(|field| item.get(*field).and_then(Value::as_str).is_some())
-    {
-        if let Some(external_identity_id) = external_identity_id {
-            transaction
-                .execute(
-                    "UPDATE external_identities SET object_id = ?2, resolution_state = 'resolved', resolved_record_id = ?3 WHERE external_identity_id = ?1 AND resolution_state != 'conflict'",
-                    params![external_identity_id, object_id, record_id],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-        }
-    }
-
-    let existing_file = transaction
-        .query_row(
-            "SELECT file_ref_id, object_id, last_seen_record_id, identity_state
-             FROM file_refs
-             WHERE collection_id = ?1 AND logical_path_encoding = ?2
-               AND logical_path_bytes = ?3 AND path_state = 'active'",
-            params![collection_id, logical.encoding, logical_bytes],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|source| sqlite_error(database_path, source))?;
-    if let Some((existing_id, _, _, _)) = &existing_file {
-        if existing_id != file_ref_id {
-            return Err(V2ProjectionError::Invalid(
-                "content item changes the stable File ID for a logical path".to_owned(),
-            ));
-        }
-    }
-    let identity_conflict = if existing_file
-        .as_ref()
-        .is_some_and(|(_, _, _, state)| state == "conflict")
-    {
-        true
-    } else if let Some((_, Some(existing_object_id), existing_record_id, _)) = &existing_file {
-        if existing_object_id == object_id {
-            false
-        } else {
-            let (existing_origin, existing_sequence): (String, i64) = transaction
-                .query_row(
-                    "SELECT origin_id, origin_seq FROM records WHERE record_id = ?1",
-                    [existing_record_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            let existing_sequence = sql_u64(existing_sequence, "existing File origin sequence")?;
-            let causal_base = verified
-                .frontiers
-                .get(&record.causal_frontier_hash)
-                .ok_or_else(|| {
-                    V2ProjectionError::Invalid(
-                        "content observation causal frontier is unavailable".to_owned(),
-                    )
-                })?;
-            let descends_from_existing = causal_base.origins.iter().any(|origin| {
-                origin.origin_id == existing_origin && origin.seq >= existing_sequence
-            });
-            if !descends_from_existing {
-                insert_file_identity_conflict(
-                    transaction,
-                    collection_id,
-                    &logical.encoding,
-                    &logical_bytes,
-                    &existing_origin,
-                    existing_sequence,
-                    existing_record_id,
-                    origin_id,
-                    record.record.envelope.origin_seq,
-                    record_id,
-                    database_path,
-                )?;
-            }
-            !descends_from_existing
-        }
-    } else {
-        false
-    };
-    transaction
-        .execute(
-            "INSERT INTO file_refs(file_ref_id, collection_id, logical_path_bytes, logical_path_encoding, logical_path_display, object_id, external_identity_id, identity_state, path_state, created_time_utc_ms, modified_time_utc_ms, observed_size_bytes, first_seen_record_id, last_seen_record_id, removed_record_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'resolved', 'active', NULL, ?8, ?9, ?10, ?10, NULL)
-             ON CONFLICT(file_ref_id) DO UPDATE SET
-                 object_id = CASE WHEN ?11 THEN NULL ELSE excluded.object_id END,
-                 external_identity_id = COALESCE(excluded.external_identity_id, file_refs.external_identity_id),
-                 identity_state = CASE WHEN ?11 THEN 'conflict' ELSE 'resolved' END,
-                 path_state = 'active',
-                 modified_time_utc_ms = excluded.modified_time_utc_ms,
-                 observed_size_bytes = excluded.observed_size_bytes,
-                 last_seen_record_id = excluded.last_seen_record_id,
-                 removed_record_id = NULL",
-            params![file_ref_id, collection_id, logical_bytes, logical.encoding, logical.display, object_id, external_identity_id, modified_time, size, record_id, identity_conflict],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    transaction
-        .execute(
-            "INSERT INTO path_observations(file_ref_id, location_id, observed_path_bytes, observed_path_encoding, observed_path_display, representation, object_id, external_identity_id, state, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, observed_size_bytes, modified_time_utc_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?9, ?10, NULL, ?11, ?12)
-             ON CONFLICT(file_ref_id, location_id, observed_path_encoding, observed_path_bytes) DO UPDATE SET representation = excluded.representation, object_id = excluded.object_id, external_identity_id = COALESCE(excluded.external_identity_id, path_observations.external_identity_id), state = 'present', last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes, modified_time_utc_ms = excluded.modified_time_utc_ms",
-            params![file_ref_id, location_id, logical_bytes, logical.encoding, logical.display, representation, object_id, external_identity_id, record_id, observed_time, size, modified_time],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-
-    let previous_claim = transaction
-        .query_row(
-            "SELECT copy_claim_id FROM copy_claims WHERE location_id = ?1 AND relative_path_encoding = ?2 AND relative_path_bytes = ?3 AND state != 'superseded'",
-            params![location_id, copy.encoding, copy_bytes],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|source| sqlite_error(database_path, source))?;
-    if let Some(previous_claim) = previous_claim.filter(|claim| claim != copy_claim_id) {
-        transaction
-            .execute(
-                "UPDATE copy_claims SET state = 'superseded', state_origin_id = ?2, state_origin_seq = ?3, state_record_id = ?4, last_seen_record_id = ?4, last_seen_time_utc_ms = ?5 WHERE copy_claim_id = ?1",
-                params![previous_claim, origin_id, origin_seq, record_id, observed_time],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-    }
-    transaction
-        .execute(
-            "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding, relative_path_display, object_id, external_identity_id, claim_basis, state, state_origin_id, state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms, last_complete_scan_id, last_verified_record_id, last_verified_time_utc_ms, last_verification_result, last_error_code, last_error_detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'observed_bytes', 'present', ?8, ?9, ?10, ?10, ?10, ?11, NULL, ?10, ?11, 'ok', NULL, NULL)
-             ON CONFLICT(copy_claim_id) DO UPDATE SET object_id = excluded.object_id, external_identity_id = COALESCE(excluded.external_identity_id, copy_claims.external_identity_id), claim_basis = 'observed_bytes', state = 'present', state_origin_id = excluded.state_origin_id, state_origin_seq = excluded.state_origin_seq, state_record_id = excluded.state_record_id, last_seen_record_id = excluded.last_seen_record_id, last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, last_verified_record_id = excluded.last_verified_record_id, last_verified_time_utc_ms = excluded.last_verified_time_utc_ms, last_verification_result = 'ok', last_error_code = NULL, last_error_detail = NULL",
-            params![copy_claim_id, location_id, copy_bytes, copy.encoding, copy.display, object_id, external_identity_id, origin_id, origin_seq, record_id, observed_time],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    let verification_id = format!("verify_{}_{item_index}", record_id);
-    transaction
-        .execute(
-            "INSERT OR IGNORE INTO verification_results(verification_id, record_id, item_index, job_id, copy_claim_id, object_id, location_id, result, expected_hash_algo, expected_hash_hex, observed_hash_hex, size_bytes, bytes_read, duration_ms, verified_time_utc_ms, path_observed_bytes, path_observed_encoding, path_observed_display, device_fingerprint_status, error_code, error_detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok', 'blake3', ?8, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, NULL)",
-            params![
-                verification_id,
-                record_id,
-                sql_i64(item_index, "content item index")?,
-                item.get("job_id").and_then(Value::as_str),
-                copy_claim_id,
-                object_id,
-                location_id,
-                hash_hex,
-                size,
-                item.get("duration_ms").and_then(Value::as_u64).map(|value| sql_i64(value, "hash duration")).transpose()?,
-                observed_time,
-                copy_bytes,
-                copy.encoding,
-                copy.display,
-                string(item, "device_fingerprint_status")?,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn insert_file_identity_conflict(
     transaction: &Transaction<'_>,
@@ -2597,7 +2083,7 @@ fn insert_file_identity_conflict(
         (observed, existing)
     };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"file_identity_conflict ");
+    hasher.update(b"file_identity_conflict\0");
     hasher.update(&entity_key);
     hasher.update(left.0.as_bytes());
     hasher.update(&left.1.to_be_bytes());
@@ -2621,200 +2107,6 @@ fn insert_file_identity_conflict(
                 right.0,
                 sql_i64(right.1, "right conflict sequence")?,
                 right.2,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    Ok(())
-}
-
-fn project_copy_verification_failed(
-    transaction: &Transaction<'_>,
-    item: &serde_json::Map<String, Value>,
-    record: &VerifiedV2Record,
-    item_index: u64,
-    database_path: &Path,
-) -> Result<()> {
-    let copy_claim_id = string(item, "copy_claim_id")?;
-    let location_id = string(item, "location_id")?;
-    let result = string(item, "result")?;
-    if !matches!(result, "hash_mismatch" | "read_error" | "identity_mismatch") {
-        return Err(V2ProjectionError::Invalid(format!(
-            "unsupported verification failure {result:?}"
-        )));
-    }
-    let path: crate::registry::RegistryPath =
-        serde_json::from_value(required(item, "copy_path")?.clone()).map_err(|error| {
-            V2ProjectionError::Invalid(format!("verification path is invalid: {error}"))
-        })?;
-    let path_bytes = registry_path_bytes(&path)
-        .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
-    let verified_time = item
-        .get("verified_time_utc_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(record.record.envelope.time_utc_ms);
-    // Ordinary inventory may find bad bytes at a Location with no prior Copy.
-    // These optional fields attach failure evidence to the already cataloged File;
-    // they never replace its expected identity or create an observed good Object.
-    if let Some(file_ref_id) = item.get("file_ref_id").and_then(Value::as_str) {
-        let collection_id = string(item, "collection_id")?;
-        let object_id = string(item, "object_id")?;
-        let logical: crate::registry::RegistryPath =
-            serde_json::from_value(required(item, "logical_path")?.clone()).map_err(|error| {
-                V2ProjectionError::Invalid(format!("verification logical path is invalid: {error}"))
-            })?;
-        let logical_bytes = registry_path_bytes(&logical)
-            .map_err(|error| V2ProjectionError::Invalid(error.to_string()))?;
-        let valid: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM file_refs f WHERE f.file_ref_id = ?1
-                AND f.collection_id = ?2 AND f.logical_path_encoding = ?3 AND f.logical_path_bytes = ?4)
-             AND EXISTS(SELECT 1 FROM objects o WHERE o.object_id = ?5
-                AND o.canonical_hash_algo = 'blake3' AND o.canonical_hash_hex = ?6)",
-            params![file_ref_id, collection_id, logical.encoding, logical_bytes, object_id,
-                string(item, "expected_hash_hex")?],
-            |row| row.get(0),
-        ).map_err(|source| sqlite_error(database_path, source))?;
-        if !valid || result != "hash_mismatch" || string(item, "expected_hash_algo")? != "blake3" {
-            return Err(V2ProjectionError::Invalid(
-                "ordinary verification failure has invalid expected File/Object".to_owned(),
-            ));
-        }
-        transaction.execute(
-            "UPDATE file_refs SET path_state = 'active', removed_record_id = NULL WHERE file_ref_id = ?1",
-            [file_ref_id],
-        ).map_err(|source| sqlite_error(database_path, source))?;
-        let record_id = &record.record.envelope.record_id;
-        let origin_id = &record.record.envelope.origin_id;
-        let origin_seq = sql_i64(
-            record.record.envelope.origin_seq,
-            "verification origin sequence",
-        )?;
-        let time = sql_i64(verified_time, "verification time")?;
-        let existing_claim: Option<(String, String, Vec<u8>, Option<String>)> = transaction.query_row(
-            "SELECT location_id, relative_path_encoding, relative_path_bytes, object_id FROM copy_claims WHERE copy_claim_id = ?1",
-            [copy_claim_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        ).optional().map_err(|source| sqlite_error(database_path, source))?;
-        if existing_claim
-            .as_ref()
-            .is_some_and(|(location, encoding, bytes, object)| {
-                location != location_id
-                    || encoding != &path.encoding
-                    || bytes != &path_bytes
-                    || object.as_deref() != Some(object_id)
-            })
-        {
-            return Err(V2ProjectionError::Invalid(
-                "verification failure changes Copy identity".to_owned(),
-            ));
-        }
-        transaction
-            .execute(
-                "UPDATE copy_claims SET state = 'superseded', state_origin_id = ?5,
-                state_origin_seq = ?6, state_record_id = ?7, last_seen_record_id = ?7,
-                last_seen_time_utc_ms = ?8
-             WHERE location_id = ?1 AND relative_path_encoding = ?2 AND relative_path_bytes = ?3
-                AND state != 'superseded' AND copy_claim_id != ?4",
-                params![
-                    location_id,
-                    path.encoding,
-                    path_bytes,
-                    copy_claim_id,
-                    origin_id,
-                    origin_seq,
-                    record_id,
-                    time
-                ],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-        transaction.execute(
-            "INSERT INTO copy_claims(copy_claim_id, location_id, relative_path_bytes, relative_path_encoding,
-                relative_path_display, object_id, claim_basis, state, state_origin_id,
-                state_origin_seq, state_record_id, first_seen_record_id, last_seen_record_id, last_seen_time_utc_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'observed_bytes', 'corrupt', ?7, ?8, ?9, ?9, ?9, ?10)
-             ON CONFLICT(copy_claim_id) DO NOTHING",
-            params![copy_claim_id, location_id, path_bytes, path.encoding, path.display,
-                object_id, origin_id, origin_seq, record_id, time],
-        ).map_err(|source| sqlite_error(database_path, source))?;
-        transaction.execute(
-            "INSERT INTO path_observations(file_ref_id, location_id, observed_path_bytes, observed_path_encoding,
-                observed_path_display, representation, object_id, state, first_seen_record_id,
-                last_seen_record_id, last_seen_time_utc_ms, observed_size_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'ordinary_file', ?6, 'present', ?7, ?7, ?8, ?9)
-             ON CONFLICT(file_ref_id, location_id, observed_path_encoding, observed_path_bytes) DO UPDATE SET
-                state = 'present', object_id = excluded.object_id, last_seen_record_id = excluded.last_seen_record_id,
-                last_seen_time_utc_ms = excluded.last_seen_time_utc_ms, observed_size_bytes = excluded.observed_size_bytes",
-            params![file_ref_id, location_id, logical_bytes, logical.encoding, logical.display,
-                object_id, record_id, time, item.get("size_bytes").and_then(Value::as_u64)
-                    .map(|value| sql_i64(value, "verification size")).transpose()?],
-        ).map_err(|source| sqlite_error(database_path, source))?;
-    }
-    let state = if result == "hash_mismatch" {
-        "corrupt"
-    } else {
-        "unknown"
-    };
-    let changed = transaction
-        .execute(
-            "UPDATE copy_claims SET state = ?2, state_origin_id = ?3, state_origin_seq = ?4,
-                 state_record_id = ?5, last_seen_record_id = ?5, last_seen_time_utc_ms = ?6,
-                 last_verified_record_id = ?5, last_verified_time_utc_ms = ?6,
-                 last_verification_result = ?7, last_error_code = ?7, last_error_detail = ?8
-             WHERE copy_claim_id = ?1 AND location_id = ?9",
-            params![
-                copy_claim_id,
-                state,
-                record.record.envelope.origin_id,
-                sql_i64(
-                    record.record.envelope.origin_seq,
-                    "verification origin sequence"
-                )?,
-                record.record.envelope.record_id,
-                sql_i64(verified_time, "verification time")?,
-                result,
-                item.get("error_detail").and_then(Value::as_str),
-                location_id,
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    if changed != 1 {
-        return Err(V2ProjectionError::Invalid(format!(
-            "verification failure references unknown Copy {copy_claim_id}"
-        )));
-    }
-    transaction
-        .execute(
-            "INSERT INTO verification_results(verification_id, record_id, item_index, job_id,
-                 copy_claim_id, object_id, location_id, result, expected_hash_algo,
-                 expected_hash_hex, observed_hash_hex, size_bytes, bytes_read, duration_ms,
-                 verified_time_utc_ms, path_observed_bytes, path_observed_encoding,
-                 path_observed_display, device_fingerprint_status, error_code, error_detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13,
-                     ?14, ?15, ?16, ?17, ?18, ?8, ?19)",
-            params![
-                format!("verify_{}_{item_index}", record.record.envelope.record_id),
-                record.record.envelope.record_id,
-                sql_i64(item_index, "verification item index")?,
-                item.get("job_id").and_then(Value::as_str),
-                copy_claim_id,
-                item.get("object_id").and_then(Value::as_str),
-                location_id,
-                result,
-                item.get("expected_hash_algo").and_then(Value::as_str),
-                item.get("expected_hash_hex").and_then(Value::as_str),
-                item.get("observed_hash_hex").and_then(Value::as_str),
-                item.get("size_bytes")
-                    .and_then(Value::as_u64)
-                    .map(|value| sql_i64(value, "verification size"))
-                    .transpose()?,
-                item.get("duration_ms")
-                    .and_then(Value::as_u64)
-                    .map(|value| sql_i64(value, "verification duration"))
-                    .transpose()?,
-                sql_i64(verified_time, "verification time")?,
-                path_bytes,
-                path.encoding,
-                path.display,
-                string(item, "device_fingerprint_status")?,
-                item.get("error_detail").and_then(Value::as_str),
             ],
         )
         .map_err(|source| sqlite_error(database_path, source))?;
@@ -3030,7 +2322,7 @@ fn project_batch_complete(
             record.record.envelope.batch_id
         )));
     }
-    finalize_scans_for_batch(transaction, record, path)?;
+    compact::finalize_scans_for_batch(transaction, record, path)?;
     transaction.execute(
         "UPDATE batch_runs SET complete_seq = ?2, item_digest = ?3, state = 'complete' WHERE batch_id = ?1",
         params![
@@ -3042,205 +2334,6 @@ fn project_batch_complete(
             string(payload, "ordered_item_digest")?
         ],
     ).map_err(|source| sqlite_error(path, source))?;
-    Ok(())
-}
-
-fn finalize_scans_for_batch(
-    transaction: &Transaction<'_>,
-    record: &VerifiedV2Record,
-    database_path: &Path,
-) -> Result<()> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT scan_id, desired_status, finished_time_utc_ms, summary_json, finished_record_id
-             FROM scan_pending_completions WHERE batch_id = ?1 ORDER BY scan_id",
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
-    let pending = statement
-        .query_map([&record.record.envelope.batch_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(|source| sqlite_error(database_path, source))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|source| sqlite_error(database_path, source))?;
-    drop(statement);
-    for (scan_id, status, finished_time, summary_json, finished_record_id) in pending {
-        let summary: Value = serde_json::from_str(&summary_json)?;
-        let summary = object(&summary, "scan summary")?;
-        let scan_info: (String, String, String, i64) = transaction
-            .query_row(
-                "SELECT scan_mode, location_id, collection_id, started_time_utc_ms FROM scan_runs WHERE scan_id = ?1 AND status = 'running'",
-                [&scan_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-        if status == "complete" && scan_info.0 == "complete" {
-            let candidate_count: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM scan_missing_candidates WHERE scan_id = ?1 AND activated = 0 AND candidate_kind = 'path'",
-                    [&scan_id],
-                    |row| row.get(0),
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            if sql_u64(candidate_count, "scan candidate count")?
-                != number(summary, "missing_paths")?
-            {
-                return Err(V2ProjectionError::Invalid(format!(
-                    "scan {scan_id} missing-candidate count does not match its completion"
-                )));
-            }
-            transaction
-                .execute(
-                    "UPDATE path_observations
-                     SET state = 'missing', last_complete_scan_id = ?1, last_seen_record_id = ?2
-                     WHERE EXISTS (
-                       SELECT 1 FROM scan_missing_candidates c
-                       WHERE c.scan_id = ?1 AND c.activated = 0 AND c.candidate_kind = 'path'
-                         AND c.file_ref_id = path_observations.file_ref_id
-                         AND c.location_id = path_observations.location_id
-                         AND c.path_encoding = path_observations.observed_path_encoding
-                         AND c.path_bytes = path_observations.observed_path_bytes
-                     )",
-                    params![scan_id, &record.record.envelope.record_id],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            transaction
-                .execute(
-                    "UPDATE copy_claims
-                     SET state = 'missing', state_origin_id = ?2, state_origin_seq = ?3,
-                         state_record_id = ?4, last_complete_scan_id = ?1
-                     WHERE copy_claim_id IN (
-                       SELECT copy_claim_id FROM scan_missing_candidates
-                       WHERE scan_id = ?1 AND activated = 0 AND copy_claim_id IS NOT NULL
-                     )",
-                    params![
-                        scan_id,
-                        record.record.envelope.origin_id,
-                        sql_i64(
-                            record.record.envelope.origin_seq,
-                            "scan completion origin sequence"
-                        )?,
-                        record.record.envelope.record_id,
-                    ],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            transaction
-                .execute(
-                    "UPDATE scan_missing_candidates SET activated = 1 WHERE scan_id = ?1",
-                    [&scan_id],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            transaction
-                .execute(
-                    "UPDATE path_observations SET last_complete_scan_id = ?1
-                     WHERE location_id = ?2 AND state = 'present' AND file_ref_id IN (
-                       SELECT file_ref_id FROM file_refs WHERE collection_id = ?3 AND path_state = 'active'
-                     )",
-                    params![scan_id, scan_info.1, scan_info.2],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            transaction
-                .execute(
-                    "UPDATE copy_claims SET last_complete_scan_id = ?1
-                     WHERE location_id = ?2 AND state IN ('present', 'corrupt', 'unknown')
-                       AND EXISTS (
-                         SELECT 1 FROM path_observations p JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-                         WHERE p.location_id = ?2 AND f.collection_id = ?3
-                           AND p.observed_path_encoding = copy_claims.relative_path_encoding
-                           AND p.observed_path_bytes = copy_claims.relative_path_bytes
-                       )",
-                    params![scan_id, scan_info.1, scan_info.2],
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            // A complete scan saw every covered fact it did not make missing, including
-            // unchanged files it emitted no item for. Refresh their presence to the
-            // scan's start, never moving a later observation backwards. Completions
-            // from before unchanged files were skipped lack `unchanged_files`; they
-            // itemized everything they read, so replaying them stays exact.
-            if summary.contains_key("unchanged_files") {
-                transaction
-                    .execute(
-                        "UPDATE path_observations
-                         SET last_seen_time_utc_ms = MAX(COALESCE(last_seen_time_utc_ms, 0), ?2)
-                         WHERE last_complete_scan_id = ?1 AND state = 'present'",
-                        params![scan_id, scan_info.3],
-                    )
-                    .map_err(|source| sqlite_error(database_path, source))?;
-                // A claim is refreshed only through a present observation this scan
-                // covered: its own path, or for a locked annex symlink its key. A
-                // missing observation from another Collection never counts.
-                transaction
-                    .execute(
-                        "UPDATE copy_claims
-                         SET last_seen_time_utc_ms = MAX(COALESCE(last_seen_time_utc_ms, 0), ?2)
-                         WHERE location_id = ?3 AND state IN ('present', 'corrupt', 'unknown')
-                           AND EXISTS (
-                             SELECT 1 FROM path_observations p
-                             WHERE p.location_id = copy_claims.location_id
-                               AND p.last_complete_scan_id = ?1 AND p.state = 'present'
-                               AND ((p.observed_path_encoding = copy_claims.relative_path_encoding
-                                     AND p.observed_path_bytes = copy_claims.relative_path_bytes)
-                                 OR (p.representation = 'annex_locked_symlink'
-                                     AND p.external_identity_id = copy_claims.external_identity_id))
-                           )",
-                        params![scan_id, scan_info.3, scan_info.1],
-                    )
-                    .map_err(|source| sqlite_error(database_path, source))?;
-            }
-        } else {
-            let candidates: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM scan_missing_candidates WHERE scan_id = ?1",
-                    [&scan_id],
-                    |row| row.get(0),
-                )
-                .map_err(|source| sqlite_error(database_path, source))?;
-            if candidates != 0 {
-                return Err(V2ProjectionError::Invalid(format!(
-                    "non-complete scan {scan_id} contains missing candidates"
-                )));
-            }
-        }
-        let error_count = number(summary, "read_errors")?
-            .saturating_add(number(summary, "concurrent_changes")?)
-            .saturating_add(number(summary, "traversal_errors")?);
-        transaction
-            .execute(
-                "UPDATE scan_runs SET status = ?2, finished_time_utc_ms = ?3,
-                   observations_count = ?4, missing_candidate_count = ?5,
-                   files_seen = ?4, bytes_seen = ?6, new_paths = ?7,
-                   changed_paths = ?8, missing_paths = ?5, unchanged_paths = ?9,
-                   error_count = ?10, error_summary_json = ?11, finished_record_id = ?12
-                 WHERE scan_id = ?1 AND status = 'running'",
-                params![
-                    scan_id,
-                    status,
-                    finished_time,
-                    sql_i64(number(summary, "files_observed")?, "scan files seen")?,
-                    sql_i64(number(summary, "missing_paths")?, "scan missing paths")?,
-                    sql_i64(number(summary, "bytes_observed")?, "scan bytes seen")?,
-                    sql_i64(number(summary, "new_paths")?, "scan new paths")?,
-                    sql_i64(number(summary, "changed_paths")?, "scan changed paths")?,
-                    sql_i64(number(summary, "confirmed_good")?, "scan unchanged paths")?,
-                    sql_i64(error_count, "scan error count")?,
-                    summary_json,
-                    finished_record_id,
-                ],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-        transaction
-            .execute(
-                "DELETE FROM scan_pending_completions WHERE scan_id = ?1",
-                [&scan_id],
-            )
-            .map_err(|source| sqlite_error(database_path, source))?;
-    }
     Ok(())
 }
 
@@ -3457,7 +2550,7 @@ mod tests {
         assert_eq!(invalid.code(), "v2_projection_invalid");
         assert_eq!(
             invalid.to_string(),
-            "schema-6 projection is invalid: original validation detail"
+            "SQLite projection is invalid: original validation detail"
         );
     }
 
@@ -3531,7 +2624,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_schema_six_and_rebuilds_equivalent_projection() {
+    fn creates_compact_schema_and_rebuilds_equivalent_projection() {
         let temp = TempDir::new().unwrap();
         let archive = temp.path().join("archive");
         initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
@@ -3541,7 +2634,7 @@ mod tests {
             .unwrap()
             .status()
             .unwrap();
-        assert_eq!(initial.schema_version, 6);
+        assert_eq!(initial.schema_version, V2_SQLITE_SCHEMA_VERSION);
         assert_eq!(initial.records, 3);
         assert_eq!(initial.collections, 0);
         let connection = Connection::open(archive.join("archive.db")).unwrap();
@@ -3567,13 +2660,63 @@ mod tests {
         assert_eq!(initial, rebuilt);
     }
 
+    #[test]
+    fn schema_upgrade_retains_previous_database_and_rebuild_does_not_retain_current_schema() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("archive");
+        initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let path = archive.join("archive.db");
+        // A prior local database is preserved byte-for-byte; its contents are not
+        // migration input. Only the signed canonical store supplies the new facts.
+        let previous = Connection::open(&path).unwrap();
+        previous.execute_batch("PRAGMA user_version=6; CREATE TABLE old_data(value TEXT); INSERT INTO old_data VALUES ('preserve me');").unwrap();
+        drop(previous);
+        let old_bytes = fs::read(&path).unwrap();
+        let canonical_head = fs::read(store.root().join("frontiers/v2/HEAD")).unwrap();
+        let stats = V2ProjectionDb::rebuild(&store, &path).unwrap();
+        let backup = stats.previous_database.unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), old_bytes);
+        assert_eq!(
+            fs::read(store.root().join("frontiers/v2/HEAD")).unwrap(),
+            canonical_head
+        );
+        assert_eq!(
+            V2ProjectionDb::open_existing(&path)
+                .unwrap()
+                .status()
+                .unwrap()
+                .schema_version,
+            V2_SQLITE_SCHEMA_VERSION
+        );
+        assert!(V2ProjectionDb::rebuild(&store, &path)
+            .unwrap()
+            .previous_database
+            .is_none());
+        assert_eq!(fs::read(&backup).unwrap(), old_bytes);
+    }
+
     fn projection_rows(connection: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
         let filter = if table == "archive_meta" {
             " WHERE key NOT IN ('projection_generation', 'policy_input_generation')"
         } else {
             ""
         };
-        let query = format!("SELECT * FROM {table}{filter}");
+        let fields = connection
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|name| {
+                !(name == "id" && matches!(table, "records" | "collections" | "locations"))
+            })
+            .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!("SELECT {fields} FROM {table}{filter}");
         let columns = connection.prepare(&query).unwrap().column_count();
         let order = (1..=columns)
             .map(|column| column.to_string())
@@ -3660,11 +2803,34 @@ mod tests {
             )
             .unwrap();
 
+        registry
+            .record(
+                RegistryChange::Location(
+                    RegistryAction::Register,
+                    LocationSnapshot {
+                        location_id: "location_annex_cas".to_owned(),
+                        display_name: "Annex objects".to_owned(),
+                        kind: "service".to_owned(),
+                        archive_root_id: None,
+                        relative_path: None,
+                        device_id: None,
+                        site_id: Some("site_home".to_owned()),
+                        encryption_state: Some("unknown".to_owned()),
+                        trust_level: Some("trusted".to_owned()),
+                        expected_availability: "online".to_owned(),
+                        is_writable: true,
+                        status: "active".to_owned(),
+                    },
+                ),
+                "desktop",
+            )
+            .unwrap();
+
         let entry = |index: usize, operation: &str| {
             json!({
                 "kind": "annex_entry_observed", "operation_key": operation,
                 "external_identity_id": format!("external_{index}"), "external_key": format!("key_{index}"),
-                "backend": "SHA256E", "expected_hash_algo": "sha256", "expected_hash_hex": "abc",
+                "backend": "SHA256E", "expected_hash_algo": "sha256", "expected_hash_hex": "a".repeat(64),
                 "expected_size_bytes": 4, "resolution_state": "unresolved", "source_repo_id": "repo_main",
                 "file_ref_id": format!("file_{index}"), "collection_id": "collection_files",
                 "logical_path": RegistryPath::utf8(format!("file-{index}")),
@@ -3691,6 +2857,16 @@ mod tests {
         resolved["copy_state"] = json!("present");
         resolved["local_availability"] = json!("present");
         resolved["verification_result"] = json!("ok");
+        let mut distinct_cas = resolved.clone();
+        distinct_cas["operation_key"] = json!("resolved_distinct_cas");
+        distinct_cas["file_ref_id"] = json!("file_distinct_cas");
+        distinct_cas["logical_path"] = json!(RegistryPath::utf8("separate-cas-file"));
+        distinct_cas["external_identity_id"] = json!("external_distinct_cas");
+        distinct_cas["external_key"] = json!("key_distinct_cas");
+        distinct_cas["copy_claim_id"] = json!("copy_distinct_cas");
+        distinct_cas["cas_location_id"] = json!("location_annex_cas");
+        distinct_cas["copy_location_id"] = json!("location_annex_cas");
+        distinct_cas["copy_path"] = json!(RegistryPath::utf8("objects/ab/cd/content"));
         append_projection_items(&store, vec![resolved]);
         // Repeated metadata must retain resolved identity and verification facts.
         append_projection_items(&store, vec![entry(0, "reimport_0")]);
@@ -3712,6 +2888,9 @@ mod tests {
                     "read_errors":0,"concurrent_changes":0,"traversal_errors":0}}),
             ],
         );
+        // Append after the existing complete-scan scenario so its coverage counts
+        // remain unchanged. The link and its readable bytes occupy distinct Locations.
+        append_projection_items(&store, vec![distinct_cas]);
         assert!(live.apply(&store).unwrap().records_applied > 64);
         let rebuilt_path = archive.join("rebuilt.db");
         V2ProjectionDb::rebuild(&store, &rebuilt_path).unwrap();
@@ -3725,13 +2904,77 @@ mod tests {
         let expected_schema = schema(&connection);
         assert_eq!(expected_schema, schema(&rebuilt));
         for (kind, name, _, _) in expected_schema {
-            if kind == "table" {
+            if (kind == "table" && !COMPACT_TABLES.contains(&name.as_str())) || kind == "view" {
                 assert_eq!(
                     projection_rows(&connection, &name),
                     projection_rows(&rebuilt, &name),
                     "table {name}"
                 );
             }
+        }
+        for db in [&connection, &rebuilt] {
+            let checks = db
+                .prepare(
+                    "SELECT location_id, presence, integrity FROM file_checks
+                     WHERE file_ref_id='file_distinct_cas' OR copy_claim_id='copy_distinct_cas' ORDER BY location_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(
+                checks,
+                vec![
+                    ("location_annex_cas".to_owned(), 1, 1),
+                    ("location_main".to_owned(), 1, 0),
+                ],
+                "only the CAS Location receives content-integrity evidence",
+            );
+            let observation: (String, String) = db
+                .query_row(
+                    "SELECT location_id, observed_path_display FROM path_observations
+                 WHERE file_ref_id='file_distinct_cas'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                observation,
+                ("location_main".to_owned(), "separate-cas-file".to_owned())
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM path_observations WHERE file_ref_id='file_distinct_cas'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1,
+                "the CAS binding must not invent another logical-path observation",
+            );
+            let copy: (String, String, String) = db
+                .query_row(
+                    "SELECT location_id, relative_path_display, last_verification_result
+                 FROM copy_claims WHERE copy_claim_id='copy_distinct_cas'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                copy,
+                (
+                    "location_annex_cas".to_owned(),
+                    "objects/ab/cd/content".to_owned(),
+                    "ok".to_owned()
+                )
+            );
         }
         let state: (String, String, String) = rebuilt.query_row(
             "SELECT p.state, c.state, p.last_complete_scan_id FROM path_observations p JOIN copy_claims c ON c.copy_claim_id = 'copy_1' WHERE p.file_ref_id = 'file_1'",
@@ -3963,7 +3206,7 @@ mod tests {
         let expected_schema = read_schema(&expected);
         assert_eq!(read_schema(&connection), expected_schema);
         for (kind, name, _, _) in expected_schema {
-            if kind == "table" {
+            if (kind == "table" && !COMPACT_TABLES.contains(&name.as_str())) || kind == "view" {
                 assert_eq!(
                     projection_rows(&connection, &name),
                     projection_rows(&expected, &name),
@@ -3996,7 +3239,7 @@ mod tests {
         let error = V2ProjectionDb::open_existing(path).unwrap_err();
         assert!(error
             .to_string()
-            .contains("Pre-v2 development Archives must be recreated"));
+            .contains("Run archive db rebuild to rebuild from the existing canonical records"));
     }
 
     #[test]
