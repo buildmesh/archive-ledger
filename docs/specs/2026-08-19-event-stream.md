@@ -505,8 +505,8 @@ batch completions have projected. A failure leaves every affected cursor before
 the failing transaction. Neither normal apply nor synchronization reconstructs
 the complete database or copies rows from another database.
 
-Incremental apply and rebuild share a replay engine that streams up to 64 canonical
-records per transaction, uses a 64 MiB SQLite page-cache target, and reuses annex
+Incremental apply and rebuild share a replay engine that streams up to 256 canonical
+records per transaction, uses a 128 MiB SQLite page-cache target, and reuses annex
 projection statements. Records are decoded one at a time; the cache target is
 not a process-memory limit. Incremental apply keeps every index and preserves
 normal journaling and synchronization. Progress advances after a group commits;
