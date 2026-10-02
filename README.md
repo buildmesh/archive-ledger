@@ -122,6 +122,14 @@ archive --version
 `make install` checks dependencies, performs a locked release build, and installs
 `$HOME/.local/bin/archive`. Use `make install PREFIX=/usr/local` or `DESTDIR` when packaging.
 
+Catalog replay (initial import, job resume, and rebuild) uses a 128 MiB SQLite page-cache
+target and commits groups of up to 256 canonical records. Repository builds also set the
+bundled SQLite statement-journal spill threshold to 1 MiB, retaining disk fallback and the
+existing durability settings. These settings reduce small writes; they are not a total-process
+memory limit. Builds launched outside this repository (including library consumers) must set
+`LIBSQLITE3_FLAGS=-DSQLITE_STMTJRNL_SPILL=1048576` themselves for the same tuning. If that
+variable is already set, include this definition alongside your other flags.
+
 ### Run with Docker Compose
 
 The repository includes a multi-stage `Dockerfile` and a Compose configuration. Compose is used as

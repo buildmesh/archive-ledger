@@ -495,12 +495,12 @@ pub struct V2ApplyStats {
 }
 
 // Stream records into bounded durable groups; do not buffer canonical input.
-const REPLAY_RECORDS_PER_TRANSACTION: usize = 64;
+const REPLAY_RECORDS_PER_TRANSACTION: usize = 256;
 
 fn configure_replay(connection: &Connection, path: &Path) -> Result<()> {
     // Bound SQLite's page-cache target rather than retaining event rows.
     connection
-        .execute_batch("PRAGMA cache_size = -65536;")
+        .execute_batch("PRAGMA cache_size = -131072;")
         .map_err(|source| sqlite_error(path, source))?;
     connection.set_prepared_statement_cache_capacity(32);
     Ok(())
@@ -2842,8 +2842,8 @@ mod tests {
                 "claim_basis": "source_metadata", "job_id": "job_import",
             })
         };
-        // More than 64 canonical records, while keeping the fixture tiny.
-        for index in 0..22 {
+        // Cross a replay transaction boundary while keeping the fixture tiny.
+        for index in 0..86 {
             append_projection_items(&store, vec![entry(index, &format!("first_{index}"))]);
         }
         let hash = "b".repeat(64);
@@ -2883,7 +2883,7 @@ mod tests {
                 "path":RegistryPath::utf8("file-1")}),
                 json!({"kind":"scan_completed", "scan_id":"scan_full", "status":"complete",
                 "finished_time_utc_ms":1_782_000_000_002_u64,
-                "summary":{"missing_paths":1,"files_observed":21,"bytes_observed":84,
+                "summary":{"missing_paths":1,"files_observed":85,"bytes_observed":340,
                     "new_paths":0,"changed_paths":0,"confirmed_good":1,
                     "read_errors":0,"concurrent_changes":0,"traversal_errors":0}}),
             ],
@@ -2891,7 +2891,9 @@ mod tests {
         // Append after the existing complete-scan scenario so its coverage counts
         // remain unchanged. The link and its readable bytes occupy distinct Locations.
         append_projection_items(&store, vec![distinct_cas]);
-        assert!(live.apply(&store).unwrap().records_applied > 64);
+        assert!(
+            live.apply(&store).unwrap().records_applied > REPLAY_RECORDS_PER_TRANSACTION as u64
+        );
         let rebuilt_path = archive.join("rebuilt.db");
         V2ProjectionDb::rebuild(&store, &rebuilt_path).unwrap();
         let connection = live.open().unwrap();
@@ -3023,6 +3025,31 @@ mod tests {
     }
 
     #[test]
+    fn replay_configuration_bounds_memory_and_preserves_durability() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_replay(&connection, Path::new(":memory:")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            -131072
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(connection
+            .query_row(
+                "SELECT sqlite_compileoption_used('STMTJRNL_SPILL=1048576')",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+    }
+
+    #[test]
     fn failed_replay_group_rolls_back_and_preserves_installed_database() {
         let temp = TempDir::new().unwrap();
         let archive = temp.path().join("archive");
@@ -3032,13 +3059,13 @@ mod tests {
         V2ProjectionDb::create_from_store(&store, &installed).unwrap();
         let grouped_path = archive.join("grouped.db");
         fs::copy(&installed, &grouped_path).unwrap();
-        for index in 0..23 {
+        for index in 0..87 {
             append_projection_items(
                 &store,
                 vec![json!({
                     "kind":"archive_updated", "archive_id":"arc_test",
                     "archive_display_name":format!("Batch {index}"),
-                    "operation_key":format!("operation_{}", index.min(21)),
+                    "operation_key":format!("operation_{}", index.min(85)),
                 })],
             );
         }
@@ -3054,21 +3081,21 @@ mod tests {
             vec![
                 V2ApplyProgress::Verifying,
                 V2ApplyProgress::Applying {
-                    records_applied: 64,
-                    total_records: 69
+                    records_applied: 256,
+                    total_records: 261
                 },
             ]
         );
         let connection = grouped.open().unwrap();
-        // The first group ends with batch 21's start, at origin sequence 67.
+        // The first group ends with batch 85's start, at origin sequence 259.
         // Its chunk and the failing batch are in the rolled-back second group.
         assert_eq!(
             count(&connection, grouped.path(), "records", None).unwrap(),
-            67
+            259
         );
         assert_eq!(
             meta(&connection, grouped.path(), "archive_display_name").unwrap(),
-            "Batch 20"
+            "Batch 84"
         );
         assert_eq!(
             connection
@@ -3077,12 +3104,12 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            66
+            258
         );
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM operation_outcomes WHERE operation_key='operation_21'",
+                    "SELECT COUNT(*) FROM operation_outcomes WHERE operation_key='operation_85'",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
@@ -3126,7 +3153,7 @@ mod tests {
         V2ProjectionDb::create_from_store(&store, &path).unwrap();
         let expected_path = archive.join("uninterrupted.db");
         fs::copy(&path, &expected_path).unwrap();
-        for index in 0..23 {
+        for index in 0..87 {
             append_projection_items(
                 &store,
                 vec![json!({
@@ -3144,7 +3171,7 @@ mod tests {
             .unwrap()
             .execute_batch(
                 "CREATE TRIGGER fail_replay BEFORE INSERT ON records
-             WHEN NEW.origin_seq = 71 BEGIN SELECT RAISE(ABORT, 'test interruption'); END;",
+             WHEN NEW.origin_seq = 263 BEGIN SELECT RAISE(ABORT, 'test interruption'); END;",
             )
             .unwrap();
         assert!(database
@@ -3153,10 +3180,10 @@ mod tests {
             .to_string()
             .contains("test interruption"));
         let connection = database.open().unwrap();
-        assert_eq!(count(&connection, &path, "records", None).unwrap(), 67);
+        assert_eq!(count(&connection, &path, "records", None).unwrap(), 259);
         assert_eq!(
             meta(&connection, &path, "archive_display_name").unwrap(),
-            "Batch 20"
+            "Batch 84"
         );
         assert_eq!(
             connection
@@ -3165,7 +3192,7 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            66
+            258
         );
         assert_ne!(
             meta(&connection, &path, "applied_frontier_hash").unwrap(),
@@ -3176,7 +3203,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        // Reopen as a new process would. Sequence 67 was already durable but its
+        // Reopen as a new process would. Sequence 259 was already durable but its
         // batch was incomplete; replay must recognize it and finish once.
         let database = V2ProjectionDb::open_existing(&path).unwrap();
         let resumed = database.apply(&store).unwrap();

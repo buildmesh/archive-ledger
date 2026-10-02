@@ -5,6 +5,7 @@ FROM rust:1.97.1-bookworm AS build
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
 COPY src ./src
 
 RUN cargo build --release --locked --bin archive
