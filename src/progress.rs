@@ -117,6 +117,10 @@ impl Progress {
                     total_records,
                 );
             }
+            V2ApplyProgress::ScanFinalization { phase, processed } => {
+                self.phase(phase);
+                self.state.lock().unwrap().inspected = processed;
+            }
             V2ApplyProgress::Finalizing => self.continue_phase("Finalizing catalog index"),
         }
     }
@@ -396,6 +400,18 @@ mod tests {
             progress.snapshot(Duration::ZERO).rows[0][0],
             "2 / 5 records replayed this pass"
         );
+        progress.apply_progress(V2ApplyProgress::ScanFinalization {
+            phase: "Refreshing copy presence (uncommitted)",
+            processed: 512,
+        });
+        assert_eq!(
+            progress.snapshot(Duration::ZERO).rows[0][0],
+            "512 inspected"
+        );
+        assert!(progress
+            .snapshot(Duration::ZERO)
+            .heading
+            .contains("uncommitted"));
         progress.apply_progress(V2ApplyProgress::Applying {
             records_applied: 5,
             total_records: 5,

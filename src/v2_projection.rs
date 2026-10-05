@@ -473,13 +473,19 @@ pub struct V2RebuildStats {
     pub previous_database: Option<PathBuf>,
 }
 
-/// Ephemeral replay progress. Counts advance only after a transaction commits.
+/// Ephemeral replay progress. Record counts advance only after a transaction commits.
+/// Scan-finalization row counts explicitly describe work inside that transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V2ApplyProgress {
     Verifying,
     Applying {
         records_applied: u64,
         total_records: u64,
+    },
+    /// Work within the current transaction; these rows are not committed yet.
+    ScanFinalization {
+        phase: &'static str,
+        processed: u64,
     },
     Finalizing,
 }
@@ -796,7 +802,7 @@ impl V2ProjectionDb {
     }
 
     /// Applies only canonical records beyond each persisted origin cursor.
-    /// Transactions stream up to 64 records; a crash rolls back only the current
+    /// Transactions stream up to 256 records; a crash rolls back only the current
     /// group. Already committed records, including old per-record imports, are
     /// recognized when revisiting an incomplete batch.
     pub fn apply(&self, store: &V2OriginStore) -> Result<V2ApplyStats> {
@@ -982,7 +988,9 @@ impl V2ProjectionDb {
                         project_batch_chunk(transaction, record, context, &self.path)?
                     }
                     V2RecordKind::BatchComplete => {
-                        project_batch_complete(transaction, record, &self.path)?
+                        project_batch_complete(transaction, record, &self.path, &mut |event| {
+                            if let Some(report) = progress.as_mut() { report(event); }
+                        })?
                     }
                 }
             }
@@ -2304,6 +2312,7 @@ fn project_batch_complete(
     transaction: &Transaction<'_>,
     record: &VerifiedV2Record,
     path: &Path,
+    report: &mut dyn FnMut(V2ApplyProgress),
 ) -> Result<()> {
     let payload = object(&record.record.envelope.payload, "batch_complete payload")?;
     let declared = number(payload, "total_items")?;
@@ -2322,7 +2331,7 @@ fn project_batch_complete(
             record.record.envelope.batch_id
         )));
     }
-    compact::finalize_scans_for_batch(transaction, record, path)?;
+    compact::finalize_scans_for_batch(transaction, record, path, report)?;
     transaction.execute(
         "UPDATE batch_runs SET complete_seq = ?2, item_digest = ?3, state = 'complete' WHERE batch_id = ?1",
         params![
@@ -2883,7 +2892,7 @@ mod tests {
                 "path":RegistryPath::utf8("file-1")}),
                 json!({"kind":"scan_completed", "scan_id":"scan_full", "status":"complete",
                 "finished_time_utc_ms":1_782_000_000_002_u64,
-                "summary":{"missing_paths":1,"files_observed":85,"bytes_observed":340,
+                "summary":{"missing_paths":1,"files_observed":85,"bytes_observed":340,"unchanged_files":0,
                     "new_paths":0,"changed_paths":0,"confirmed_good":1,
                     "read_errors":0,"concurrent_changes":0,"traversal_errors":0}}),
             ],
@@ -2891,6 +2900,35 @@ mod tests {
         // Append after the existing complete-scan scenario so its coverage counts
         // remain unchanged. The link and its readable bytes occupy distinct Locations.
         append_projection_items(&store, vec![distinct_cas]);
+        let interrupted_path = archive.join("interrupted.db");
+        fs::copy(&live_path, &interrupted_path).unwrap();
+        let interrupted = V2ProjectionDb::open_existing(&interrupted_path).unwrap();
+        let mut reached_finalization = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            interrupted
+                .apply_with_progress(
+                    &store,
+                    Some(&mut |event| {
+                        if let V2ApplyProgress::ScanFinalization { phase, processed } = event {
+                            if phase == "Refreshing copy presence (uncommitted)" && processed > 0 {
+                                reached_finalization = true;
+                                panic!("interrupt inside uncommitted scan finalization");
+                            }
+                        }
+                    }),
+                )
+                .unwrap();
+        }));
+        assert!(result.is_err() && reached_finalization);
+        let rolled_back = interrupted.open().unwrap();
+        assert_eq!(rolled_back.query_row(
+            "SELECT COUNT(*) FROM scan_runs WHERE scan_id='scan_full' AND status='complete'",
+            [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        drop(rolled_back);
+        // Reopen and replay the published history, without scanning source bytes.
+        let resumed = V2ProjectionDb::open_existing(&interrupted_path).unwrap();
+        assert!(resumed.apply(&store).unwrap().caught_up);
+        assert_eq!(resumed.apply(&store).unwrap().records_applied, 0);
         assert!(
             live.apply(&store).unwrap().records_applied > REPLAY_RECORDS_PER_TRANSACTION as u64
         );
@@ -2904,6 +2942,17 @@ mod tests {
                 .unwrap().collect::<std::result::Result<Vec<_>, _>>().unwrap()
         };
         let expected_schema = schema(&connection);
+        let resumed = resumed.open().unwrap();
+        assert_eq!(expected_schema, schema(&resumed));
+        for (kind, name, _, _) in &expected_schema {
+            if kind == "table" {
+                assert_eq!(
+                    projection_rows(&connection, name),
+                    projection_rows(&resumed, name),
+                    "resumed table {name}"
+                );
+            }
+        }
         assert_eq!(expected_schema, schema(&rebuilt));
         for (kind, name, _, _) in expected_schema {
             if (kind == "table" && !COMPACT_TABLES.contains(&name.as_str())) || kind == "view" {

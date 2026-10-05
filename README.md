@@ -360,6 +360,13 @@ prints its job ID; if the run is interrupted, continue it with `archive job resu
 While a Location has an unfinished scan, a new `location scan` of it is refused rather than
 silently starting over; the error names the job to resume or cancel.
 
+During catalog replay, complete-scan finalization reports its current phase and rows
+processed as **uncommitted** work. A single completion record may update presence across
+the Location; the canonical-record counter advances only after the transaction commits.
+If interrupted, resume the existing job to replay its published observations without
+reading those file contents again. Version 0.1.3 uses temporary indexed path/annex lookups
+to avoid repeatedly searching the whole Location for each copy during this step.
+
 A complete `location scan` also skips unchanged files, and when it finishes it refreshes presence
 for every file it saw. It re-reads new, changed, corrupt, and never-verified files. Byte integrity
 of unchanged files is the job of `archive verify` and the background runner, which re-read copies
