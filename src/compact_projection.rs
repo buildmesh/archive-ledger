@@ -846,12 +846,16 @@ fn scan_targets<F>(
     path: &Path,
     sql: &str,
     scan: &str,
+    report: &mut dyn FnMut(V2ApplyProgress),
+    phase: &'static str,
     mut apply: F,
 ) -> Result<()>
 where
     F: FnMut(i64) -> Result<()>,
 {
     let mut after = 0_i64;
+    let mut processed = 0_u64;
+    report(V2ApplyProgress::ScanFinalization { phase, processed });
     loop {
         let targets = {
             let mut s = tx.prepare_cached(sql).map_err(|e| sqlite_error(path, e))?;
@@ -867,8 +871,88 @@ where
         for target in targets {
             apply(target)?;
             after = target;
+            processed += 1;
         }
+        report(V2ApplyProgress::ScanFinalization { phase, processed });
     }
+    Ok(())
+}
+
+// Build indexed lookup sets once, rather than scanning every logical path for
+// each Copy. These are transaction-local work tables, not new persistent indexes.
+fn prepare_scan_copy_targets(
+    tx: &Transaction<'_>,
+    path: &Path,
+    scan: &str,
+    location: &str,
+    collection: &str,
+) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TEMP TABLE compact_scan_paths(
+        encoding TEXT NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(encoding,bytes)) WITHOUT ROWID;
+        CREATE TEMP TABLE compact_scan_present_paths(
+        encoding TEXT NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(encoding,bytes)) WITHOUT ROWID;
+        CREATE TEMP TABLE compact_scan_annex_ids(id INTEGER PRIMARY KEY);
+        CREATE TEMP TABLE compact_scan_copy_targets(
+        id INTEGER PRIMARY KEY, covered INTEGER NOT NULL, present INTEGER NOT NULL);",
+    )
+    .map_err(|e| sqlite_error(path, e))?;
+    // Match the historical view predicates exactly: coverage includes removed
+    // and absent paths too, but never synthetic annex-content observations.
+    run(
+        tx,
+        path,
+        "INSERT OR IGNORE INTO temp.compact_scan_paths
+        SELECT f.path_encoding,f.path_bytes FROM file_locations p
+        JOIN file_objects f ON f.id=p.file_id
+        WHERE p.location_id=(SELECT id FROM locations WHERE location_id=?1)
+        AND f.collection_id=(SELECT id FROM collections WHERE collection_id=?2)
+        AND p.representation!='annex_content'",
+        params![location, collection],
+    )?;
+    run(
+        tx,
+        path,
+        "INSERT OR IGNORE INTO temp.compact_scan_present_paths
+        SELECT f.path_encoding,f.path_bytes FROM file_locations p
+        JOIN file_objects f ON f.id=p.file_id
+        WHERE p.location_id=(SELECT id FROM locations WHERE location_id=?1)
+        AND p.complete_scan=?2 AND p.presence=1 AND p.representation!='annex_content'",
+        params![location, scan],
+    )?;
+    run(
+        tx,
+        path,
+        "INSERT OR IGNORE INTO temp.compact_scan_annex_ids
+        SELECT p.external_id FROM file_locations p
+        WHERE p.location_id=(SELECT id FROM locations WHERE location_id=?1)
+        AND p.complete_scan=?2 AND p.presence=1
+        AND p.representation='annex_locked_symlink' AND p.external_id IS NOT NULL",
+        params![location, scan],
+    )?;
+    run(
+        tx,
+        path,
+        "INSERT INTO temp.compact_scan_copy_targets
+        SELECT b.id,
+          EXISTS(SELECT 1 FROM temp.compact_scan_paths p
+            WHERE p.encoding=COALESCE(b.locator_encoding,f.path_encoding)
+            AND p.bytes=COALESCE(b.locator_bytes,f.path_bytes)),
+          EXISTS(SELECT 1 FROM temp.compact_scan_present_paths p
+            WHERE p.encoding=COALESCE(b.locator_encoding,f.path_encoding)
+            AND p.bytes=COALESCE(b.locator_bytes,f.path_bytes))
+          OR EXISTS(SELECT 1 FROM temp.compact_scan_annex_ids p WHERE p.id=b.external_id)
+        FROM copy_bindings b JOIN file_locations owner ON owner.id=b.owner
+        JOIN file_objects f ON f.id=owner.file_id
+        WHERE b.location_id=(SELECT id FROM locations WHERE location_id=?1)
+        AND b.state IN('present','corrupt','unknown')",
+        [location],
+    )?;
+    tx.execute_batch(
+        "DROP TABLE temp.compact_scan_paths;
+        DROP TABLE temp.compact_scan_present_paths; DROP TABLE temp.compact_scan_annex_ids;",
+    )
+    .map_err(|e| sqlite_error(path, e))?;
     Ok(())
 }
 
@@ -876,6 +960,7 @@ pub(super) fn finalize_scans_for_batch(
     tx: &Transaction<'_>,
     record: &VerifiedV2Record,
     path: &Path,
+    report: &mut dyn FnMut(V2ApplyProgress),
 ) -> Result<()> {
     let pending = {
         let mut s=tx.prepare("SELECT scan_id,desired_status,finished_time_utc_ms,summary_json,finished_record_id FROM scan_pending_completions WHERE batch_id=?1 ORDER BY scan_id").map_err(|e|sqlite_error(path,e))?;
@@ -906,12 +991,12 @@ pub(super) fn finalize_scans_for_batch(
                     "scan {scan} missing-candidate count does not match its completion"
                 )));
             }
-            scan_targets(tx,path,"SELECT p.id FROM file_locations p JOIN file_objects f ON f.id=p.file_id JOIN locations l ON l.id=p.location_id WHERE p.id>?2 AND EXISTS(SELECT 1 FROM scan_missing_candidates c WHERE c.scan_id=?1 AND c.activated=0 AND c.candidate_kind='path' AND c.file_ref_id=f.canonical_id AND c.location_id=l.location_id AND c.path_encoding=f.path_encoding AND c.path_bytes=f.path_bytes) ORDER BY p.id LIMIT 512",&scan,|id|{
+            scan_targets(tx,path,"SELECT p.id FROM file_locations p JOIN file_objects f ON f.id=p.file_id JOIN locations l ON l.id=p.location_id WHERE p.id>?2 AND EXISTS(SELECT 1 FROM scan_missing_candidates c WHERE c.scan_id=?1 AND c.activated=0 AND c.candidate_kind='path' AND c.file_ref_id=f.canonical_id AND c.location_id=l.location_id AND c.path_encoding=f.path_encoding AND c.path_bytes=f.path_bytes) ORDER BY p.id LIMIT 512",&scan,report,"Applying scan presence (uncommitted)",|id|{
                 let check=presence_check(tx,path,id,finished,0,&record.record.envelope.batch_id)?;
                 run(tx,path,"UPDATE file_locations SET presence=0,complete_scan=?2,last_record=?3,latest_presence=?4 WHERE id=?1",params![id,scan,rid,check])?;
                 Ok(())
             })?;
-            scan_targets(tx,path,"SELECT b.id FROM copy_bindings b WHERE b.id>?2 AND b.canonical_id IN(SELECT copy_claim_id FROM scan_missing_candidates WHERE scan_id=?1 AND activated=0 AND copy_claim_id IS NOT NULL) ORDER BY b.id LIMIT 512",&scan,|id|{
+            scan_targets(tx,path,"SELECT b.id FROM copy_bindings b WHERE b.id>?2 AND b.canonical_id IN(SELECT copy_claim_id FROM scan_missing_candidates WHERE scan_id=?1 AND activated=0 AND copy_claim_id IS NOT NULL) ORDER BY b.id LIMIT 512",&scan,report,"Applying scan presence (uncommitted)",|id|{
                 let owner=key(tx,path,"SELECT owner FROM copy_bindings WHERE id=?1",[id])?;
                 let check=presence_check(tx,path,owner,finished,0,&record.record.envelope.batch_id)?;
                 run(tx,path,"UPDATE copy_bindings SET state='missing',state_record=?2,complete_scan=?3,latest_presence=?4 WHERE id=?1",params![id,rid,scan,check])?;
@@ -924,22 +1009,35 @@ pub(super) fn finalize_scans_for_batch(
                 [&scan],
             )?;
             run(tx,path,"UPDATE file_locations SET complete_scan=?1 WHERE location_id=(SELECT id FROM locations WHERE location_id=?2) AND presence=1 AND file_id IN(SELECT f.id FROM file_objects f JOIN collections c ON c.id=f.collection_id WHERE c.collection_id=?3 AND f.active=1)",params![scan,location,collection])?;
-            run(tx,path,"UPDATE copy_bindings SET complete_scan=?1 WHERE location_id=(SELECT id FROM locations WHERE location_id=?2) AND state IN('present','corrupt','unknown') AND EXISTS(SELECT 1 FROM path_observations p JOIN file_refs f ON f.file_ref_id=p.file_ref_id JOIN copy_claims cc ON cc.copy_claim_id=copy_bindings.canonical_id WHERE p.location_id=?2 AND f.collection_id=?3 AND p.observed_path_encoding=cc.relative_path_encoding AND p.observed_path_bytes=cc.relative_path_bytes)",params![scan,location,collection])?;
+            report(V2ApplyProgress::ScanFinalization {
+                phase: "Matching scan copies (uncommitted)",
+                processed: 0,
+            });
+            prepare_scan_copy_targets(tx, path, &scan, &location, &collection)?;
+            run(
+                tx,
+                path,
+                "UPDATE copy_bindings SET complete_scan=?1 WHERE id IN
+                (SELECT id FROM temp.compact_scan_copy_targets WHERE covered=1)",
+                [&scan],
+            )?;
             if summary.contains_key("unchanged_files") {
-                scan_targets(tx,path,"SELECT id FROM file_locations WHERE complete_scan=?1 AND presence=1 AND id>?2 ORDER BY id LIMIT 512",&scan,|id|{
+                scan_targets(tx,path,"SELECT id FROM file_locations WHERE complete_scan=?1 AND presence=1 AND id>?2 ORDER BY id LIMIT 512",&scan,report,"Applying scan presence (uncommitted)",|id|{
                     let check=presence_check(tx,path,id,start,1,&record.record.envelope.batch_id)?;
                     run(tx,path,"UPDATE file_locations SET seen_time=MAX(seen_time,?2),latest_presence=?3 WHERE id=?1",params![id,start,check])?;
                     Ok(())
                 })?;
-                scan_targets(tx,path,"SELECT b.id FROM copy_bindings b JOIN locations l ON l.id=b.location_id WHERE b.id>?2 AND b.state IN('present','corrupt','unknown') AND l.location_id=(SELECT location_id FROM scan_runs WHERE scan_id=?1) AND EXISTS(SELECT 1 FROM path_observations p JOIN copy_claims cc ON cc.copy_claim_id=b.canonical_id WHERE p.location_id=l.location_id AND p.last_complete_scan_id=?1 AND p.state='present' AND ((p.observed_path_encoding=cc.relative_path_encoding AND p.observed_path_bytes=cc.relative_path_bytes) OR(p.representation='annex_locked_symlink' AND p.external_identity_id=cc.external_identity_id))) ORDER BY b.id LIMIT 512",&scan,|id|{
+                scan_targets(tx,path,"SELECT id FROM temp.compact_scan_copy_targets WHERE id>?2 AND present=1 AND ?1 IS NOT NULL ORDER BY id LIMIT 512",&scan,report,"Refreshing copy presence (uncommitted)",|id|{
                     let owner=key(tx,path,"SELECT owner FROM copy_bindings WHERE id=?1",[id])?;
                     let check=presence_check(tx,path,owner,start,1,&record.record.envelope.batch_id)?;
                     run(tx,path,"UPDATE copy_bindings SET latest_presence=?2 WHERE id=?1",params![id,check])?;
                     Ok(())
                 })?;
             }
-            tx.execute_batch("DROP TABLE temp.compact_scan_presence;")
-                .map_err(|e| sqlite_error(path, e))?;
+            tx.execute_batch(
+                "DROP TABLE temp.compact_scan_presence; DROP TABLE temp.compact_scan_copy_targets;",
+            )
+            .map_err(|e| sqlite_error(path, e))?;
         } else if key(
             tx,
             path,
@@ -1225,3 +1323,7 @@ mod tests {
         assert_eq!(error, "read_error");
     }
 }
+
+#[cfg(test)]
+#[path = "compact_projection/scan_tests.rs"]
+mod scan_tests;
