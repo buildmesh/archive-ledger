@@ -687,6 +687,12 @@ archive report integrity
 archive report policy
 ```
 
+Status and detailed risk reports evaluate copies of content referenced by the selected
+Collection, including protecting copies in other Collections and Locations. Version 0.1.4
+scopes these queries to that content instead of aggregating unrelated archive contents.
+Reports still evaluate current policy freshness on each invocation; limiting displayed
+findings does not limit the Collection totals. No database rebuild is required for this update.
+
 `report integrity` lists copies whose content differs from the catalog (corrupt copies). For each
 one it shows where verified copies of the same content are: Location, Device, path, when each was
 last verified, and whether it is connected now. It says plainly when no verified copy remains in

@@ -4629,6 +4629,40 @@ fn verify_operation_key(job_id: &str, input_version: &str, copy_id: &str, kind: 
     )
 }
 
+// Shared qualification rules for summaries and detailed reports. Keep local integer
+// identities throughout coverage; canonical IDs are only needed for displayed Files.
+const V2_RISK_COVERAGE: &str = include_str!("collection_risk_coverage.sql");
+const V2_RISK_TOTALS: &str = "
+    SELECT COUNT(*), COALESCE(SUM(COALESCE(o.size_bytes, 0)), 0),
+           COALESCE(SUM(CASE WHEN f.content_id IS NOT NULL AND (
+               COALESCE(c.qualifying_copies, 0) < ?7 OR
+               COALESCE(c.devices, 0) < ?8 OR
+               COALESCE(c.sites, 0) < ?9 OR
+               (?10 = 1 AND COALESCE(c.has_offsite, 0) = 0) OR
+               (?11 = 1 AND COALESCE(c.has_offline, 0) = 0) OR
+               (?12 = 1 AND COALESCE(c.has_encrypted_offsite, 0) = 0)
+           ) THEN 1 ELSE 0 END), 0),
+           COALESCE(SUM(CASE WHEN f.content_id IS NULL THEN 1 ELSE 0 END), 0)
+    FROM file_objects f
+    LEFT JOIN content_objects o ON o.id = f.content_id
+    LEFT JOIN coverage c ON c.content_id = f.content_id
+    WHERE f.collection_id = (SELECT id FROM collections WHERE collection_id = ?1)
+      AND f.active = 1";
+const V2_RISK_DETAILS: &str = "
+    SELECT f.canonical_id, COALESCE(f.path_display, CAST(f.path_bytes AS TEXT)),
+           f.content_id, o.size_bytes,
+           COALESCE(c.qualifying_copies, 0), COALESCE(c.devices, 0),
+           COALESCE(c.sites, 0), COALESCE(c.has_offsite, 0),
+           COALESCE(c.has_offline, 0), COALESCE(c.has_encrypted_offsite, 0)
+    FROM file_objects f
+    LEFT JOIN content_objects o ON o.id = f.content_id
+    LEFT JOIN coverage c ON c.content_id = f.content_id
+    WHERE f.collection_id = (SELECT id FROM collections WHERE collection_id = ?1)
+      AND f.active = 1";
+
+#[cfg(test)]
+mod risk_query_tests;
+
 fn v2_collection_risk(
     database: &V2ProjectionDb,
     state: &archive_ledger::RegistryState,
@@ -4644,9 +4678,10 @@ fn v2_collection_risk(
         let values: (i64, i64) = connection
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(COALESCE(o.size_bytes, 0)), 0)
-                 FROM file_refs f
-                 LEFT JOIN objects o ON o.object_id = f.object_id
-                 WHERE f.collection_id = ?1 AND f.path_state = 'active'",
+                 FROM file_objects f
+                 LEFT JOIN content_objects o ON o.id = f.content_id
+                 WHERE f.collection_id = (SELECT id FROM collections WHERE collection_id = ?1)
+                   AND f.active = 1",
                 [&collection.collection_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4663,59 +4698,14 @@ fn v2_collection_risk(
     let requirements = &policy.requirements;
     let values: (i64, i64, i64, i64) = connection
         .query_row(
-            "WITH eligible AS (
-                 SELECT DISTINCT c.object_id, c.location_id
-                 FROM copy_claims c
-                 WHERE c.state = 'present'
-                   AND c.last_verification_result = 'ok'
-                   AND c.last_seen_time_utc_ms >= ?2
-                   AND c.last_verified_time_utc_ms >= ?3
-             ), qualifying AS (
-                 SELECT e.object_id, l.device_id,
-                        COALESCE(d.current_site_id, l.site_id) AS site_id,
-                        l.expected_availability, l.encryption_state
-                 FROM eligible e
-                 JOIN locations l ON l.location_id = e.location_id AND l.status = 'active'
-                 LEFT JOIN devices d ON d.device_id = l.device_id AND d.status = 'active'
-                 WHERE (
-                       l.device_id IS NULL OR
-                       (d.device_id IS NOT NULL
-                        AND d.identity_state = 'confirmed'
-                        AND d.last_fingerprint_status = 'match'
-                        AND d.last_checkin_time_utc_ms >= ?4)
-                   )
-             ), coverage AS (
-                 SELECT object_id,
-                        COUNT(*) AS qualifying_copies,
-                        COUNT(DISTINCT device_id) AS devices,
-                        COUNT(DISTINCT site_id) AS sites,
-                        MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 THEN 1 ELSE 0 END) AS has_offsite,
-                        MAX(CASE WHEN expected_availability = 'offline' THEN 1 ELSE 0 END) AS has_offline,
-                        MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 AND encryption_state = 'encrypted' THEN 1 ELSE 0 END) AS has_encrypted_offsite
-                 FROM qualifying
-                 GROUP BY object_id
-             )
-             SELECT COUNT(*), COALESCE(SUM(COALESCE(o.size_bytes, 0)), 0),
-                    COALESCE(SUM(CASE
-                        WHEN f.object_id IS NOT NULL AND (
-                            COALESCE(c.qualifying_copies, 0) < ?6 OR
-                            COALESCE(c.devices, 0) < ?7 OR
-                            COALESCE(c.sites, 0) < ?8 OR
-                            (?9 = 1 AND COALESCE(c.has_offsite, 0) = 0) OR
-                            (?10 = 1 AND COALESCE(c.has_offline, 0) = 0) OR
-                            (?11 = 1 AND COALESCE(c.has_encrypted_offsite, 0) = 0)
-                        ) THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN f.object_id IS NULL THEN 1 ELSE 0 END), 0)
-             FROM file_refs f
-             LEFT JOIN objects o ON o.object_id = f.object_id
-             LEFT JOIN coverage c ON c.object_id = f.object_id
-             WHERE f.collection_id = ?1 AND f.path_state = 'active'",
+            &format!("{V2_RISK_COVERAGE}{V2_RISK_TOTALS}"),
             params![
                 collection.collection_id,
                 risk_cutoff(now, requirements.max_observation_age_days),
                 risk_cutoff(now, requirements.max_verification_age_days),
                 risk_cutoff(now, requirements.max_device_checkin_age_days),
                 collection.home_site_id,
+                1,
                 i64::try_from(requirements.min_qualifying_copies).unwrap_or(i64::MAX),
                 i64::try_from(requirements.min_devices).unwrap_or(i64::MAX),
                 i64::try_from(requirements.min_sites).unwrap_or(i64::MAX),
@@ -4794,51 +4784,9 @@ fn v2_collection_risk_with_findings(
     let order_clause = if findings_limit == 0 {
         ""
     } else {
-        " ORDER BY f.file_ref_id"
+        " ORDER BY f.canonical_id"
     };
-    let query = format!(
-        "WITH eligible AS (
-             SELECT DISTINCT c.object_id, c.location_id
-             FROM copy_claims c
-             WHERE ?6 = 1
-               AND c.state = 'present'
-               AND c.last_verification_result = 'ok'
-               AND c.last_seen_time_utc_ms >= ?2
-               AND c.last_verified_time_utc_ms >= ?3
-         ), qualifying AS (
-             SELECT e.object_id, l.device_id,
-                    COALESCE(d.current_site_id, l.site_id) AS site_id,
-                    l.expected_availability, l.encryption_state
-             FROM eligible e
-             JOIN locations l ON l.location_id = e.location_id AND l.status = 'active'
-             LEFT JOIN devices d ON d.device_id = l.device_id AND d.status = 'active'
-             WHERE (
-                   l.device_id IS NULL OR
-                   (d.device_id IS NOT NULL
-                    AND d.identity_state = 'confirmed'
-                    AND d.last_fingerprint_status = 'match'
-                    AND d.last_checkin_time_utc_ms >= ?4)
-               )
-         ), coverage AS (
-             SELECT object_id,
-                    COUNT(*) AS qualifying_copies,
-                    COUNT(DISTINCT device_id) AS devices,
-                    COUNT(DISTINCT site_id) AS sites,
-                    MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 THEN 1 ELSE 0 END) AS has_offsite,
-                    MAX(CASE WHEN expected_availability = 'offline' THEN 1 ELSE 0 END) AS has_offline,
-                    MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 AND encryption_state = 'encrypted' THEN 1 ELSE 0 END) AS has_encrypted_offsite
-             FROM qualifying
-             GROUP BY object_id
-         )
-         SELECT f.file_ref_id, f.logical_path_display, f.object_id, o.size_bytes,
-                COALESCE(c.qualifying_copies, 0), COALESCE(c.devices, 0),
-                COALESCE(c.sites, 0), COALESCE(c.has_offsite, 0),
-                COALESCE(c.has_offline, 0), COALESCE(c.has_encrypted_offsite, 0)
-         FROM file_refs f
-         LEFT JOIN objects o ON o.object_id = f.object_id
-         LEFT JOIN coverage c ON c.object_id = f.object_id
-         WHERE f.collection_id = ?1 AND f.path_state = 'active'{order_clause}"
-    );
+    let query = format!("{V2_RISK_COVERAGE}{V2_RISK_DETAILS}{order_clause}");
     let mut statement = connection
         .prepare(&query)
         .map_err(|source| v2_cli_sql_error(database, source))?;
@@ -4873,7 +4821,7 @@ fn v2_collection_risk_with_findings(
                 .get(1)
                 .map_err(|source| v2_cli_sql_error(database, source))?,
             object_known: row
-                .get::<_, Option<String>>(2)
+                .get::<_, Option<i64>>(2)
                 .map_err(|source| v2_cli_sql_error(database, source))?
                 .is_some(),
             size_bytes: row

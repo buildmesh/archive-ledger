@@ -4042,6 +4042,90 @@ mod unix {
         );
         assert_eq!(risk["collections"][0]["findings"][0]["sites"], 0);
 
+        // A findings limit bounds presentation, not Collection totals. The first
+        // finding stays in the same canonical File-ID order as the full report.
+        for limit in ["0", "1"] {
+            let limited = archive(&temp)
+                .args([
+                    "--json",
+                    "report",
+                    "risk",
+                    "--collection",
+                    "Files",
+                    "--limit",
+                    limit,
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(limited.status.code(), Some(10));
+            let limited = json(&limited);
+            assert_eq!(
+                limited["collections"][0]["summary"],
+                risk["collections"][0]["summary"]
+            );
+            let findings = limited["collections"][0]["findings"].as_array().unwrap();
+            assert_eq!(findings.len(), limit.parse::<usize>().unwrap());
+            if limit == "1" {
+                assert_eq!(findings[0], risk["collections"][0]["findings"][0]);
+            }
+        }
+        for field in [
+            "file_count",
+            "known_size_bytes",
+            "files_at_risk",
+            "files_uncertain",
+        ] {
+            assert_eq!(
+                collection_status[field],
+                risk["collections"][0]["summary"][field]
+            );
+            assert_eq!(
+                archive_status["collections"][0][field],
+                collection_status[field]
+            );
+        }
+
+        // Without an active policy both query paths retain the same full totals
+        // and classify even resolved content as uncertain.
+        let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        database
+            .execute("UPDATE policies SET enabled=0", [])
+            .unwrap();
+        let no_policy_status = archive(&temp)
+            .args(["--json", "collection", "status", "Files"])
+            .output()
+            .unwrap();
+        assert_eq!(no_policy_status.status.code(), Some(10));
+        let no_policy_status = json(&no_policy_status);
+        let no_policy_report = archive(&temp)
+            .args(["--json", "report", "risk", "--collection", "Files"])
+            .output()
+            .unwrap();
+        assert_eq!(no_policy_report.status.code(), Some(10));
+        let no_policy_report = json(&no_policy_report);
+        assert_eq!(no_policy_status["files_at_risk"], 0);
+        assert_eq!(no_policy_status["files_uncertain"], 2);
+        for field in [
+            "file_count",
+            "known_size_bytes",
+            "files_at_risk",
+            "files_uncertain",
+        ] {
+            assert_eq!(
+                no_policy_status[field],
+                no_policy_report["collections"][0]["summary"][field]
+            );
+        }
+        assert!(no_policy_report["collections"][0]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["result"] == "uncertain"));
+        database
+            .execute("UPDATE policies SET enabled=1", [])
+            .unwrap();
+        drop(database);
+
         let root_before = json(&success(archive(&temp).args(["--json", "root", "list"])));
         let confirmed = json(&success(archive(&temp).args([
             "--json",
