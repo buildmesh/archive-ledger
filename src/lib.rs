@@ -116,9 +116,10 @@ pub use v2_fsck::{
 };
 pub use v2_inventory::{
     add_files as v2_add_files, cancel_job as v2_cancel_job, preview_changes as v2_preview_changes,
-    preview_scan as v2_preview_scan, record_placements as v2_record_placements, V2ChangePreview,
-    V2InventoryConfig, V2InventoryError, V2InventoryResult, V2InventorySummary, V2Placement,
-    V2PreviewCategory, V2ScanPreview,
+    preview_scan as v2_preview_scan, record_placements as v2_record_placements,
+    visit_new_files as v2_visit_new_files, V2ChangePreview, V2InventoryConfig, V2InventoryError,
+    V2InventoryResult, V2InventorySummary, V2NewFileKind, V2Placement, V2PreviewCategory,
+    V2ScanPreview,
 };
 pub use v2_projection::{
     V2ApplyStats, V2ProjectionDb, V2ProjectionError, V2ProjectionStatus, V2RebuildStats,

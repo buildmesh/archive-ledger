@@ -355,6 +355,33 @@ annex-tracked file that is neither unchanged, its recorded content size, nor a p
 listed as uncertain, because telling requires reading it. Like a scan, the preview refuses while
 the Location has an unfinished scan job.
 
+To list **all** files new to a Collection or Location, without the 20-path preview
+sample limit or verification-due calculations:
+
+```bash
+archive collection add /path/to/subdirectory --collection Files --location "Files on disk9" --dry-run --list-new
+archive --json collection add /path/to/subdirectory --collection Files --location "Files on disk9" --dry-run --list-new
+```
+
+The listing streams paths in filesystem discovery order, labeled `new-to-collection`
+or `new-to-location` (a known File not currently recorded present here). Paths are
+Collection-relative, including when selecting a subtree. Existing recorded files that
+need verification are not listed as new. Ordinary symlinks are ignored; imported annex
+links are checked for local content availability using metadata, without hashing or fetching
+content. `--exclude` works as in the ordinary preview. `--list-new` requires `--dry-run`
+and cannot be combined with `--accept-changes`.
+
+JSON output is one object with a streamed `items` array; each item has `kind`, lossless
+`path`, and `size_bytes`. The final `summary` and `complete` fields describe coverage within
+the requested scope, with exclusions, filesystem boundaries, ignored entries and errors
+reported explicitly. Check the exit code and final `complete` field before treating results
+as exhaustive: code 0 means a complete listing with no new files, 10 means new files or
+incomplete coverage, and 2 means a fatal error. A traversal/classification failure may leave
+partial items followed by `complete: false` and an `error`; an interrupted command or failed
+output write may leave unfinished JSON. No catalog updates or file-content reads are made.
+Memory use does not grow with the result count; walking a large HDD directory tree can
+still take time. Version 0.1.5 adds this option without requiring a database rebuild.
+
 On a terminal, `location scan` and `collection add` show live progress on stderr. Each first
 prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
 While a Location has an unfinished scan, a new `location scan` of it is refused rather than

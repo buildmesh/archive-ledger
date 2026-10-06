@@ -42,7 +42,7 @@ mod acceptance;
 mod preview;
 pub use acceptance::{preview_changes, V2ChangePreview};
 use acceptance::{selected_files, validate_selected_path};
-pub use preview::{preview_scan, V2PreviewCategory, V2ScanPreview};
+pub use preview::{preview_scan, visit_new_files, V2NewFileKind, V2PreviewCategory, V2ScanPreview};
 
 #[cfg(test)]
 mod recovery_tests;

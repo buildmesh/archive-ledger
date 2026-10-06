@@ -1074,6 +1074,10 @@ struct CollectionAddArgs {
     /// show the acceptance; otherwise show how disk and catalog differ from metadata only.
     #[arg(long)]
     dry_run: bool,
+    /// List every new-to-Collection or new-to-Location path without hashing content.
+    /// Requires --dry-run; streams results and skips verification-due summaries.
+    #[arg(long, requires = "dry_run", conflicts_with = "accept_changes")]
+    list_new: bool,
     /// Confirm acceptance of the explicitly selected files.
     #[arg(long, requires = "accept_changes")]
     yes: bool,
@@ -9123,6 +9127,7 @@ fn execute_v2_job(
                                 Vec::new()
                             },
                             dry_run: false,
+                            list_new: false,
                             yes: true,
                             non_interactive: true,
                             job_id: Some(job_id.clone()),
@@ -12315,6 +12320,16 @@ fn execute_v2_collection_add(
         batch_entries: args.batch_entries,
         max_items: args.max_items,
     };
+    if args.list_new {
+        refuse_unfinished_v2_scans(
+            database,
+            &location.display_name,
+            &location.location_id,
+            &collection.collection_id,
+            None,
+        )?;
+        return print_v2_new_files(cli, database, &config, &location_path);
+    }
     // Without --accept-changes, --dry-run previews the add from metadata only.
     if args.dry_run && args.accept_changes.is_empty() {
         let preview = archive_ledger::v2_preview_scan(database, &config)?;
@@ -12632,6 +12647,137 @@ fn exclude_arguments(exclusions: &[PathBuf]) -> String {
         .iter()
         .map(|path| format!(" --exclude {}", shell_quote(&path.to_string_lossy())))
         .collect()
+}
+
+/// Stream a single JSON object (or labeled human lines), retaining no result list.
+fn print_v2_new_files(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    config: &archive_ledger::V2InventoryConfig,
+    location_root: &Path,
+) -> Result<u8, AppError> {
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    if cli.json {
+        let mut header = serde_json::to_string(&json!({
+            "version": 2,
+            "mode": "new_files",
+            "collection_id": config.collection_id,
+            "location_id": config.location_id,
+            "path": RegistryPath::from_path(&config.root_path),
+            "exclusions": config.exclusions.iter().map(|p| RegistryPath::from_path(p)).collect::<Vec<_>>(),
+        }))?;
+        header.pop(); // Append the streamed array to this object's fields.
+        write!(output, "{header},\"items\":[")?;
+    } else {
+        writeln!(output, "New files (metadata only; nothing recorded):")?;
+    }
+    output.flush()?;
+    let mut first = true;
+    let result = archive_ledger::v2_visit_new_files(
+        database,
+        config,
+        location_root,
+        &mut |kind, path, size_bytes| {
+            let mut write_item = || -> std::io::Result<()> {
+                if cli.json {
+                    if !first {
+                        output.write_all(b",")?;
+                    }
+                    let path =
+                        registry_path_from_sql(path.encoding.as_str(), &path.bytes, &path.display)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    serde_json::to_writer(
+                        &mut output,
+                        &json!({
+                            "kind": kind, "path": path, "size_bytes": size_bytes,
+                        }),
+                    )
+                    .map_err(std::io::Error::other)?;
+                } else {
+                    let label = match kind {
+                        archive_ledger::V2NewFileKind::NewToCollection => "new-to-collection",
+                        archive_ledger::V2NewFileKind::NewToLocation => "new-to-location",
+                    };
+                    // Quote paths so embedded newlines/control bytes cannot look like rows.
+                    let display =
+                        serde_json::to_string(&path.display).map_err(std::io::Error::other)?;
+                    writeln!(output, "{label}\t{display}")?;
+                }
+                first = false;
+                Ok(())
+            };
+            write_item().map_err(|source| archive_ledger::V2InventoryError::Io {
+                operation: "write new-files listing",
+                path: PathBuf::from("<stdout>"),
+                source,
+            })
+        },
+    );
+    match result {
+        Ok(preview) => {
+            let complete = preview.complete_coverage
+                && preview.uncertain.count == 0
+                && preview.without_identity == 0;
+            if cli.json {
+                let tail = serde_json::to_string(&json!({
+                    "complete": complete,
+                    "summary": {
+                        "new_to_collection": preview.new_files.count,
+                        "new_to_location": preview.new_at_location.count,
+                        "ignored_symlinks": preview.ignored_symlinks,
+                        "ignored_special_files": preview.ignored_special_files,
+                        "excluded_subtrees": preview.excluded_subtrees,
+                        "filesystem_boundaries": preview.filesystem_boundaries,
+                        "traversal_errors": preview.traversal_errors,
+                        "concurrent_changes": preview.concurrent_changes,
+                        "unreadable": preview.unreadable.count,
+                        "uncertain": preview.uncertain.count,
+                        "without_identity": preview.without_identity,
+                        "annex_content_absent": preview.recorded_absent,
+                    }
+                }))?;
+                writeln!(output, "],{}", &tail[1..])?;
+            } else {
+                writeln!(
+                    output,
+                    "{} new to Collection; {} new to Location.",
+                    preview.new_files.count, preview.new_at_location.count
+                )?;
+                writeln!(output, "Listing {} within the requested scope; {} excluded subtrees, {} filesystem boundaries, {} ignored symlinks, {} ignored special files.",
+                    if complete { "complete" } else { "incomplete" }, preview.excluded_subtrees,
+                    preview.filesystem_boundaries, preview.ignored_symlinks, preview.ignored_special_files)?;
+                if !complete {
+                    writeln!(output, "{} traversal errors; {} concurrent changes; {} unreadable annex links; {} uncertain entries; {} entries without supported identity metadata.",
+                        preview.traversal_errors, preview.concurrent_changes, preview.unreadable.count,
+                        preview.uncertain.count, preview.without_identity)?;
+                }
+            }
+            output.flush()?;
+            Ok(
+                if !complete || preview.new_files.count > 0 || preview.new_at_location.count > 0 {
+                    EXIT_FINDINGS
+                } else {
+                    EXIT_OK
+                },
+            )
+        }
+        Err(error) => {
+            if cli.json {
+                let tail = serde_json::to_string(&json!({
+                    "complete": false, "error": {"code": error.code(), "message": error.to_string()},
+                }))?;
+                writeln!(output, "],{}", &tail[1..])?;
+            } else {
+                writeln!(
+                    output,
+                    "Listing incomplete; earlier entries are partial results."
+                )?;
+            }
+            output.flush()?;
+            Err(error.into())
+        }
+    }
 }
 
 /// Prints a read-only scan/add preview. Exit 10 means a real run would record

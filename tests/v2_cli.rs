@@ -2188,6 +2188,205 @@ mod unix {
     }
 
     #[test]
+    fn list_new_streams_all_categories_without_reading_or_recording() {
+        use std::os::unix::ffi::OsStringExt;
+        let (temp, source) = immutable_files_fixture();
+        fs::create_dir(source.join("sub")).unwrap();
+        for i in 0..25 {
+            fs::write(source.join(format!("sub/known-{i:02}")), b"known").unwrap();
+        }
+        success(archive(&temp).args([
+            "collection",
+            "add",
+            source.join("sub").to_str().unwrap(),
+            "--collection",
+            "Files",
+        ]));
+        let second = temp.path().join("second");
+        fs::create_dir(&second).unwrap();
+        success(archive(&temp).args([
+            "location",
+            "init",
+            second.to_str().unwrap(),
+            "--collection",
+            "Files",
+            "--location-name",
+            "Second",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+        ]));
+        let sub = second.join("sub");
+        fs::create_dir(&sub).unwrap();
+        for i in 0..25 {
+            fs::write(sub.join(format!("known-{i:02}")), b"known").unwrap();
+            fs::write(sub.join(format!("new-{i:02}")), b"new").unwrap();
+        }
+        // Names are lossless in JSON, and human output safely quotes control characters.
+        let raw = std::ffi::OsString::from_vec(b"raw-\xff\nname".to_vec());
+        fs::write(sub.join(&raw), b"raw").unwrap();
+        fs::set_permissions(sub.join("new-00"), fs::Permissions::from_mode(0o000)).unwrap();
+        fs::create_dir(sub.join("skip")).unwrap();
+        fs::write(sub.join("skip/excluded"), b"skip").unwrap();
+        fs::write(second.join("outside-subtree"), b"outside").unwrap();
+        std::os::unix::fs::symlink("new-00", sub.join("ordinary-link")).unwrap();
+        let db = root(&temp).join("archive.db");
+        let before = fs::read(&db).unwrap();
+        let head = git(&root(&temp).join("canonical"), &["rev-parse", "HEAD"]);
+        let list = |machine: bool| {
+            let mut command = archive(&temp);
+            if machine {
+                command.arg("--json");
+            }
+            command.args([
+                "collection",
+                "add",
+                sub.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--location",
+                "Second",
+                "--dry-run",
+                "--list-new",
+                "--exclude",
+                "skip",
+            ]);
+            command.output().unwrap()
+        };
+        let output = list(true);
+        assert_eq!(
+            output.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = json(&output);
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["summary"]["new_to_collection"], 26);
+        assert_eq!(value["summary"]["new_to_location"], 25);
+        assert_eq!(value["summary"]["excluded_subtrees"], 1);
+        assert_eq!(value["summary"]["ignored_symlinks"], 1);
+        assert!(value.get("verification_due").is_none());
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 51);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|v| v["kind"] == "new_to_collection")
+                .count(),
+            26
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|v| v["kind"] == "new_to_location")
+                .count(),
+            25
+        );
+        for item in items {
+            assert!(item["path"]["display"]
+                .as_str()
+                .unwrap()
+                .starts_with("sub/"));
+        }
+        let encoded = items
+            .iter()
+            .find(|v| v["path"]["encoding"] == "unix_bytes")
+            .unwrap();
+        let decoded: archive_ledger::RegistryPath =
+            serde_json::from_value(encoded["path"].clone()).unwrap();
+        assert_eq!(
+            decoded.to_path_buf().unwrap(),
+            PathBuf::from("sub").join(&raw)
+        );
+        let human = list(false);
+        assert_eq!(human.status.code(), Some(10));
+        let text = String::from_utf8(human.stdout).unwrap();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("new-to-"))
+                .count(),
+            51
+        );
+        assert!(text.contains("Listing complete"));
+        assert_eq!(before, fs::read(&db).unwrap());
+        assert_eq!(
+            head,
+            git(&root(&temp).join("canonical"), &["rev-parse", "HEAD"])
+        );
+
+        // Directory read failures produce an explicit partial result, never a clean empty list.
+        fs::create_dir(sub.join("unreadable")).unwrap();
+        fs::set_permissions(sub.join("unreadable"), fs::Permissions::from_mode(0o000)).unwrap();
+        let partial = list(true);
+        assert_eq!(partial.status.code(), Some(10));
+        let partial = json(&partial);
+        assert_eq!(partial["complete"], false);
+        assert!(partial["summary"]["traversal_errors"].as_u64().unwrap() > 0);
+        fs::set_permissions(sub.join("unreadable"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(before, fs::read(&db).unwrap());
+
+        // Existing-but-unverified files are not mislabeled as new.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE checks SET integrity=0", []).unwrap();
+        drop(conn);
+        let known = archive(&temp)
+            .args([
+                "--json",
+                "collection",
+                "add",
+                source.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--dry-run",
+                "--list-new",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            known.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&known.stderr)
+        );
+        assert_eq!(json(&known)["items"].as_array().unwrap().len(), 0);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE file_objects SET content_id=NULL,identity_state='unresolved' WHERE path_bytes=?1", [b"a.txt".as_slice()]).unwrap();
+        drop(conn);
+        let failed = archive(&temp)
+            .args([
+                "--json",
+                "collection",
+                "add",
+                source.to_str().unwrap(),
+                "--collection",
+                "Files",
+                "--dry-run",
+                "--list-new",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(failed.status.code(), Some(2));
+        let failed = json(&failed);
+        assert_eq!(failed["complete"], false);
+        assert!(failed["error"]["code"].is_string());
+        for extra in [
+            vec!["--list-new"],
+            vec!["--dry-run", "--list-new", "--accept-changes", "a.txt"],
+        ] {
+            let invalid = archive(&temp)
+                .args(["collection", "add", source.to_str().unwrap()])
+                .args(extra)
+                .output()
+                .unwrap();
+            assert_eq!(invalid.status.code(), Some(2));
+        }
+    }
+
+    #[test]
     fn scan_and_add_dry_runs_classify_differences_without_reading_or_writing() {
         let (temp, content) = immutable_files_fixture();
         let path = content.to_str().unwrap();
@@ -4386,6 +4585,86 @@ mod unix {
         git_success(&repo, &["add", "."]);
         git_success(&repo, &["commit", "-m", "inventory-only fixture"]);
         repo
+    }
+
+    #[test]
+    fn list_new_annex_subtree_preserves_absence_and_reports_unreadable_links() {
+        let temp = TempDir::new().unwrap();
+        success(archive(&temp).args([
+            "init",
+            "Personal",
+            "--archive-id",
+            "arc_personal",
+            "--non-interactive",
+        ]));
+        let repo = inventory_only_annex_fixture(&temp);
+        success(archive(&temp).args([
+            "collection",
+            "init",
+            repo.to_str().unwrap(),
+            "--name",
+            "Files",
+            "--device",
+            "Test Device",
+            "--site",
+            "Home",
+            "--allow-unidentified-root",
+            "--non-interactive",
+            "--import-annex",
+            "--inventory-only",
+        ]));
+        let sub = repo.join("src");
+        fs::write(sub.join("brand-new"), b"new ordinary file").unwrap();
+        std::os::unix::fs::symlink("brand-new", sub.join("ordinary-link")).unwrap();
+        let db_path = root(&temp).join("archive.db");
+        let before = fs::read(&db_path).unwrap();
+        let list = || {
+            archive(&temp)
+                .args([
+                    "--json",
+                    "collection",
+                    "add",
+                    sub.to_str().unwrap(),
+                    "--collection",
+                    "Files",
+                    "--dry-run",
+                    "--list-new",
+                ])
+                .output()
+                .unwrap()
+        };
+        let output = list();
+        assert_eq!(
+            output.status.code(),
+            Some(10),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing = json(&output);
+        assert_eq!(listing["complete"], true, "{listing}");
+        assert_eq!(listing["summary"]["unreadable"], 0);
+        assert_eq!(listing["summary"]["annex_content_absent"], 1);
+        assert_eq!(listing["summary"]["ignored_symlinks"], 1);
+        let items = listing["items"].as_array().unwrap();
+        assert!(items
+            .iter()
+            .any(|v| v["path"]["text"] == "src/brand-new" && v["kind"] == "new_to_collection"));
+        assert!(!items.iter().any(|v| v["path"]["text"] == "src/missing"));
+        assert!(!items
+            .iter()
+            .any(|v| v["path"]["text"] == "src/ordinary-link"));
+        assert_eq!(before, fs::read(&db_path).unwrap());
+        // Absolute annex links are refused by the shared resolver; report partial coverage.
+        let target = fs::read_link(sub.join("sha256")).unwrap();
+        let absolute = fs::canonicalize(sub.join(&target)).unwrap();
+        fs::remove_file(sub.join("sha256")).unwrap();
+        std::os::unix::fs::symlink(absolute, sub.join("sha256")).unwrap();
+        let partial = list();
+        assert_eq!(partial.status.code(), Some(10));
+        let partial = json(&partial);
+        assert_eq!(partial["complete"], false);
+        assert_eq!(partial["summary"]["unreadable"], 1);
+        assert_eq!(before, fs::read(&db_path).unwrap());
     }
 
     #[test]
