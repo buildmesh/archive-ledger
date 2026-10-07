@@ -1074,6 +1074,10 @@ struct CollectionAddArgs {
     /// show the acceptance; otherwise show how disk and catalog differ from metadata only.
     #[arg(long)]
     dry_run: bool,
+    /// List every new-to-Collection or new-to-Location path without hashing content.
+    /// Requires --dry-run; streams results and skips verification-due summaries.
+    #[arg(long, requires = "dry_run", conflicts_with = "accept_changes")]
+    list_new: bool,
     /// Confirm acceptance of the explicitly selected files.
     #[arg(long, requires = "accept_changes")]
     yes: bool,
@@ -4629,6 +4633,40 @@ fn verify_operation_key(job_id: &str, input_version: &str, copy_id: &str, kind: 
     )
 }
 
+// Shared qualification rules for summaries and detailed reports. Keep local integer
+// identities throughout coverage; canonical IDs are only needed for displayed Files.
+const V2_RISK_COVERAGE: &str = include_str!("collection_risk_coverage.sql");
+const V2_RISK_TOTALS: &str = "
+    SELECT COUNT(*), COALESCE(SUM(COALESCE(o.size_bytes, 0)), 0),
+           COALESCE(SUM(CASE WHEN f.content_id IS NOT NULL AND (
+               COALESCE(c.qualifying_copies, 0) < ?7 OR
+               COALESCE(c.devices, 0) < ?8 OR
+               COALESCE(c.sites, 0) < ?9 OR
+               (?10 = 1 AND COALESCE(c.has_offsite, 0) = 0) OR
+               (?11 = 1 AND COALESCE(c.has_offline, 0) = 0) OR
+               (?12 = 1 AND COALESCE(c.has_encrypted_offsite, 0) = 0)
+           ) THEN 1 ELSE 0 END), 0),
+           COALESCE(SUM(CASE WHEN f.content_id IS NULL THEN 1 ELSE 0 END), 0)
+    FROM file_objects f
+    LEFT JOIN content_objects o ON o.id = f.content_id
+    LEFT JOIN coverage c ON c.content_id = f.content_id
+    WHERE f.collection_id = (SELECT id FROM collections WHERE collection_id = ?1)
+      AND f.active = 1";
+const V2_RISK_DETAILS: &str = "
+    SELECT f.canonical_id, COALESCE(f.path_display, CAST(f.path_bytes AS TEXT)),
+           f.content_id, o.size_bytes,
+           COALESCE(c.qualifying_copies, 0), COALESCE(c.devices, 0),
+           COALESCE(c.sites, 0), COALESCE(c.has_offsite, 0),
+           COALESCE(c.has_offline, 0), COALESCE(c.has_encrypted_offsite, 0)
+    FROM file_objects f
+    LEFT JOIN content_objects o ON o.id = f.content_id
+    LEFT JOIN coverage c ON c.content_id = f.content_id
+    WHERE f.collection_id = (SELECT id FROM collections WHERE collection_id = ?1)
+      AND f.active = 1";
+
+#[cfg(test)]
+mod risk_query_tests;
+
 fn v2_collection_risk(
     database: &V2ProjectionDb,
     state: &archive_ledger::RegistryState,
@@ -4644,9 +4682,10 @@ fn v2_collection_risk(
         let values: (i64, i64) = connection
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(COALESCE(o.size_bytes, 0)), 0)
-                 FROM file_refs f
-                 LEFT JOIN objects o ON o.object_id = f.object_id
-                 WHERE f.collection_id = ?1 AND f.path_state = 'active'",
+                 FROM file_objects f
+                 LEFT JOIN content_objects o ON o.id = f.content_id
+                 WHERE f.collection_id = (SELECT id FROM collections WHERE collection_id = ?1)
+                   AND f.active = 1",
                 [&collection.collection_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4663,59 +4702,14 @@ fn v2_collection_risk(
     let requirements = &policy.requirements;
     let values: (i64, i64, i64, i64) = connection
         .query_row(
-            "WITH eligible AS (
-                 SELECT DISTINCT c.object_id, c.location_id
-                 FROM copy_claims c
-                 WHERE c.state = 'present'
-                   AND c.last_verification_result = 'ok'
-                   AND c.last_seen_time_utc_ms >= ?2
-                   AND c.last_verified_time_utc_ms >= ?3
-             ), qualifying AS (
-                 SELECT e.object_id, l.device_id,
-                        COALESCE(d.current_site_id, l.site_id) AS site_id,
-                        l.expected_availability, l.encryption_state
-                 FROM eligible e
-                 JOIN locations l ON l.location_id = e.location_id AND l.status = 'active'
-                 LEFT JOIN devices d ON d.device_id = l.device_id AND d.status = 'active'
-                 WHERE (
-                       l.device_id IS NULL OR
-                       (d.device_id IS NOT NULL
-                        AND d.identity_state = 'confirmed'
-                        AND d.last_fingerprint_status = 'match'
-                        AND d.last_checkin_time_utc_ms >= ?4)
-                   )
-             ), coverage AS (
-                 SELECT object_id,
-                        COUNT(*) AS qualifying_copies,
-                        COUNT(DISTINCT device_id) AS devices,
-                        COUNT(DISTINCT site_id) AS sites,
-                        MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 THEN 1 ELSE 0 END) AS has_offsite,
-                        MAX(CASE WHEN expected_availability = 'offline' THEN 1 ELSE 0 END) AS has_offline,
-                        MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 AND encryption_state = 'encrypted' THEN 1 ELSE 0 END) AS has_encrypted_offsite
-                 FROM qualifying
-                 GROUP BY object_id
-             )
-             SELECT COUNT(*), COALESCE(SUM(COALESCE(o.size_bytes, 0)), 0),
-                    COALESCE(SUM(CASE
-                        WHEN f.object_id IS NOT NULL AND (
-                            COALESCE(c.qualifying_copies, 0) < ?6 OR
-                            COALESCE(c.devices, 0) < ?7 OR
-                            COALESCE(c.sites, 0) < ?8 OR
-                            (?9 = 1 AND COALESCE(c.has_offsite, 0) = 0) OR
-                            (?10 = 1 AND COALESCE(c.has_offline, 0) = 0) OR
-                            (?11 = 1 AND COALESCE(c.has_encrypted_offsite, 0) = 0)
-                        ) THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN f.object_id IS NULL THEN 1 ELSE 0 END), 0)
-             FROM file_refs f
-             LEFT JOIN objects o ON o.object_id = f.object_id
-             LEFT JOIN coverage c ON c.object_id = f.object_id
-             WHERE f.collection_id = ?1 AND f.path_state = 'active'",
+            &format!("{V2_RISK_COVERAGE}{V2_RISK_TOTALS}"),
             params![
                 collection.collection_id,
                 risk_cutoff(now, requirements.max_observation_age_days),
                 risk_cutoff(now, requirements.max_verification_age_days),
                 risk_cutoff(now, requirements.max_device_checkin_age_days),
                 collection.home_site_id,
+                1,
                 i64::try_from(requirements.min_qualifying_copies).unwrap_or(i64::MAX),
                 i64::try_from(requirements.min_devices).unwrap_or(i64::MAX),
                 i64::try_from(requirements.min_sites).unwrap_or(i64::MAX),
@@ -4794,51 +4788,9 @@ fn v2_collection_risk_with_findings(
     let order_clause = if findings_limit == 0 {
         ""
     } else {
-        " ORDER BY f.file_ref_id"
+        " ORDER BY f.canonical_id"
     };
-    let query = format!(
-        "WITH eligible AS (
-             SELECT DISTINCT c.object_id, c.location_id
-             FROM copy_claims c
-             WHERE ?6 = 1
-               AND c.state = 'present'
-               AND c.last_verification_result = 'ok'
-               AND c.last_seen_time_utc_ms >= ?2
-               AND c.last_verified_time_utc_ms >= ?3
-         ), qualifying AS (
-             SELECT e.object_id, l.device_id,
-                    COALESCE(d.current_site_id, l.site_id) AS site_id,
-                    l.expected_availability, l.encryption_state
-             FROM eligible e
-             JOIN locations l ON l.location_id = e.location_id AND l.status = 'active'
-             LEFT JOIN devices d ON d.device_id = l.device_id AND d.status = 'active'
-             WHERE (
-                   l.device_id IS NULL OR
-                   (d.device_id IS NOT NULL
-                    AND d.identity_state = 'confirmed'
-                    AND d.last_fingerprint_status = 'match'
-                    AND d.last_checkin_time_utc_ms >= ?4)
-               )
-         ), coverage AS (
-             SELECT object_id,
-                    COUNT(*) AS qualifying_copies,
-                    COUNT(DISTINCT device_id) AS devices,
-                    COUNT(DISTINCT site_id) AS sites,
-                    MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 THEN 1 ELSE 0 END) AS has_offsite,
-                    MAX(CASE WHEN expected_availability = 'offline' THEN 1 ELSE 0 END) AS has_offline,
-                    MAX(CASE WHEN ?5 IS NOT NULL AND site_id != ?5 AND encryption_state = 'encrypted' THEN 1 ELSE 0 END) AS has_encrypted_offsite
-             FROM qualifying
-             GROUP BY object_id
-         )
-         SELECT f.file_ref_id, f.logical_path_display, f.object_id, o.size_bytes,
-                COALESCE(c.qualifying_copies, 0), COALESCE(c.devices, 0),
-                COALESCE(c.sites, 0), COALESCE(c.has_offsite, 0),
-                COALESCE(c.has_offline, 0), COALESCE(c.has_encrypted_offsite, 0)
-         FROM file_refs f
-         LEFT JOIN objects o ON o.object_id = f.object_id
-         LEFT JOIN coverage c ON c.object_id = f.object_id
-         WHERE f.collection_id = ?1 AND f.path_state = 'active'{order_clause}"
-    );
+    let query = format!("{V2_RISK_COVERAGE}{V2_RISK_DETAILS}{order_clause}");
     let mut statement = connection
         .prepare(&query)
         .map_err(|source| v2_cli_sql_error(database, source))?;
@@ -4873,7 +4825,7 @@ fn v2_collection_risk_with_findings(
                 .get(1)
                 .map_err(|source| v2_cli_sql_error(database, source))?,
             object_known: row
-                .get::<_, Option<String>>(2)
+                .get::<_, Option<i64>>(2)
                 .map_err(|source| v2_cli_sql_error(database, source))?
                 .is_some(),
             size_bytes: row
@@ -9175,6 +9127,7 @@ fn execute_v2_job(
                                 Vec::new()
                             },
                             dry_run: false,
+                            list_new: false,
                             yes: true,
                             non_interactive: true,
                             job_id: Some(job_id.clone()),
@@ -12367,6 +12320,16 @@ fn execute_v2_collection_add(
         batch_entries: args.batch_entries,
         max_items: args.max_items,
     };
+    if args.list_new {
+        refuse_unfinished_v2_scans(
+            database,
+            &location.display_name,
+            &location.location_id,
+            &collection.collection_id,
+            None,
+        )?;
+        return print_v2_new_files(cli, database, &config, &location_path);
+    }
     // Without --accept-changes, --dry-run previews the add from metadata only.
     if args.dry_run && args.accept_changes.is_empty() {
         let preview = archive_ledger::v2_preview_scan(database, &config)?;
@@ -12684,6 +12647,137 @@ fn exclude_arguments(exclusions: &[PathBuf]) -> String {
         .iter()
         .map(|path| format!(" --exclude {}", shell_quote(&path.to_string_lossy())))
         .collect()
+}
+
+/// Stream a single JSON object (or labeled human lines), retaining no result list.
+fn print_v2_new_files(
+    cli: &Cli,
+    database: &V2ProjectionDb,
+    config: &archive_ledger::V2InventoryConfig,
+    location_root: &Path,
+) -> Result<u8, AppError> {
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    if cli.json {
+        let mut header = serde_json::to_string(&json!({
+            "version": 2,
+            "mode": "new_files",
+            "collection_id": config.collection_id,
+            "location_id": config.location_id,
+            "path": RegistryPath::from_path(&config.root_path),
+            "exclusions": config.exclusions.iter().map(|p| RegistryPath::from_path(p)).collect::<Vec<_>>(),
+        }))?;
+        header.pop(); // Append the streamed array to this object's fields.
+        write!(output, "{header},\"items\":[")?;
+    } else {
+        writeln!(output, "New files (metadata only; nothing recorded):")?;
+    }
+    output.flush()?;
+    let mut first = true;
+    let result = archive_ledger::v2_visit_new_files(
+        database,
+        config,
+        location_root,
+        &mut |kind, path, size_bytes| {
+            let mut write_item = || -> std::io::Result<()> {
+                if cli.json {
+                    if !first {
+                        output.write_all(b",")?;
+                    }
+                    let path =
+                        registry_path_from_sql(path.encoding.as_str(), &path.bytes, &path.display)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    serde_json::to_writer(
+                        &mut output,
+                        &json!({
+                            "kind": kind, "path": path, "size_bytes": size_bytes,
+                        }),
+                    )
+                    .map_err(std::io::Error::other)?;
+                } else {
+                    let label = match kind {
+                        archive_ledger::V2NewFileKind::NewToCollection => "new-to-collection",
+                        archive_ledger::V2NewFileKind::NewToLocation => "new-to-location",
+                    };
+                    // Quote paths so embedded newlines/control bytes cannot look like rows.
+                    let display =
+                        serde_json::to_string(&path.display).map_err(std::io::Error::other)?;
+                    writeln!(output, "{label}\t{display}")?;
+                }
+                first = false;
+                Ok(())
+            };
+            write_item().map_err(|source| archive_ledger::V2InventoryError::Io {
+                operation: "write new-files listing",
+                path: PathBuf::from("<stdout>"),
+                source,
+            })
+        },
+    );
+    match result {
+        Ok(preview) => {
+            let complete = preview.complete_coverage
+                && preview.uncertain.count == 0
+                && preview.without_identity == 0;
+            if cli.json {
+                let tail = serde_json::to_string(&json!({
+                    "complete": complete,
+                    "summary": {
+                        "new_to_collection": preview.new_files.count,
+                        "new_to_location": preview.new_at_location.count,
+                        "ignored_symlinks": preview.ignored_symlinks,
+                        "ignored_special_files": preview.ignored_special_files,
+                        "excluded_subtrees": preview.excluded_subtrees,
+                        "filesystem_boundaries": preview.filesystem_boundaries,
+                        "traversal_errors": preview.traversal_errors,
+                        "concurrent_changes": preview.concurrent_changes,
+                        "unreadable": preview.unreadable.count,
+                        "uncertain": preview.uncertain.count,
+                        "without_identity": preview.without_identity,
+                        "annex_content_absent": preview.recorded_absent,
+                    }
+                }))?;
+                writeln!(output, "],{}", &tail[1..])?;
+            } else {
+                writeln!(
+                    output,
+                    "{} new to Collection; {} new to Location.",
+                    preview.new_files.count, preview.new_at_location.count
+                )?;
+                writeln!(output, "Listing {} within the requested scope; {} excluded subtrees, {} filesystem boundaries, {} ignored symlinks, {} ignored special files.",
+                    if complete { "complete" } else { "incomplete" }, preview.excluded_subtrees,
+                    preview.filesystem_boundaries, preview.ignored_symlinks, preview.ignored_special_files)?;
+                if !complete {
+                    writeln!(output, "{} traversal errors; {} concurrent changes; {} unreadable annex links; {} uncertain entries; {} entries without supported identity metadata.",
+                        preview.traversal_errors, preview.concurrent_changes, preview.unreadable.count,
+                        preview.uncertain.count, preview.without_identity)?;
+                }
+            }
+            output.flush()?;
+            Ok(
+                if !complete || preview.new_files.count > 0 || preview.new_at_location.count > 0 {
+                    EXIT_FINDINGS
+                } else {
+                    EXIT_OK
+                },
+            )
+        }
+        Err(error) => {
+            if cli.json {
+                let tail = serde_json::to_string(&json!({
+                    "complete": false, "error": {"code": error.code(), "message": error.to_string()},
+                }))?;
+                writeln!(output, "],{}", &tail[1..])?;
+            } else {
+                writeln!(
+                    output,
+                    "Listing incomplete; earlier entries are partial results."
+                )?;
+            }
+            output.flush()?;
+            Err(error.into())
+        }
+    }
 }
 
 /// Prints a read-only scan/add preview. Exit 10 means a real run would record
@@ -13419,14 +13513,22 @@ fn v2_copy_destination(
             })?;
             let annex: Option<(String, String, Option<String>)> = connection
                 .query_row(
-                    "SELECT p.external_identity_id, x.external_key, x.object_id
-                     FROM path_observations p
+                    "SELECT x.external_identity_id, x.external_key, x.object_id
+                     FROM file_refs f
                      JOIN external_identities x
-                       ON x.external_identity_id = p.external_identity_id
-                     WHERE p.file_ref_id = ?1 AND p.location_id = ?2
-                       AND p.observed_path_encoding = ?3
-                       AND p.observed_path_bytes = ?4
-                       AND p.representation = 'annex_locked_symlink'",
+                       ON x.external_identity_id = f.external_identity_id
+                     LEFT JOIN path_observations p
+                       ON p.file_ref_id = f.file_ref_id AND p.location_id = ?2
+                     WHERE f.file_ref_id = ?1 AND f.path_state = 'active'
+                       AND f.logical_path_encoding = ?3
+                       AND f.logical_path_bytes = ?4
+                       AND x.namespace = 'git-annex'
+                       AND (p.representation = 'annex_locked_symlink'
+                            OR (p.file_ref_id IS NULL AND EXISTS (
+                                SELECT 1 FROM annex_imports a
+                                WHERE a.collection_id = f.collection_id
+                                  AND a.worktree_location_id = ?2
+                                  AND a.status = 'complete')))",
                     params![
                         item.file_ref_id,
                         destination_location_id,

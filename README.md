@@ -355,6 +355,33 @@ annex-tracked file that is neither unchanged, its recorded content size, nor a p
 listed as uncertain, because telling requires reading it. Like a scan, the preview refuses while
 the Location has an unfinished scan job.
 
+To list **all** files new to a Collection or Location, without the 20-path preview
+sample limit or verification-due calculations:
+
+```bash
+archive collection add /path/to/subdirectory --collection Files --location "Files on disk9" --dry-run --list-new
+archive --json collection add /path/to/subdirectory --collection Files --location "Files on disk9" --dry-run --list-new
+```
+
+The listing streams paths in filesystem discovery order, labeled `new-to-collection`
+or `new-to-location` (a known File not currently recorded present here). Paths are
+Collection-relative, including when selecting a subtree. Existing recorded files that
+need verification are not listed as new. Ordinary symlinks are ignored; imported annex
+links are checked for local content availability using metadata, without hashing or fetching
+content. `--exclude` works as in the ordinary preview. `--list-new` requires `--dry-run`
+and cannot be combined with `--accept-changes`.
+
+JSON output is one object with a streamed `items` array; each item has `kind`, lossless
+`path`, and `size_bytes`. The final `summary` and `complete` fields describe coverage within
+the requested scope, with exclusions, filesystem boundaries, ignored entries and errors
+reported explicitly. Check the exit code and final `complete` field before treating results
+as exhaustive: code 0 means a complete listing with no new files, 10 means new files or
+incomplete coverage, and 2 means a fatal error. A traversal/classification failure may leave
+partial items followed by `complete: false` and an `error`; an interrupted command or failed
+output write may leave unfinished JSON. No catalog updates or file-content reads are made.
+Memory use does not grow with the result count; walking a large HDD directory tree can
+still take time. Version 0.1.5 adds this option without requiring a database rebuild.
+
 On a terminal, `location scan` and `collection add` show live progress on stderr. Each first
 prints its job ID; if the run is interrupted, continue it with `archive job resume <job-id>`.
 While a Location has an unfinished scan, a new `location scan` of it is refused rather than
@@ -687,6 +714,12 @@ archive report integrity
 archive report policy
 ```
 
+Status and detailed risk reports evaluate copies of content referenced by the selected
+Collection, including protecting copies in other Collections and Locations. Version 0.1.4
+scopes these queries to that content instead of aggregating unrelated archive contents.
+Reports still evaluate current policy freshness on each invocation; limiting displayed
+findings does not limit the Collection totals. No database rebuild is required for this update.
+
 `report integrity` lists copies whose content differs from the catalog (corrupt copies). For each
 one it shows where verified copies of the same content are: Location, Device, path, when each was
 last verified, and whether it is connected now. It says plainly when no verified copy remains in
@@ -914,7 +947,7 @@ already enrolled installation, and synchronize both installations before the new
 request never contains the private key. To stop a lost installation from making future writes, use
 `archive sync revoke <client-id> --yes`; previously accepted history remains intact.
 
-### Upgrade an existing schema-6 catalog
+### Upgrade an existing schema-6 or schema-7 catalog
 
 After installing the new binary, stop commands writing the selected Archive and allow enough
 space for a replacement database alongside the existing one. Rebuild its local SQLite catalog:
@@ -925,7 +958,8 @@ archive db rebuild
 archive fsck --full
 ```
 
-This creates schema 7 from the existing signed history. The canonical genesis schema remains 6;
+This creates schema 8 from the existing signed history, omitting Location/check rows for
+annex content that was never present while retaining observations of copies that went missing. The canonical genesis schema remains 6;
 the event tree is unchanged. Rebuild does not re-import an annex repository or rehash archive
 contents. It retains the previous schema database beside `archive.db` as
 `.archive-ledger-previous-<id>.db` and reports its exact path (`previous_database` in JSON).

@@ -6,8 +6,20 @@ pub(super) const DEFERRED_INDEXES: &[&str] = &[
     "compact_file_content",
     "compact_file_external",
     "compact_copy_content",
-    "compact_copy_external",
 ];
+
+// Absent imports need this lookup even while bulk rebuild defers other indexes.
+const ANNEX_ABSENT_CAS_COPIES: &str = "SELECT b.id,b.owner
+ FROM copy_bindings b INDEXED BY compact_copy_external JOIN file_locations p ON p.id=b.owner
+ WHERE b.external_id=?1 AND b.location_id=?2 AND b.state IN ('present','corrupt','unknown')
+ AND b.basis!='source_metadata' AND p.representation IN ('annex_content','annex_locked_symlink')";
+const ANNEX_REMOVE_AVAILABILITY: &str = "DELETE FROM source_availability WHERE identity_id=?1 AND location_id=?2
+ AND source_id=(SELECT id FROM annex_sources WHERE uuid=?3)
+ AND NOT EXISTS(SELECT 1 FROM copy_bindings b INDEXED BY compact_copy_external WHERE b.external_id=?1
+     AND b.location_id IN (?2,?4) AND b.state IN ('present','corrupt'))";
+
+const ANNEX_MARK_BINDINGS_MISSING: &str = "UPDATE file_locations
+ SET presence=0,last_record=?2,seen_time=?3,latest_presence=?4 WHERE copy_id=?1";
 
 const ACTIVE_FILE_LOOKUP: &str = "SELECT f.canonical_id,o.object_id,r.record_id,f.identity_state
  FROM file_objects f JOIN collections c ON c.id=f.collection_id
@@ -333,6 +345,24 @@ pub(super) fn project_annex_entry(
 ) -> Result<()> {
     let rid = record_key(tx, path, record)?;
     let time = sql_i64(record.record.envelope.time_utc_ms, "annex observation time")?;
+    project_annex_observation(tx, item, rid, time, path)
+}
+
+fn project_annex_observation(
+    tx: &Transaction<'_>,
+    item: &serde_json::Map<String, Value>,
+    rid: i64,
+    time: i64,
+    path: &Path,
+) -> Result<()> {
+    let inventory = item.get("claim_basis").and_then(Value::as_str) == Some("source_metadata");
+    let absent = !inventory
+        && item.get("local_availability").and_then(Value::as_str) == Some("missing")
+        && item
+            .get("verification_result")
+            .and_then(Value::as_str)
+            .is_none()
+        && item.get("object_id").and_then(Value::as_str).is_none();
     let content = if item.get("object_id").and_then(Value::as_str).is_some() {
         Some(content(
             tx,
@@ -355,7 +385,7 @@ pub(super) fn project_annex_entry(
     };
     let external_name = string(item, "external_identity_id")?;
     let resolution = string(item, "resolution_state")?;
-    run(tx,path,"INSERT INTO source_identities(canonical_id,namespace,source_key,expected_checksum,expected_size,content_id,resolution,first_record,resolved_record) VALUES(?1,'git-annex',?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(canonical_id) DO UPDATE SET expected_checksum=excluded.expected_checksum,expected_size=excluded.expected_size,content_id=CASE WHEN source_identities.resolution!='conflict' THEN COALESCE(excluded.content_id,source_identities.content_id) ELSE source_identities.content_id END,resolution=CASE WHEN source_identities.resolution!='conflict' AND excluded.content_id IS NOT NULL THEN 'resolved' ELSE source_identities.resolution END,resolved_record=CASE WHEN source_identities.resolution!='conflict' THEN COALESCE(excluded.resolved_record,source_identities.resolved_record) ELSE source_identities.resolved_record END",
+    run(tx,path,"INSERT INTO source_identities(canonical_id,namespace,source_key,expected_checksum,expected_size,content_id,resolution,first_record,resolved_record) VALUES(?1,'git-annex',?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(canonical_id) DO UPDATE SET expected_checksum=excluded.expected_checksum,expected_size=excluded.expected_size,content_id=CASE WHEN source_identities.resolution!='conflict' THEN COALESCE(excluded.content_id,source_identities.content_id) ELSE source_identities.content_id END,resolution=CASE WHEN source_identities.resolution!='conflict' AND excluded.content_id IS NOT NULL THEN 'resolved' ELSE source_identities.resolution END,resolved_record=CASE WHEN source_identities.resolution!='conflict' THEN COALESCE(excluded.resolved_record,source_identities.resolved_record) ELSE source_identities.resolved_record END WHERE source_identities.expected_checksum IS NOT excluded.expected_checksum OR source_identities.expected_size IS NOT excluded.expected_size OR excluded.content_id IS NOT NULL",
         params![external_name,string(item,"external_key")?,expected,optional_number(item,"expected_size_bytes")?,content,resolution,rid,content.map(|_|rid)])?;
     let external = named(tx, path, "source_identities", "canonical_id", external_name)?;
     let resolved: Option<i64> = tx
@@ -363,21 +393,38 @@ pub(super) fn project_annex_entry(
         .and_then(|mut s| s.query_row([external], |r| r.get(0)))
         .map_err(|e| sqlite_error(path, e))?;
     let file_content = content.or(resolved);
-    let fid = file(
-        tx,
-        path,
-        item,
-        rid,
-        file_content,
-        Some(external),
-        if file_content.is_some() {
-            "resolved"
-        } else if resolution == "unsupported" {
-            "unknown"
-        } else {
-            resolution
-        },
-    )?;
+    let file_state = if file_content.is_some() {
+        "resolved"
+    } else if resolution == "unsupported" {
+        "unknown"
+    } else {
+        resolution
+    };
+    // Absent annex links add Collection identity, not a physical-location observation.
+    // A repeated absent entry must not rewrite an unchanged File just to refresh its date.
+    let file_name = string(item, "file_ref_id")?;
+    let existing = if absent {
+        tx.prepare_cached("SELECT id FROM file_objects WHERE canonical_id=?1 AND external_id=?2 AND content_id IS ?3 AND identity_state=?4 AND active=1")
+            .and_then(|mut s| s.query_row(params![file_name,external,file_content,file_state], |r| r.get::<_,i64>(0)).optional())
+            .map_err(|e| sqlite_error(path,e))?
+    } else {
+        None
+    };
+    let fid = match existing {
+        Some(fid) => fid,
+        None => file(
+            tx,
+            path,
+            item,
+            rid,
+            file_content,
+            Some(external),
+            file_state,
+        )?,
+    };
+    if absent {
+        return project_annex_absence(tx, path, item, fid, external, rid, time);
+    }
     let binding = binding(
         tx,
         path,
@@ -413,7 +460,6 @@ pub(super) fn project_annex_entry(
         .get("copy_state")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let inventory = item.get("claim_basis").and_then(Value::as_str) == Some("source_metadata");
     if let (Some(name), Some(copy_location), Some(_)) = (
         item.get("copy_claim_id").and_then(Value::as_str),
         item.get("copy_location_id").and_then(Value::as_str),
@@ -517,6 +563,90 @@ pub(super) fn project_annex_entry(
             None,
         )?;
     }
+    Ok(())
+}
+
+// Missing bytes matter only when this Location previously held a physical Copy.
+// CAS copies are shared by aliases; unlocked worktree copies belong to one path.
+fn project_annex_absence(
+    tx: &Transaction<'_>,
+    path: &Path,
+    item: &serde_json::Map<String, Value>,
+    file: i64,
+    external: i64,
+    record: i64,
+    time: i64,
+) -> Result<()> {
+    let cas = string(item, "representation")? == "annex_locked_symlink";
+    let location = named(
+        tx,
+        path,
+        "locations",
+        "location_id",
+        string(
+            item,
+            if cas {
+                "cas_location_id"
+            } else {
+                "worktree_location_id"
+            },
+        )?,
+    )?;
+    let sql = if cas {
+        ANNEX_ABSENT_CAS_COPIES
+    } else {
+        "SELECT b.id,b.owner FROM file_locations p JOIN copy_bindings b ON b.id=p.copy_id WHERE p.file_id=?1 AND p.location_id=?2 AND b.location_id=?2 AND b.state IN ('present','corrupt','unknown') AND b.basis!='source_metadata' AND p.representation NOT IN ('annex_content','annex_locked_symlink')"
+    };
+    let copies = tx
+        .prepare_cached(sql)
+        .and_then(|mut s| {
+            s.query_map(params![if cas { external } else { file }, location], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| sqlite_error(path, e))?;
+    for (copy, owner) in copies {
+        let check = append_check(tx, path, owner, time, 0, 0, None)?;
+        run(tx,path,"UPDATE copy_bindings SET state='missing',state_record=?2,latest_presence=?3 WHERE id=?1",params![copy,record,check])?;
+        run(
+            tx,
+            path,
+            ANNEX_MARK_BINDINGS_MISSING,
+            params![copy, record, time, check],
+        )?;
+    }
+    // Availability is a current hint, not check history. Do not retain a stale
+    // positive hint or manufacture a new negative row for a never-present key.
+    let availability_location = if cas {
+        location
+    } else {
+        named(
+            tx,
+            path,
+            "locations",
+            "location_id",
+            string(item, "cas_location_id")?,
+        )?
+    };
+    let worktree = named(
+        tx,
+        path,
+        "locations",
+        "location_id",
+        string(item, "worktree_location_id")?,
+    )?;
+    run(
+        tx,
+        path,
+        ANNEX_REMOVE_AVAILABILITY,
+        params![
+            external,
+            availability_location,
+            string(item, "source_repo_id")?,
+            worktree
+        ],
+    )?;
     Ok(())
 }
 
@@ -1067,6 +1197,483 @@ pub(super) fn finalize_scans_for_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn annex_database() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE records(id INTEGER PRIMARY KEY,record_id TEXT,batch_id TEXT);
+            CREATE TABLE collections(id INTEGER PRIMARY KEY,collection_id TEXT);
+            CREATE TABLE locations(id INTEGER PRIMARY KEY,location_id TEXT);
+            INSERT INTO records VALUES(1,'first','batch'),(2,'second','batch'),(3,'third','batch');
+            INSERT INTO collections VALUES(1,'collection');
+            INSERT INTO locations VALUES(1,'worktree'),(2,'cas'),(3,'other_worktree'),(4,'other_cas');").unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+    }
+
+    fn annex_item(present: bool) -> serde_json::Map<String, Value> {
+        let hash = "11".repeat(32);
+        serde_json::json!({
+            "collection_id":"collection", "file_ref_id":"file",
+            "logical_path":crate::registry::RegistryPath::utf8("file"),
+            "external_identity_id":"external", "external_key":"SHA256-key",
+            "expected_hash_algo":"sha256", "expected_hash_hex":hash,
+            "expected_size_bytes":10, "observed_size_bytes":10,
+            "resolution_state":if present {"resolved"} else {"unresolved"},
+            "worktree_location_id":"worktree", "cas_location_id":"cas", "source_repo_id":"source",
+            "representation":"annex_locked_symlink", "path_state":"present",
+            "local_availability":if present {"present"} else {"missing"},
+            "object_id":present.then(||format!("blake3:{hash}")), "blake3_hex":present.then_some(&hash),
+            "sha256_hex":present.then_some(&hash), "claim_basis":"observed_bytes",
+            "copy_claim_id":present.then_some("copy"), "copy_location_id":present.then_some("cas"),
+            "copy_path":present.then(||crate::registry::RegistryPath::utf8("objects/key")),
+            "copy_state":if present {"present"} else {"missing"},
+            "verification_result":present.then_some("ok")
+        }).as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn absent_annex_copy_lookups_stay_indexed_during_bulk_rebuild() {
+        let connection = annex_database();
+        for index in DEFERRED_INDEXES {
+            connection
+                .execute_batch(&format!("DROP INDEX {index}"))
+                .unwrap();
+        }
+        for (sql, index, table) in [
+            (ANNEX_ABSENT_CAS_COPIES, "compact_copy_external", "b"),
+            (ANNEX_REMOVE_AVAILABILITY, "compact_copy_external", "b"),
+            (
+                ANNEX_MARK_BINDINGS_MISSING,
+                "compact_file_copy",
+                "file_locations",
+            ),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let parameters = vec![Value::Null; statement.parameter_count()];
+            let plan = statement
+                .query_map(
+                    rusqlite::params_from_iter(parameters.iter().map(|_| rusqlite::types::Null)),
+                    |r| r.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|line| line.starts_with(&format!("SEARCH {table} USING "))
+                        && line.contains(&format!("INDEX {index} "))),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains(&format!("SCAN {table}"))),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_annex_entries_only_add_identity_and_unchanged_repeats_do_not_write() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        let item = annex_item(false);
+        project_annex_observation(&tx, &item, 1, 10, path).unwrap();
+        for table in ["file_objects", "source_identities", "checksums"] {
+            assert_eq!(
+                key(&tx, path, &format!("SELECT count(*) FROM {table}"), []).unwrap(),
+                1
+            );
+        }
+        for table in [
+            "file_locations",
+            "copy_bindings",
+            "checks",
+            "source_availability",
+            "annex_sources",
+            "content_objects",
+        ] {
+            assert_eq!(
+                key(&tx, path, &format!("SELECT count(*) FROM {table}"), []).unwrap(),
+                0
+            );
+        }
+        let before = tx.total_changes();
+        project_annex_observation(&tx, &item, 2, 20, path).unwrap();
+        assert_eq!(tx.total_changes(), before);
+    }
+
+    #[test]
+    fn absent_annex_entry_preserves_identity_and_copy_known_elsewhere() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        project_annex_observation(&tx, &annex_item(true), 1, 10, path).unwrap();
+        let mut absent = annex_item(false);
+        absent.insert("worktree_location_id".into(), Value::from("other_worktree"));
+        absent.insert("cas_location_id".into(), Value::from("other_cas"));
+        absent.insert("source_repo_id".into(), Value::from("other_source"));
+        let before = tx.total_changes();
+        project_annex_observation(&tx, &absent, 2, 20, path).unwrap();
+        assert_eq!(tx.total_changes(), before);
+        assert_eq!(key(&tx,path,"SELECT count(*) FROM file_objects WHERE identity_state='resolved' AND content_id IS NOT NULL",[]).unwrap(),1);
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM copy_bindings WHERE state='present'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM file_locations WHERE location_id IN (3,4)",
+                []
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn absent_annex_entry_invalidates_shared_local_copy_once_without_losing_integrity_history() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        let present = annex_item(true);
+        project_annex_observation(&tx, &present, 1, 10, path).unwrap();
+        let mut alias = present.clone();
+        alias.insert("file_ref_id".into(), Value::from("alias"));
+        alias.insert(
+            "logical_path".into(),
+            serde_json::to_value(crate::registry::RegistryPath::utf8("alias")).unwrap(),
+        );
+        project_annex_observation(&tx, &alias, 1, 10, path).unwrap();
+        let checks = key(&tx, path, "SELECT count(*) FROM checks", []).unwrap();
+        project_annex_observation(&tx, &annex_item(false), 2, 20, path).unwrap();
+        assert_eq!(
+            key(&tx, path, "SELECT count(*) FROM checks", []).unwrap(),
+            checks + 1
+        );
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM checks WHERE presence=0 AND integrity=0 AND checked_at=20",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(key(&tx,path,"SELECT count(*) FROM copy_bindings b JOIN checks c ON c.id=b.latest_integrity WHERE b.state='missing' AND c.integrity=1",[]).unwrap(),1);
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM file_locations WHERE presence!=0",
+                []
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            key(&tx, path, "SELECT count(*) FROM source_availability", []).unwrap(),
+            0
+        );
+        let before = tx.total_changes();
+        project_annex_observation(&tx, &annex_item(false), 3, 30, path).unwrap();
+        assert_eq!(tx.total_changes(), before);
+    }
+
+    #[test]
+    fn annex_inventory_unknown_does_not_invalidate_known_content() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        project_annex_observation(&tx, &annex_item(true), 1, 10, path).unwrap();
+        let checks = key(&tx, path, "SELECT count(*) FROM checks", []).unwrap();
+        let mut inventory = annex_item(false);
+        for (field, value) in [
+            ("claim_basis", "source_metadata"),
+            ("local_availability", "unknown"),
+            ("copy_state", "unknown"),
+            ("copy_claim_id", "copy"),
+            ("copy_location_id", "cas"),
+        ] {
+            inventory.insert(field.into(), Value::from(value));
+        }
+        inventory.insert(
+            "copy_path".into(),
+            serde_json::to_value(crate::registry::RegistryPath::utf8("objects/key")).unwrap(),
+        );
+        project_annex_observation(&tx, &inventory, 2, 20, path).unwrap();
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM copy_bindings WHERE state='present'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT presence FROM file_locations WHERE location_id=2",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(&tx, path, "SELECT count(*) FROM checks", []).unwrap(),
+            checks
+        );
+    }
+
+    #[test]
+    fn annex_absence_does_not_invalidate_another_physical_copy_of_the_same_key() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        project_annex_observation(&tx, &annex_item(true), 1, 10, path).unwrap();
+        let mut unlocked = annex_item(true);
+        for (field, value) in [
+            ("file_ref_id", "unlocked"),
+            ("representation", "annex_unlocked"),
+            ("copy_claim_id", "unlocked_copy"),
+            ("copy_location_id", "worktree"),
+        ] {
+            unlocked.insert(field.into(), Value::from(value));
+        }
+        for field in ["logical_path", "copy_path"] {
+            unlocked.insert(
+                field.into(),
+                serde_json::to_value(crate::registry::RegistryPath::utf8("unlocked")).unwrap(),
+            );
+        }
+        project_annex_observation(&tx, &unlocked, 1, 10, path).unwrap();
+        project_annex_observation(&tx, &annex_item(false), 2, 20, path).unwrap();
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM copy_bindings WHERE canonical_id='copy' AND state='missing'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(key(&tx,path,"SELECT count(*) FROM copy_bindings WHERE canonical_id='unlocked_copy' AND state='present'",[]).unwrap(),1);
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM source_availability WHERE state='present'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        // An absence at one unlocked path must likewise retain another alias.
+        let mut alias = unlocked.clone();
+        alias.insert("file_ref_id".into(), Value::from("second"));
+        alias.insert("copy_claim_id".into(), Value::from("second_copy"));
+        for field in ["logical_path", "copy_path"] {
+            alias.insert(
+                field.into(),
+                serde_json::to_value(crate::registry::RegistryPath::utf8("second")).unwrap(),
+            );
+        }
+        project_annex_observation(&tx, &alias, 2, 20, path).unwrap();
+        let mut absent = annex_item(false);
+        absent.insert("file_ref_id".into(), Value::from("unlocked"));
+        absent.insert("representation".into(), Value::from("annex_unlocked"));
+        absent.insert("logical_path".into(), unlocked["logical_path"].clone());
+        project_annex_observation(&tx, &absent, 3, 30, path).unwrap();
+        assert_eq!(key(&tx,path,"SELECT count(*) FROM copy_bindings WHERE canonical_id='unlocked_copy' AND state='missing'",[]).unwrap(),1);
+        assert_eq!(key(&tx,path,"SELECT count(*) FROM copy_bindings WHERE canonical_id='second_copy' AND state='present'",[]).unwrap(),1);
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM source_availability WHERE state='present'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn absent_annex_entry_invalidates_copy_when_cas_and_worktree_share_a_location() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        let mut present = annex_item(true);
+        present.insert("cas_location_id".into(), Value::from("worktree"));
+        present.insert("copy_location_id".into(), Value::from("worktree"));
+        project_annex_observation(&tx, &present, 1, 10, path).unwrap();
+        let mut absent = annex_item(false);
+        absent.insert("cas_location_id".into(), Value::from("worktree"));
+        project_annex_observation(&tx, &absent, 2, 20, path).unwrap();
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM copy_bindings WHERE state='missing'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM file_locations WHERE presence=0",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM checks WHERE checked_at=20 AND presence=0 AND integrity=0",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(&tx, path, "SELECT count(*) FROM source_availability", []).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn absent_worktree_link_does_not_prove_cas_content_missing() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        let mut present = annex_item(true);
+        present.insert("cas_location_id".into(), Value::from("worktree"));
+        present.insert("copy_location_id".into(), Value::from("worktree"));
+        project_annex_observation(&tx, &present, 1, 10, path).unwrap();
+        let mut absent = annex_item(false);
+        absent.insert("cas_location_id".into(), Value::from("worktree"));
+        absent.insert(
+            "representation".into(),
+            Value::from("missing_worktree_entry"),
+        );
+        absent.insert("path_state".into(), Value::from("missing"));
+        let checks = key(&tx, path, "SELECT count(*) FROM checks", []).unwrap();
+        project_annex_observation(&tx, &absent, 2, 20, path).unwrap();
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM copy_bindings WHERE state='present'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM source_availability WHERE state='present'",
+                []
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            key(&tx, path, "SELECT count(*) FROM checks", []).unwrap(),
+            checks
+        );
+    }
+
+    #[test]
+    fn inventory_copy_verified_then_absent_records_missing_observation() {
+        let mut connection = annex_database();
+        let tx = connection.transaction().unwrap();
+        let path = Path::new(":memory:");
+        let mut inventory = annex_item(true);
+        for field in [
+            "object_id",
+            "blake3_hex",
+            "sha256_hex",
+            "verification_result",
+        ] {
+            inventory.insert(field.into(), Value::Null);
+        }
+        for (field, value) in [
+            ("claim_basis", "source_metadata"),
+            ("local_availability", "unknown"),
+            ("copy_state", "unknown"),
+            ("resolution_state", "unresolved"),
+        ] {
+            inventory.insert(field.into(), Value::from(value));
+        }
+        project_annex_observation(&tx, &inventory, 1, 10, path).unwrap();
+        project_annex_observation(&tx, &annex_item(true), 2, 20, path).unwrap();
+        project_annex_observation(&tx, &annex_item(false), 3, 30, path).unwrap();
+        assert_eq!(key(&tx,path,"SELECT count(*) FROM copy_bindings WHERE state='missing' AND basis='observed_bytes'",[]).unwrap(),1);
+        assert_eq!(
+            key(
+                &tx,
+                path,
+                "SELECT count(*) FROM checks WHERE checked_at=30 AND presence=0 AND integrity=0",
+                []
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn annex_read_errors_and_mismatches_still_record_failed_checks() {
+        for (result, state, availability, integrity) in [
+            ("read_error", "unknown", "missing", 0),
+            ("hash_mismatch", "corrupt", "present", 2),
+        ] {
+            let mut connection = annex_database();
+            let tx = connection.transaction().unwrap();
+            let path = Path::new(":memory:");
+            let mut item = annex_item(true);
+            item.insert("object_id".into(), Value::Null);
+            item.insert("resolution_state".into(), Value::from("unresolved"));
+            item.insert("verification_result".into(), Value::from(result));
+            item.insert("copy_state".into(), Value::from(state));
+            item.insert("local_availability".into(), Value::from(availability));
+            project_annex_observation(&tx, &item, 1, 10, path).unwrap();
+            assert_eq!(key(&tx,path,"SELECT count(*) FROM checks c JOIN check_errors e ON e.check_id=c.id WHERE e.code=?1 AND c.integrity=?2",params![result,integrity]).unwrap(),1);
+            assert_eq!(
+                key(
+                    &tx,
+                    path,
+                    "SELECT count(*) FROM copy_bindings WHERE state=?1",
+                    [state]
+                )
+                .unwrap(),
+                1
+            );
+        }
+    }
 
     fn check_database() -> Connection {
         let connection = Connection::open_in_memory().unwrap();

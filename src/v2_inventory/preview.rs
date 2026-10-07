@@ -103,9 +103,80 @@ impl V2ScanPreview {
     }
 }
 
+/// Why an on-disk file would be added by a positive inventory run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum V2NewFileKind {
+    NewToCollection,
+    NewToLocation,
+}
+
+type NewFileVisitor<'a> = dyn FnMut(V2NewFileKind, &EncodedPath, u64) -> Result<()> + 'a;
+
+/// Visit every newly discovered File or Location presence in discovery order,
+/// without reading content or changing the catalog. Summary path samples remain
+/// bounded; the visitor is called immediately and may stop the walk with an error.
+/// Only novelty and traversal/annex uncertainty counters are populated: recorded
+/// ordinary files are not checked for verification status or changed metadata.
+/// `location_root` is the actual registered Location root, including when the
+/// inventory config selects a subtree. Only positive (`Add`) previews are supported.
+pub fn visit_new_files(
+    projection: &V2ProjectionDb,
+    config: &V2InventoryConfig,
+    location_root: &Path,
+    visitor: &mut NewFileVisitor<'_>,
+) -> Result<V2ScanPreview> {
+    if config.scan_mode != ScanMode::Add || !config.accept_changes.is_empty() {
+        return Err(V2InventoryError::Invalid(
+            "listing new files requires an add preview without accept_changes".to_owned(),
+        ));
+    }
+    let prefix = config
+        .location_prefix
+        .as_deref()
+        .unwrap_or_else(|| Path::new(""));
+    if !prefix
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(V2InventoryError::Invalid(
+            "Location prefix must be a relative path without parent traversal".to_owned(),
+        ));
+    }
+    let location_root = fs::canonicalize(location_root)
+        .map_err(|source| io_error("resolve Location root", location_root, source))?;
+    let scan_root = fs::canonicalize(&config.root_path)
+        .map_err(|source| io_error("resolve inventory root", &config.root_path, source))?;
+    let expected_root = location_root.join(prefix);
+    let expected_root = fs::canonicalize(&expected_root)
+        .map_err(|source| io_error("resolve Location subtree", &expected_root, source))?;
+    if expected_root != scan_root || !scan_root.starts_with(&location_root) {
+        return Err(V2InventoryError::Invalid(
+            "inventory root does not match the Location root and prefix".to_owned(),
+        ));
+    }
+    walk_preview(projection, config, &location_root, true, visitor)
+}
+
 pub fn preview_scan(
     projection: &V2ProjectionDb,
     config: &V2InventoryConfig,
+) -> Result<V2ScanPreview> {
+    walk_preview(
+        projection,
+        config,
+        &config.root_path,
+        false,
+        &mut |_, _, _| Ok(()),
+    )
+}
+
+fn walk_preview(
+    projection: &V2ProjectionDb,
+    config: &V2InventoryConfig,
+    annex_root: &Path,
+    list_new_only: bool,
+    visitor: &mut NewFileVisitor<'_>,
 ) -> Result<V2ScanPreview> {
     validate_config(config)?;
     validate_scope(projection.path(), config)?;
@@ -134,7 +205,9 @@ pub fn preview_scan(
                     config.location_prefix.as_deref(),
                     &relative,
                 ));
-                seen.insert((logical.encoding.as_str().to_owned(), logical.bytes.clone()));
+                if config.scan_mode == ScanMode::Complete {
+                    seen.insert((logical.encoding.as_str().to_owned(), logical.bytes.clone()));
+                }
                 let annex = if annex_imported {
                     known_annex_entry(
                         &connection,
@@ -150,15 +223,17 @@ pub fn preview_scan(
                 // Without reading: unchanged content is skipped, the recorded content
                 // size is content, and a pointer's size is fixed by its key.
                 if let Some(known) = annex.as_ref().filter(|_| file.size_bytes <= 32 * 1024) {
-                    if copy_unchanged(
-                        &connection,
-                        database,
-                        &config.collection_id,
-                        &config.location_id,
-                        &here,
-                        file.size_bytes,
-                        file.modified_time_utc_ms,
-                    )? {
+                    if !list_new_only
+                        && copy_unchanged(
+                            &connection,
+                            database,
+                            &config.collection_id,
+                            &config.location_id,
+                            &here,
+                            file.size_bytes,
+                            file.modified_time_utc_ms,
+                        )?
+                    {
                         preview.unchanged = preview.unchanged.saturating_add(1);
                         continue;
                     }
@@ -200,6 +275,8 @@ pub fn preview_scan(
                     file.size_bytes,
                     file.modified_time_utc_ms,
                     annex.is_some(),
+                    list_new_only,
+                    visitor,
                 )?;
             }
             DiscoveryItem::Symlink(path) => {
@@ -212,7 +289,9 @@ pub fn preview_scan(
                     preview.ignored_symlinks = preview.ignored_symlinks.saturating_add(1);
                     continue;
                 }
-                seen.insert((logical.encoding.as_str().to_owned(), logical.bytes.clone()));
+                if config.scan_mode == ScanMode::Complete {
+                    seen.insert((logical.encoding.as_str().to_owned(), logical.bytes.clone()));
+                }
                 let Some(known) = known_annex_entry(
                     &connection,
                     database,
@@ -224,7 +303,10 @@ pub fn preview_scan(
                     preview.ignored_symlinks = preview.ignored_symlinks.saturating_add(1);
                     continue;
                 };
-                if known.representation != "annex_locked_symlink"
+                if known
+                    .representation
+                    .as_deref()
+                    .is_some_and(|value| value != "annex_locked_symlink")
                     || known.expected_hash_hex.is_none()
                 {
                     preview.without_identity = preview.without_identity.saturating_add(1);
@@ -234,7 +316,12 @@ pub fn preview_scan(
                     config.location_prefix.as_deref(),
                     &relative,
                 ));
-                match resolve_annex_content(&config.root_path, &relative, &known)? {
+                let annex_relative = if list_new_only {
+                    prefixed_path(config.location_prefix.as_deref(), &relative)
+                } else {
+                    relative
+                };
+                match resolve_annex_content(annex_root, &annex_relative, &known)? {
                     AnnexContent::Present { metadata, .. } => classify(
                         &connection,
                         database,
@@ -245,6 +332,8 @@ pub fn preview_scan(
                         metadata.len(),
                         modified_time_ms(&metadata),
                         true,
+                        list_new_only,
+                        visitor,
                     )?,
                     AnnexContent::Absent => {
                         // Only a complete scan records absence, and only when it is new.
@@ -364,31 +453,28 @@ fn classify(
     size_bytes: u64,
     modified_time_utc_ms: Option<u64>,
     annex: bool,
+    list_new_only: bool,
+    visitor: &mut NewFileVisitor<'_>,
 ) -> Result<()> {
-    if copy_unchanged(
-        connection,
-        database,
-        &config.collection_id,
-        &config.location_id,
-        here,
-        size_bytes,
-        modified_time_utc_ms,
-    )? {
+    if !list_new_only
+        && copy_unchanged(
+            connection,
+            database,
+            &config.collection_id,
+            &config.location_id,
+            here,
+            size_bytes,
+            modified_time_utc_ms,
+        )?
+    {
         preview.unchanged = preview.unchanged.saturating_add(1);
         return Ok(());
     }
     // The real walk's lookup: an existing File at this path, active or not.
-    let existing: Option<(Option<String>, String)> = connection
-        .query_row(
-            "SELECT object_id, identity_state FROM file_refs WHERE collection_id = ?1 AND logical_path_encoding = ?2 AND logical_path_bytes = ?3 ORDER BY (path_state = 'active') DESC LIMIT 1",
-            params![config.collection_id, logical.encoding.as_str(), logical.bytes],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|source| inventory_sqlite_error(database, source))?;
+    let existing = file_at_path(connection, database, &config.collection_id, logical)?;
     let Some((object_id, identity_state)) = existing else {
         preview.new_files.add(logical, size_bytes);
-        return Ok(());
+        return visitor(V2NewFileKind::NewToCollection, logical, size_bytes);
     };
     if !annex && (identity_state != "resolved" || object_id.is_none()) {
         // The real run stops at this path, so the preview reports the same error.
@@ -397,23 +483,12 @@ fn classify(
             logical.display
         )));
     }
-    let recorded: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM path_observations p
-             JOIN file_refs f ON f.file_ref_id = p.file_ref_id
-             WHERE p.location_id = ?1 AND p.observed_path_encoding = ?2
-               AND p.observed_path_bytes = ?3 AND p.state = 'present' AND f.collection_id = ?4)",
-            params![
-                config.location_id,
-                here.encoding.as_str(),
-                here.bytes,
-                config.collection_id
-            ],
-            |row| row.get(0),
-        )
-        .map_err(|source| inventory_sqlite_error(database, source))?;
+    let recorded = recorded_at_location(connection, database, config, here)?;
     if !recorded {
         preview.new_at_location.add(logical, size_bytes);
+        return visitor(V2NewFileKind::NewToLocation, logical, size_bytes);
+    }
+    if list_new_only {
         return Ok(());
     }
     // A copy that is not present with a good last check is read whatever its metadata.
@@ -444,4 +519,62 @@ fn classify(
         preview.needs_reading.add(logical, size_bytes);
     }
     Ok(())
+}
+
+/// Probe active paths first through compact_file_path. The less common fallback
+/// preserves the real walk's treatment of retired Files, scoped to this Collection.
+fn file_at_path(
+    connection: &Connection,
+    database: &Path,
+    collection_id: &str,
+    path: &EncodedPath,
+) -> Result<Option<(Option<i64>, String)>> {
+    for active in [1, 0] {
+        let found = connection
+            .query_row(
+                "SELECT content_id, identity_state FROM file_objects
+             WHERE collection_id=(SELECT id FROM collections WHERE collection_id=?1)
+               AND path_encoding=?2 AND path_bytes=?3 AND active=?4 LIMIT 1",
+                params![collection_id, path.encoding.as_str(), path.bytes, active],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|source| inventory_sqlite_error(database, source))?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
+fn recorded_at_location(
+    connection: &Connection,
+    database: &Path,
+    config: &V2InventoryConfig,
+    path: &EncodedPath,
+) -> Result<bool> {
+    for active in [1, 0] {
+        let found = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM file_objects f
+             JOIN file_locations p ON p.file_id=f.id
+             WHERE f.collection_id=(SELECT id FROM collections WHERE collection_id=?1)
+               AND f.path_encoding=?2 AND f.path_bytes=?3 AND f.active=?4
+               AND p.location_id=(SELECT id FROM locations WHERE location_id=?5)
+               AND p.presence=1 AND p.representation!='annex_content')",
+                params![
+                    config.collection_id,
+                    path.encoding.as_str(),
+                    path.bytes,
+                    active,
+                    config.location_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| inventory_sqlite_error(database, source))?;
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
