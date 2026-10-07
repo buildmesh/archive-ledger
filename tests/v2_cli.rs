@@ -463,7 +463,7 @@ mod unix {
         assert_eq!(initialized["archive_name"], "Personal");
 
         let before = json(&success(archive(&temp).args(["--json", "status"])));
-        assert_eq!(before["schema_version"], 7);
+        assert_eq!(before["schema_version"], 8);
         assert_eq!(before["event_tree_version"], 2);
         assert_eq!(before["records"], 3);
         assert_eq!(before["collections"], serde_json::json!([]));
@@ -613,7 +613,7 @@ mod unix {
                 .arg(&archive_root)
                 .args(["--json", "status"]),
         ));
-        assert_eq!(current["schema_version"], 7);
+        assert_eq!(current["schema_version"], 8);
         assert_eq!(current["records"], 3);
     }
 
@@ -5932,7 +5932,36 @@ mod unix {
                 .unwrap(),
             1
         );
+        // A dangling annex link supplies Collection identity, not a stored copy
+        // or a Location presence/check observation.
+        let absent_rows: (i64, i64, i64) = database
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM file_locations p JOIN file_objects f ON f.id=p.file_id
+                     WHERE f.path_bytes=CAST('absent.txt' AS BLOB)),
+                    (SELECT COUNT(*) FROM checks),
+                    (SELECT COUNT(*) FROM source_availability WHERE state='missing')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(absent_rows, (0, 1, 0));
         drop(database);
+
+        success(archive(&temp).args(["db", "rebuild"]));
+        let rebuilt = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
+        assert_eq!(
+            rebuilt
+                .query_row(
+                    "SELECT COUNT(*) FROM file_locations p JOIN file_objects f ON f.id=p.file_id
+                 WHERE f.path_bytes=CAST('absent.txt' AS BLOB)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(rebuilt);
 
         let first_scan = json(&success(archive(&temp).args([
             "--json",

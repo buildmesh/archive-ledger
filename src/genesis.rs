@@ -13,7 +13,7 @@ pub const GENESIS_VERSION: u32 = 2;
 /// Schema identifier in signed canonical genesis documents; independent of SQLite storage.
 pub const V2_SCHEMA_VERSION: u32 = 6;
 /// Current local SQLite projection format, rebuilt from unchanged canonical history.
-pub const V2_SQLITE_SCHEMA_VERSION: u32 = 7;
+pub const V2_SQLITE_SCHEMA_VERSION: u32 = 8;
 
 pub type Result<T> = std::result::Result<T, GenesisError>;
 

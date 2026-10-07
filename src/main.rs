@@ -13513,14 +13513,22 @@ fn v2_copy_destination(
             })?;
             let annex: Option<(String, String, Option<String>)> = connection
                 .query_row(
-                    "SELECT p.external_identity_id, x.external_key, x.object_id
-                     FROM path_observations p
+                    "SELECT x.external_identity_id, x.external_key, x.object_id
+                     FROM file_refs f
                      JOIN external_identities x
-                       ON x.external_identity_id = p.external_identity_id
-                     WHERE p.file_ref_id = ?1 AND p.location_id = ?2
-                       AND p.observed_path_encoding = ?3
-                       AND p.observed_path_bytes = ?4
-                       AND p.representation = 'annex_locked_symlink'",
+                       ON x.external_identity_id = f.external_identity_id
+                     LEFT JOIN path_observations p
+                       ON p.file_ref_id = f.file_ref_id AND p.location_id = ?2
+                     WHERE f.file_ref_id = ?1 AND f.path_state = 'active'
+                       AND f.logical_path_encoding = ?3
+                       AND f.logical_path_bytes = ?4
+                       AND x.namespace = 'git-annex'
+                       AND (p.representation = 'annex_locked_symlink'
+                            OR (p.file_ref_id IS NULL AND EXISTS (
+                                SELECT 1 FROM annex_imports a
+                                WHERE a.collection_id = f.collection_id
+                                  AND a.worktree_location_id = ?2
+                                  AND a.status = 'complete')))",
                     params![
                         item.file_ref_id,
                         destination_location_id,

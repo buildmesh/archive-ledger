@@ -947,7 +947,7 @@ already enrolled installation, and synchronize both installations before the new
 request never contains the private key. To stop a lost installation from making future writes, use
 `archive sync revoke <client-id> --yes`; previously accepted history remains intact.
 
-### Upgrade an existing schema-6 catalog
+### Upgrade an existing schema-6 or schema-7 catalog
 
 After installing the new binary, stop commands writing the selected Archive and allow enough
 space for a replacement database alongside the existing one. Rebuild its local SQLite catalog:
@@ -958,7 +958,8 @@ archive db rebuild
 archive fsck --full
 ```
 
-This creates schema 7 from the existing signed history. The canonical genesis schema remains 6;
+This creates schema 8 from the existing signed history, omitting Location/check rows for
+annex content that was never present while retaining observations of copies that went missing. The canonical genesis schema remains 6;
 the event tree is unchanged. Rebuild does not re-import an annex repository or rehash archive
 contents. It retains the previous schema database beside `archive.db` as
 `.archive-ledger-previous-<id>.db` and reports its exact path (`previous_database` in JSON).

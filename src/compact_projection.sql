@@ -50,6 +50,8 @@ CREATE TABLE file_locations (
  UNIQUE(file_id,location_id)
 ) STRICT;
 CREATE INDEX compact_location_files ON file_locations(location_id,file_id);
+-- Refresh every logical alias of a missing physical Copy without a full scan.
+CREATE INDEX compact_file_copy ON file_locations(copy_id) WHERE copy_id IS NOT NULL;
 -- One shared Copy identity can serve multiple logical annex paths.
 CREATE TABLE copy_bindings (
  id INTEGER PRIMARY KEY, canonical_id TEXT NOT NULL UNIQUE,

@@ -929,7 +929,7 @@ pub fn add_files(
                     "duration_ms": hashed.duration_ms,
                     "observed_time_utc_ms": observed_time_utc_ms,
                     "device_fingerprint_status": config.device_fingerprint_status,
-                    "representation": annex.as_ref().map_or("ordinary_file", |known| known.representation.as_str()),
+                    "representation": annex.as_ref().map_or("ordinary_file", |known| known.representation.as_deref().unwrap_or("annex_unlocked_file")),
                     "external_identity_id": annex.as_ref().map(|known| &known.external_identity_id),
                     "extension_hint": Path::new(&relative).extension().and_then(|value| value.to_str()),
                     "job_id": config.job_id,
@@ -1010,7 +1010,10 @@ pub fn add_files(
                     summary.ignored_symlinks = summary.ignored_symlinks.saturating_add(1);
                     continue;
                 };
-                if known.representation != "annex_locked_symlink"
+                if known
+                    .representation
+                    .as_deref()
+                    .is_some_and(|value| value != "annex_locked_symlink")
                     || known.expected_hash_hex.is_none()
                 {
                     record_seen
@@ -1652,7 +1655,7 @@ fn validate_scope(database: &Path, config: &V2InventoryConfig) -> Result<()> {
 }
 
 struct KnownAnnexEntry {
-    representation: String,
+    representation: Option<String>,
     file_ref_id: String,
     external_identity_id: String,
     external_key: String,
@@ -1727,16 +1730,16 @@ const KNOWN_ANNEX_ENTRY_SQL: &str = "SELECT p.representation, f.canonical_id, e.
                       ELSE COALESCE(physical.path_display,CAST(physical.path_bytes AS TEXT)) END,
                     h.algorithm, e.source_key
              FROM file_objects f
-             JOIN file_locations p ON p.file_id=f.id
+             LEFT JOIN file_locations p ON p.file_id=f.id
+               AND p.location_id=(SELECT id FROM locations WHERE location_id=?2)
              JOIN source_identities e ON e.id=f.external_id
              LEFT JOIN checksums h ON h.id=e.expected_checksum
              LEFT JOIN content_objects content ON content.id=e.content_id
              LEFT JOIN copy_bindings c ON c.external_id=e.id
-               AND c.location_id=p.location_id AND c.state!='superseded'
+               AND c.location_id=(SELECT id FROM locations WHERE location_id=?2) AND c.state!='superseded'
              LEFT JOIN file_locations owner ON owner.id=c.owner
              LEFT JOIN file_objects physical ON physical.id=owner.file_id
              WHERE f.collection_id=(SELECT id FROM collections WHERE collection_id=?1)
-               AND p.location_id=(SELECT id FROM locations WHERE location_id=?2)
                AND f.path_encoding=?3 AND f.path_bytes=?4 AND f.active=1
              ORDER BY c.canonical_id LIMIT 1";
 
@@ -1758,7 +1761,7 @@ fn known_annex_entry(
             ],
             |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,

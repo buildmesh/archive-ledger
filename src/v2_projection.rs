@@ -2679,7 +2679,7 @@ mod tests {
         // A prior local database is preserved byte-for-byte; its contents are not
         // migration input. Only the signed canonical store supplies the new facts.
         let previous = Connection::open(&path).unwrap();
-        previous.execute_batch("PRAGMA user_version=6; CREATE TABLE old_data(value TEXT); INSERT INTO old_data VALUES ('preserve me');").unwrap();
+        previous.execute_batch("PRAGMA user_version=7; CREATE TABLE old_data(value TEXT); INSERT INTO old_data VALUES ('preserve me');").unwrap();
         drop(previous);
         let old_bytes = fs::read(&path).unwrap();
         let canonical_head = fs::read(store.root().join("frontiers/v2/HEAD")).unwrap();

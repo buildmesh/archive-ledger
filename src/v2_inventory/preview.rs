@@ -303,7 +303,10 @@ fn walk_preview(
                     preview.ignored_symlinks = preview.ignored_symlinks.saturating_add(1);
                     continue;
                 };
-                if known.representation != "annex_locked_symlink"
+                if known
+                    .representation
+                    .as_deref()
+                    .is_some_and(|value| value != "annex_locked_symlink")
                     || known.expected_hash_hex.is_none()
                 {
                     preview.without_identity = preview.without_identity.saturating_add(1);
