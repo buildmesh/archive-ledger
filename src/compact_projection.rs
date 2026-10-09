@@ -34,12 +34,12 @@ fn run<P: rusqlite::Params>(
 ) -> Result<usize> {
     tx.prepare_cached(sql)
         .and_then(|mut s| s.execute(args))
-        .map_err(|e| sqlite_error(path, e))
+        .map_err(|e| sqlite_operation_error(tx, path, sql, e))
 }
 fn key<P: rusqlite::Params>(tx: &Transaction<'_>, path: &Path, sql: &str, args: P) -> Result<i64> {
     tx.prepare_cached(sql)
         .and_then(|mut s| s.query_row(args, |r| r.get(0)))
-        .map_err(|e| sqlite_error(path, e))
+        .map_err(|e| sqlite_operation_error(tx, path, sql, e))
 }
 fn named(tx: &Transaction<'_>, path: &Path, table: &str, column: &str, value: &str) -> Result<i64> {
     key(
@@ -1934,3 +1934,53 @@ mod tests {
 #[cfg(test)]
 #[path = "compact_projection/scan_tests.rs"]
 mod scan_tests;
+
+#[cfg(test)]
+mod failure_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn full_database_reports_statement_and_limits_without_bound_data() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("full.db");
+        let mut db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE payload(value BLOB); INSERT INTO payload VALUES('original');",
+        )
+        .unwrap();
+        let pages: i64 = db
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        db.pragma_update(None, "max_page_count", pages).unwrap();
+        let tx = db.transaction().unwrap();
+        let secret = "private-file-name-not-for-diagnostics".repeat(4096);
+        let sql = "INSERT INTO payload(value) VALUES(?1)";
+        let error = run(&tx, &path, sql, [secret.as_bytes()]).unwrap_err();
+        assert_eq!(error.code(), "v2_projection_sqlite");
+        let message = error.to_string();
+        assert!(
+            message.contains("SQLite primary code 13, extended code 13"),
+            "{message}"
+        );
+        assert!(message.contains(&format!(
+            "statement_blake3={}",
+            blake3::hash(sql.as_bytes())
+        )));
+        assert!(
+            message.contains(&format!("\"main.max_page_count\":{pages}")),
+            "{message}"
+        );
+        assert!(message.contains("main.page_count"));
+        assert!(message.contains("temp.max_page_count"));
+        assert!(!message.contains("private-file-name"));
+        drop(tx);
+        let original: String = db
+            .query_row("SELECT value FROM payload", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(original, "original");
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM payload", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}

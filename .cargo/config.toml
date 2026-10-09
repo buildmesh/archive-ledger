@@ -1,4 +1,0 @@
-[env]
-# Keep small replay statement journals in memory, with disk fallback above 1 MiB.
-# libsqlite3-sys tracks this variable and rebuilds the bundled SQLite when it changes.
-LIBSQLITE3_FLAGS = "-DSQLITE_STMTJRNL_SPILL=1048576"

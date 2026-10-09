@@ -123,12 +123,16 @@ archive --version
 `$HOME/.local/bin/archive`. Use `make install PREFIX=/usr/local` or `DESTDIR` when packaging.
 
 Catalog replay (initial import, job resume, and rebuild) uses a 128 MiB SQLite page-cache
-target and commits groups of up to 256 canonical records. Repository builds also set the
-bundled SQLite statement-journal spill threshold to 1 MiB, retaining disk fallback and the
-existing durability settings. These settings reduce small writes; they are not a total-process
-memory limit. Builds launched outside this repository (including library consumers) must set
-`LIBSQLITE3_FLAGS=-DSQLITE_STMTJRNL_SPILL=1048576` themselves for the same tuning. If that
-variable is already set, include this definition alongside your other flags.
+target and commits groups of up to 256 canonical records. SQLite uses its default 64 KiB
+statement-journal spill threshold, with disk fallback and existing durability settings.
+These settings are not a total-process memory limit.
+
+Version 0.1.8 removes the custom 1 MiB statement-journal threshold, which could cause
+large replay updates to fail with `database or disk is full` despite available space.
+If you previously set `LIBSQLITE3_FLAGS=-DSQLITE_STMTJRNL_SPILL=1048576` outside this
+repository, remove that definition before rebuilding (preserving any unrelated flags).
+After installing the fixed build, retry `archive db rebuild`; a failed replacement build
+leaves the original catalog in place.
 
 ### Run with Docker Compose
 
@@ -1116,6 +1120,23 @@ storage for low-latency indexed review; canonical history remains the recovery s
 measurements live under `docs/benchmarks/`. The 100,000-file gate is ignored by routine
 `make test`; run it deliberately with `make test-scale` only when changing traversal, batching,
 projection-scale, or memory behavior.
+
+### Diagnose a failed catalog rebuild
+
+SQLite replay and rebuild errors include failure context while retaining
+stable error codes such as `v2_projection_sqlite`. Reports include the source callsite,
+replay origin/sequence/batch and item index when available, and a statement BLAKE3
+identifier for compact projection operations. The identifier hashes the SQL template;
+bound file paths and contents are not included in this added context.
+
+Best-effort SQLite diagnostics report the library version, autocommit state, and
+`page_size`, `page_count`, and `max_page_count` for the main and temporary databases.
+`null` means a diagnostic query failed. These are observations **after the error** and
+may reflect automatic rollback; they do not prove that disk space was exhausted.
+Keep the complete error when reporting a failure. This change adds diagnostics, not a
+fix for every `SQLITE_FULL` cause, and does not change the catalog schema or require
+an additional rebuild for catalogs already on schema 8.
+
 
 ## License
 
