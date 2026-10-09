@@ -411,6 +411,12 @@ pub type Result<T> = std::result::Result<T, V2ProjectionError>;
 
 #[derive(Debug, Error)]
 pub enum V2ProjectionError {
+    #[error("{source}; {context}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<V2ProjectionError>,
+    },
     #[error("version 2 event verification failed: {0}")]
     Store(#[from] V2StoreError),
     #[error("SQLite projection is invalid: {0}")]
@@ -432,8 +438,16 @@ pub enum V2ProjectionError {
 }
 
 impl V2ProjectionError {
+    fn context(self, context: impl Into<String>) -> Self {
+        Self::Context {
+            context: context.into(),
+            source: Box::new(self),
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Context { source, .. } => source.code(),
             Self::Store(error) => error.code(),
             Self::Sqlite { .. } => "v2_projection_sqlite",
             Self::Io { .. } => "v2_projection_io",
@@ -683,26 +697,41 @@ impl V2ProjectionDb {
         let database = Self {
             path: path.to_path_buf(),
         };
-        let applied = database.apply(store)?;
+        let applied = database
+            .apply(store)
+            .map_err(|error| error.context("rebuild phase=replay"))?;
         let mut connection = database.open()?;
         configure_replay(&connection, path)?;
         let transaction = connection
             .transaction()
             .map_err(|source| sqlite_error(path, source))?;
         for definition in deferred_indexes {
-            transaction
-                .execute_batch(&definition)
-                .map_err(|source| sqlite_error(path, source))?;
+            transaction.execute_batch(&definition).map_err(|source| {
+                sqlite_operation_error(&transaction, path, &definition, source)
+                    .context("rebuild phase=indexes")
+            })?;
         }
-        transaction
-            .commit()
-            .map_err(|source| sqlite_error(path, source))?;
+        transaction.commit().map_err(|source| {
+            sqlite_operation_error(&connection, path, "COMMIT", source)
+                .context("rebuild phase=index commit")
+        })?;
         connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;")
-            .map_err(|source| sqlite_error(path, source))?;
+            .map_err(|source| {
+                sqlite_operation_error(
+                    &connection,
+                    path,
+                    "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;",
+                    source,
+                )
+                .context("rebuild phase=optimize")
+            })?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .map_err(|source| sqlite_error(path, source))?;
+            .map_err(|source| {
+                sqlite_operation_error(&connection, path, "PRAGMA integrity_check", source)
+                    .context("rebuild phase=integrity check")
+            })?;
         if integrity != "ok" {
             return Err(V2ProjectionError::Invalid(format!(
                 "SQLite integrity_check failed: {integrity}"
@@ -922,6 +951,7 @@ impl V2ProjectionDb {
             &verification_cursors,
             &trusted_clients,
             |record, context| {
+            let result = (|| -> Result<()> {
             if !validated_context {
                 if meta(&connection, &self.path, "archive_id")?
                     != context.genesis.body.archive_id
@@ -1027,13 +1057,25 @@ impl V2ProjectionDb {
                 }
             }
             Ok(())
+            })();
+            result.map_err(|error| {
+                error.context(format!(
+                    "replay origin={:?} sequence={} batch={:?} kind={:?}; {}",
+                    record.record.envelope.origin_id,
+                    record.record.envelope.origin_seq,
+                    record.record.envelope.batch_id,
+                    record.record.envelope.record_kind,
+                    sqlite_storage_diagnostics(&connection),
+                ))
+            })
         },
         )?;
         // Records remain streamed; on error RAII rolls back the pending group.
         if let Some(transaction) = pending_transaction.take() {
-            transaction
-                .commit()
-                .map_err(|source| sqlite_error(&self.path, source))?;
+            transaction.commit().map_err(|source| {
+                sqlite_operation_error(&connection, &self.path, "COMMIT", source)
+                    .context("replay phase=final group commit")
+            })?;
             if let Some(report) = progress.as_mut() {
                 report(V2ApplyProgress::Applying {
                     records_applied,
@@ -1084,9 +1126,10 @@ impl V2ProjectionDb {
                 )
                 .map_err(|source| sqlite_error(&self.path, source))?;
         }
-        final_transaction
-            .commit()
-            .map_err(|source| sqlite_error(&self.path, source))?;
+        final_transaction.commit().map_err(|source| {
+            sqlite_operation_error(&connection, &self.path, "COMMIT", source)
+                .context("replay phase=frontier commit")
+        })?;
         let status = self.status()?;
         if status.accepted_frontier_hash != verified.accepted_frontier_hash {
             return Err(V2ProjectionError::Invalid(
@@ -1179,7 +1222,9 @@ impl V2ProjectionDb {
             Ok(stats) => stats,
             Err(error) => {
                 let _ = fs::remove_file(&temp);
-                return Err(error);
+                return Err(error.context(
+                    "rebuild replacement creation failed; original database was not replaced",
+                ));
             }
         };
         File::open(&temp)
@@ -1396,27 +1441,28 @@ fn project_batch_chunk(
             .checked_add(offset)
             .ok_or_else(|| V2ProjectionError::Invalid("batch item index overflow".to_owned()))?;
         let kind = string(item, "kind")?;
-        if item_requires_coordination(transaction, item, kind, path)? {
-            require_batch_coordination(transaction, &record.record.envelope.batch_id, path)?;
-        }
-        match kind {
-            "archive_initialized" => {
-                if string(item, "archive_id")? != verified.genesis.body.archive_id
-                    || string(item, "archive_display_name")?
-                        != verified.genesis.body.archive_display_name
-                    || string(item, "client_id")? != verified.genesis.body.initial_client_id
-                    || string(item, "public_key")? != verified.genesis.body.initial_public_key
-                {
-                    return Err(V2ProjectionError::Invalid(
-                        "archive_initialized item does not match genesis".to_owned(),
-                    ));
-                }
-                let public_key = STANDARD_NO_PAD
-                    .decode(&verified.genesis.body.initial_public_key)
-                    .map_err(|_| {
-                        V2ProjectionError::Invalid("genesis public key is invalid".to_owned())
-                    })?;
-                transaction
+        let result = (|| -> Result<()> {
+            if item_requires_coordination(transaction, item, kind, path)? {
+                require_batch_coordination(transaction, &record.record.envelope.batch_id, path)?;
+            }
+            match kind {
+                "archive_initialized" => {
+                    if string(item, "archive_id")? != verified.genesis.body.archive_id
+                        || string(item, "archive_display_name")?
+                            != verified.genesis.body.archive_display_name
+                        || string(item, "client_id")? != verified.genesis.body.initial_client_id
+                        || string(item, "public_key")? != verified.genesis.body.initial_public_key
+                    {
+                        return Err(V2ProjectionError::Invalid(
+                            "archive_initialized item does not match genesis".to_owned(),
+                        ));
+                    }
+                    let public_key = STANDARD_NO_PAD
+                        .decode(&verified.genesis.body.initial_public_key)
+                        .map_err(|_| {
+                            V2ProjectionError::Invalid("genesis public key is invalid".to_owned())
+                        })?;
+                    transaction
                     .execute(
                         "INSERT OR IGNORE INTO clients(client_id, display_name, public_key, capabilities_json, status, approved_record_id, approved_origin_id, approved_origin_seq, revoked_record_id)
                          VALUES (?1, ?2, ?3, ?4, 'enrolled', ?5, ?6, ?7, NULL)",
@@ -1434,77 +1480,80 @@ fn project_batch_chunk(
                         ],
                     )
                     .map_err(|source| sqlite_error(path, source))?;
-            }
-            "archive_updated" => {
-                if string(item, "archive_id")? != verified.genesis.body.archive_id {
-                    return Err(V2ProjectionError::Invalid(
-                        "archive_updated item belongs to another Archive".to_owned(),
-                    ));
                 }
-                let display_name = string(item, "archive_display_name")?;
-                if display_name.trim().is_empty() {
-                    return Err(V2ProjectionError::Invalid(
-                        "Archive display name must not be empty".to_owned(),
-                    ));
+                "archive_updated" => {
+                    if string(item, "archive_id")? != verified.genesis.body.archive_id {
+                        return Err(V2ProjectionError::Invalid(
+                            "archive_updated item belongs to another Archive".to_owned(),
+                        ));
+                    }
+                    let display_name = string(item, "archive_display_name")?;
+                    if display_name.trim().is_empty() {
+                        return Err(V2ProjectionError::Invalid(
+                            "Archive display name must not be empty".to_owned(),
+                        ));
+                    }
+                    transaction
+                        .execute(
+                            "UPDATE archive_meta SET value = ?1 WHERE key = 'archive_display_name'",
+                            [display_name],
+                        )
+                        .map_err(|source| sqlite_error(path, source))?;
                 }
-                transaction
-                    .execute(
-                        "UPDATE archive_meta SET value = ?1 WHERE key = 'archive_display_name'",
-                        [display_name],
-                    )
-                    .map_err(|source| sqlite_error(path, source))?;
+                "client_enrolled" => {
+                    project_client_enrolled(transaction, item, record, path)?;
+                }
+                "client_revoked" => {
+                    project_client_revoked(transaction, item, record, path)?;
+                }
+                kind if is_registry_item(kind) => {
+                    project_registry_item(transaction, item, record, path)?;
+                }
+                "content_observed" => {
+                    compact::project_content_observed(
+                        transaction,
+                        item,
+                        record,
+                        item_index,
+                        verified,
+                        path,
+                    )?;
+                }
+                "copy_verification_failed" => {
+                    compact::project_copy_verification_failed(
+                        transaction,
+                        item,
+                        record,
+                        item_index,
+                        path,
+                    )?;
+                }
+                "scan_started" => project_scan_started(transaction, item, record, path)?,
+                "scan_missing_candidate" => {
+                    project_scan_missing_candidate(transaction, item, record, item_index, path)?;
+                }
+                "scan_completed" => project_scan_completed(transaction, item, record, path)?,
+                "annex_import_started" => {
+                    project_annex_import_started(transaction, item, record, path)?
+                }
+                "annex_entry_observed" => {
+                    compact::project_annex_entry(transaction, item, record, item_index, path)?;
+                }
+                "annex_import_completed" => {
+                    project_annex_import_completed(transaction, item, record, path)?
+                }
+                "job_started" => project_job_started(transaction, item, record, path)?,
+                "job_finished" => project_job_finished(transaction, item, record, path)?,
+                kind => {
+                    return Err(V2ProjectionError::Invalid(format!(
+                        "unsupported projection item kind {kind:?}"
+                    )))
+                }
             }
-            "client_enrolled" => {
-                project_client_enrolled(transaction, item, record, path)?;
-            }
-            "client_revoked" => {
-                project_client_revoked(transaction, item, record, path)?;
-            }
-            kind if is_registry_item(kind) => {
-                project_registry_item(transaction, item, record, path)?;
-            }
-            "content_observed" => {
-                compact::project_content_observed(
-                    transaction,
-                    item,
-                    record,
-                    item_index,
-                    verified,
-                    path,
-                )?;
-            }
-            "copy_verification_failed" => {
-                compact::project_copy_verification_failed(
-                    transaction,
-                    item,
-                    record,
-                    item_index,
-                    path,
-                )?;
-            }
-            "scan_started" => project_scan_started(transaction, item, record, path)?,
-            "scan_missing_candidate" => {
-                project_scan_missing_candidate(transaction, item, record, item_index, path)?;
-            }
-            "scan_completed" => project_scan_completed(transaction, item, record, path)?,
-            "annex_import_started" => {
-                project_annex_import_started(transaction, item, record, path)?
-            }
-            "annex_entry_observed" => {
-                compact::project_annex_entry(transaction, item, record, item_index, path)?;
-            }
-            "annex_import_completed" => {
-                project_annex_import_completed(transaction, item, record, path)?
-            }
-            "job_started" => project_job_started(transaction, item, record, path)?,
-            "job_finished" => project_job_finished(transaction, item, record, path)?,
-            kind => {
-                return Err(V2ProjectionError::Invalid(format!(
-                    "unsupported projection item kind {kind:?}"
-                )))
-            }
-        }
-        project_operation_outcome(transaction, item, record, item_index, path)?;
+            project_operation_outcome(transaction, item, record, item_index, path)?;
+            Ok(())
+        })();
+        result.map_err(|error| error.context(format!("batch item index={item_index}")))?;
     }
     let next = sql_u64(current, "batch item count")?
         .checked_add(
@@ -2469,11 +2518,54 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+// Failure-only observations: never replace the original error if a diagnostic query fails.
+// Values may reflect SQLite's automatic rollback, not the exact instant of failure.
+fn sqlite_storage_diagnostics(connection: &Connection) -> String {
+    let mut values = serde_json::Map::new();
+    values.insert("sqlite_version".into(), Value::from(rusqlite::version()));
+    values.insert("autocommit".into(), Value::from(connection.is_autocommit()));
+    for schema in ["main", "temp"] {
+        for pragma in ["page_size", "page_count", "max_page_count"] {
+            let value = connection
+                .query_row(&format!("PRAGMA {schema}.{pragma}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .ok();
+            values.insert(
+                format!("{schema}.{pragma}"),
+                value.map_or(Value::Null, Value::from),
+            );
+        }
+    }
+    format!("SQLite state after error={}", Value::Object(values))
+}
+
+fn sqlite_operation_error(
+    connection: &Connection,
+    path: &Path,
+    sql: &str,
+    source: rusqlite::Error,
+) -> V2ProjectionError {
+    // A digest identifies the exact source statement without exporting SQL or bound values.
+    let statement = blake3::hash(sql.as_bytes()).to_hex();
+    sqlite_error(path, source).context(format!(
+        "statement_blake3={statement}; {}",
+        sqlite_storage_diagnostics(connection)
+    ))
+}
+
+#[track_caller]
 fn sqlite_error(path: impl Into<PathBuf>, source: rusqlite::Error) -> V2ProjectionError {
+    let caller = std::panic::Location::caller();
     V2ProjectionError::Sqlite {
         path: path.into(),
         source,
     }
+    .context(format!(
+        "projection callsite={}:{}",
+        caller.file(),
+        caller.line()
+    ))
 }
 
 fn sqlite_error_details(source: &rusqlite::Error) -> String {
@@ -2548,13 +2640,10 @@ mod tests {
     fn sqlite_diagnostics_preserve_errors_without_sqlite_result_codes() {
         let error = sqlite_error("fixture.db", rusqlite::Error::QueryReturnedNoRows);
         assert_eq!(error.code(), "v2_projection_sqlite");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "SQLite operation failed for fixture.db: {}",
-                rusqlite::Error::QueryReturnedNoRows
-            )
-        );
+        assert!(error.to_string().starts_with(&format!(
+            "SQLite operation failed for fixture.db: {}; projection callsite=",
+            rusqlite::Error::QueryReturnedNoRows
+        )));
         let invalid = V2ProjectionError::Invalid("original validation detail".to_owned());
         assert_eq!(invalid.code(), "v2_projection_invalid");
         assert_eq!(
@@ -2571,9 +2660,9 @@ mod tests {
         let original = source.to_string();
         let error = sqlite_error("fixture.db", source);
         assert_eq!(error.code(), "v2_projection_sqlite");
-        assert_eq!(error.to_string(), format!(
-            "SQLite operation failed for fixture.db: {original} (SQLite primary code 1, extended code 1)"
-        ));
+        assert!(error.to_string().starts_with(&format!(
+            "SQLite operation failed for fixture.db: {original} (SQLite primary code 1, extended code 1); projection callsite="
+        )));
     }
 
     fn copy_tree(source: &Path, target: &Path) {
@@ -3089,13 +3178,71 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(connection
-            .query_row(
-                "SELECT sqlite_compileoption_used('STMTJRNL_SPILL=1048576')",
-                [],
-                |row| row.get::<_, bool>(0)
+    }
+
+    #[test]
+    fn replay_candidate_activation_spills_statement_journal_and_remains_atomic() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("projection.db");
+        let connection = Connection::open(&path).unwrap();
+        configure_replay(&connection, &path).unwrap();
+        // A reduced scan-candidate table isolates the replay statement-journal
+        // boundary. Enough existing pages must be changed twice in one transaction
+        // to exceed the former 1 MiB spill threshold. Changing an unrelated table
+        // first does not reproduce the failure.
+        connection
+            .execute_batch(
+                "CREATE TABLE scan_missing_candidates (
+                candidate_id INTEGER PRIMARY KEY,
+                scan_id TEXT NOT NULL,
+                path_bytes BLOB NOT NULL,
+                activated INTEGER NOT NULL DEFAULT 0 CHECK(activated IN (0,1))
+             ) STRICT;
+             BEGIN;",
             )
-            .unwrap());
+            .unwrap();
+        {
+            let mut insert = connection.prepare(
+                "INSERT INTO scan_missing_candidates(scan_id,path_bytes) VALUES ('scan_test',?1)",
+            ).unwrap();
+            for _ in 0..8192 {
+                insert.execute([vec![b'a'; 212]]).unwrap();
+            }
+        }
+        connection.execute_batch("COMMIT;").unwrap();
+        for finish in ["ROLLBACK", "COMMIT"] {
+            connection
+                .execute_batch(
+                    "BEGIN; UPDATE scan_missing_candidates SET path_bytes=zeroblob(212);",
+                )
+                .unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE scan_missing_candidates SET activated=1 WHERE scan_id=?1",
+                        ["scan_test"],
+                    )
+                    .unwrap(),
+                8192
+            );
+            connection.execute_batch(finish).unwrap();
+            let activated: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM scan_missing_candidates WHERE activated=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(activated, if finish == "COMMIT" { 8192 } else { 0 });
+            let changed_paths: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM scan_missing_candidates WHERE path_bytes=zeroblob(212)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(changed_paths, activated);
+        }
     }
 
     #[test]
@@ -3316,6 +3463,58 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Run archive db rebuild to rebuild from the existing canonical records"));
+    }
+
+    #[test]
+    fn replay_failure_reports_record_and_item_and_allows_retry() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("archive");
+        initialize_v2_archive(&archive, "arc_test", "Personal", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &path).unwrap();
+        let database = V2ProjectionDb::open_existing(&path).unwrap();
+        let before = database.status().unwrap();
+        append_projection_items(
+            &store,
+            vec![json!({
+                "kind": "archive_updated", "archive_id": "arc_test",
+                "archive_display_name": "private-bound-name"
+            })],
+        );
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_update BEFORE UPDATE ON archive_meta
+            WHEN OLD.key='archive_display_name' BEGIN SELECT RAISE(ABORT,'injected failure'); END;",
+            )
+            .unwrap();
+        let error = database.apply(&store).unwrap_err();
+        assert_eq!(error.code(), "v2_projection_sqlite");
+        let message = error.to_string();
+        assert!(message.contains("sequence=5"), "{message}");
+        assert!(message.contains("batch item index=0"), "{message}");
+        assert!(message.contains("main.max_page_count"), "{message}");
+        assert!(message.contains("projection callsite="), "{message}");
+        assert!(!message.contains("private-bound-name"));
+        // A failed apply intentionally leaves accepted ahead of applied, so inspect
+        // the retained facts directly rather than asking for a caught-up status.
+        assert_eq!(
+            meta(&connection, &path, "archive_display_name").unwrap(),
+            before.archive_name
+        );
+        assert_eq!(
+            meta(&connection, &path, "applied_frontier_hash").unwrap(),
+            before.applied_frontier_hash
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        database.apply(&store).unwrap();
+        assert_eq!(
+            database.status().unwrap().archive_name,
+            "private-bound-name"
+        );
     }
 
     #[test]
