@@ -4825,6 +4825,21 @@ mod unix {
             )
             .unwrap();
         assert_eq!(shared_copy, ("missing".to_owned(), "present".to_owned()));
+        let listed = success(archive(&temp).args([
+            "file",
+            "find",
+            "--collection",
+            "Files",
+            "--in",
+            "Annex Location",
+            "--verified-within",
+            "30d",
+            "--print0",
+            "--limit",
+            "1",
+        ]));
+        assert_eq!(listed.stdout, b"src/sha256\0src/sha512\0");
+
         assert_eq!(fs::read(repo.join(".git/index")).unwrap(), original_index);
         for (path, bytes) in original_content {
             assert_eq!(fs::read(path).unwrap(), bytes);
