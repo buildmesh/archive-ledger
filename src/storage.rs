@@ -172,6 +172,65 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn findmnt_selects_visible_mount_above_systemd_automount() {
+        let temp = TempDir::new().unwrap();
+        let mount_root = temp.path().join("disk10");
+        let collection = mount_root.join("annex/files");
+        std::fs::create_dir_all(&collection).unwrap();
+        let mount_root = std::fs::canonicalize(mount_root).unwrap();
+        let mountinfo = temp.path().join("mountinfo");
+        // A private table exercises real findmnt without requiring mount privileges.
+        std::fs::write(
+            &mountinfo,
+            format!(
+                "100 1 0:1 / / rw - tmpfs rootfs rw\n\
+                 101 100 0:30 / {target} rw - autofs systemd-1 rw\n\
+                 102 101 8:33 / {target} rw - ext4 /dev/archive-ledger-test rw\n",
+                target = mount_root.display(),
+            ),
+        )
+        .unwrap();
+
+        for path in [&mount_root, &collection] {
+            let output = findmnt_command(path)
+                .arg("--tab-file")
+                .arg(&mountinfo)
+                .output()
+                .unwrap();
+            let discovered = parse_findmnt_output(path.clone(), output).unwrap();
+            assert_eq!(discovered.mount_root, mount_root);
+            assert_eq!(
+                discovered.source.as_deref(),
+                Some("/dev/archive-ledger-test")
+            );
+            assert_eq!(discovered.filesystem_type.as_deref(), Some("ext4"));
+            assert_eq!(
+                discovered.relative_path,
+                path.strip_prefix(&mount_root).unwrap()
+            );
+            assert_eq!(discovered.identity_state, "unavailable");
+        }
+    }
+
+    #[test]
+    fn multiple_filesystem_results_remain_ambiguous() {
+        let temp = TempDir::new().unwrap();
+        let body = serde_json::json!({
+            "filesystems": [
+                {"target": temp.path(), "source": "/dev/test1", "fstype": "ext4"},
+                {"target": temp.path(), "source": "/dev/test2", "fstype": "ext4"}
+            ]
+        });
+        assert!(matches!(
+            parse_findmnt_json(
+                temp.path().to_path_buf(),
+                &serde_json::to_vec(&body).unwrap()
+            ),
+            Err(StorageDiscoveryError::AmbiguousFilesystem(_))
+        ));
+    }
+
+    #[test]
     fn parses_root_and_prefers_filesystem_uuid() {
         let temp = TempDir::new().unwrap();
         let collection = temp.path().join("annex/photos");
