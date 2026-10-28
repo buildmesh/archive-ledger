@@ -218,7 +218,9 @@ through Compose; plain `docker run` does not inherit them.
 
 The container runs as `ARCHIVE_LEDGER_UID:ARCHIVE_LEDGER_GID`; the state directory must be writable
 and Location files readable by that identity. `findmnt` runs inside the container, and Docker may
-not expose the underlying filesystem UUID for every bind mount. Always inspect a representative
+not expose the underlying filesystem UUID for every bind mount. Version 0.1.9 uses `findmnt --uniq`
+to select the visible filesystem when a disk is mounted over a systemd automount at the same
+path; covered `autofs` entries do not make the mounted disk ambiguous. Always inspect a representative
 root with `location discover`. If stable identity is unavailable, `--allow-unidentified-root` is an
 explicit weaker fallback whose safety depends on keeping both the container mount path and
 `ARCHIVE_LEDGER_HOST_ID` stable. Mounting a host root at the same absolute container path is also

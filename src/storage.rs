@@ -83,15 +83,23 @@ pub fn discover_mounted_filesystem(path: impl AsRef<Path>) -> Result<MountedFile
     if !canonical.is_dir() {
         return Err(StorageDiscoveryError::NotDirectory(canonical));
     }
-    let output = Command::new("findmnt")
-        .arg("--json")
-        .arg("--target")
-        .arg(&canonical)
-        .arg("--output")
-        .arg("TARGET,SOURCE,FSTYPE,UUID,PARTUUID")
+    let output = findmnt_command(&canonical)
         .output()
         .map_err(StorageDiscoveryError::FindmntUnavailable)?;
     parse_findmnt_output(canonical, output)
+}
+
+fn findmnt_command(path: &Path) -> Command {
+    let mut command = Command::new("findmnt");
+    command
+        .arg("--json")
+        // Skip covered mountpoints, such as autofs beneath its mounted disk.
+        .arg("--uniq")
+        .arg("--target")
+        .arg(path)
+        .arg("--output")
+        .arg("TARGET,SOURCE,FSTYPE,UUID,PARTUUID");
+    command
 }
 
 fn parse_findmnt_output(path: PathBuf, output: Output) -> Result<MountedFilesystem> {
