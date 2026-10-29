@@ -13,17 +13,18 @@ use archive_ledger::{
     ArchiveRootSnapshot, CachedPolicyStatus, CatalogError, CatalogRegistry, CollectionSnapshot,
     CopyFilter, CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot, DiscoveryItem,
     EventReferences, EventRequest, EventStore, EventStoreConfig, EventStoreError, FileDiscovery,
-    FileFilter, FilePageRequest, LocationScanner, LocationSnapshot, LocationStatus,
-    MetadataDestinationSnapshot, MetadataError, MetadataProtector, MetadataRegistry, PolicyError,
-    PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter, PolicyFindingPage,
-    PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb, ProjectionError, Registry,
-    RegistryAction, RegistryChange, RegistryError, RegistryPath, ReviewError, RiskAssignment,
-    RiskDomainSnapshot, SafeCopyError, ScanConfig, ScanError, ScanMode, ScanStatus, SiteSnapshot,
-    StageAuditOptions, StageError, StatusError, StorageDiscoveryError, V2FsckError, V2FsckOptions,
-    V2OriginStore, V2ProjectionDb, V2ProjectionError, V2Registry, V2StoreError,
+    FileFilter, FileLocationGroup, FilePage, FilePageRequest, LocationScanner, LocationSnapshot,
+    LocationStatus, MetadataDestinationSnapshot, MetadataError, MetadataProtector,
+    MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter,
+    PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb,
+    ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError, RegistryPath,
+    ReviewError, RiskAssignment, RiskDomainSnapshot, SafeCopyError, ScanConfig, ScanError,
+    ScanMode, ScanStatus, SiteSnapshot, StageAuditOptions, StageError, StatusError,
+    StorageDiscoveryError, V2FsckError, V2FsckOptions, V2OriginStore, V2ProjectionDb,
+    V2ProjectionError, V2Registry, V2StoreError,
 };
 use base64::Engine as _;
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use fs2::available_space;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1350,6 +1351,23 @@ enum RegistryKind {
 
 #[derive(Debug, Args)]
 struct FileFindArgs {
+    /// Match any Location in this group (name or stable ID); repeat for alternatives.
+    #[arg(long = "in", action = clap::ArgAction::Append)]
+    locations: Vec<String>,
+    /// Start another Location group; all groups must match.
+    #[arg(long = "and", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true")]
+    and_groups: Vec<bool>,
+    /// Negate the next Location group (use immediately after --and, or first).
+    #[arg(long = "not", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true")]
+    not_groups: Vec<bool>,
+    /// Require checksum evidence this recent in the current group (e.g. 30d, 12h).
+    #[arg(long, action = clap::ArgAction::Append)]
+    verified_within: Vec<String>,
+    /// Emit all source-relative paths separated by NUL; requires one source Location.
+    #[arg(long, conflicts_with_all = ["continuation", "json"])]
+    print0: bool,
+    #[arg(skip)]
+    location_groups: Vec<FileLocationGroup>,
     #[arg(long)]
     collection: Option<String>,
     #[arg(long, conflicts_with = "prefix")]
@@ -1362,6 +1380,125 @@ struct FileFindArgs {
     limit: usize,
     #[arg(long = "continue")]
     continuation: Option<String>,
+}
+
+fn parse_file_location_groups(
+    matches: &clap::ArgMatches,
+) -> Result<Vec<FileLocationGroup>, String> {
+    let mut tokens = Vec::new();
+    for id in ["locations", "verified_within"] {
+        if let (Some(indices), Some(values)) =
+            (matches.indices_of(id), matches.get_many::<String>(id))
+        {
+            for (index, value) in indices.zip(values) {
+                tokens.push((index, id, Some(value.clone())));
+            }
+        }
+    }
+    for id in ["and_groups", "not_groups"] {
+        if let Some(indices) = matches.indices_of(id) {
+            for index in indices {
+                tokens.push((index, id, None));
+            }
+        }
+    }
+    tokens.sort_by_key(|token| token.0);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let empty = || FileLocationGroup {
+        location_ids: Vec::new(),
+        negated: false,
+        verified_within_ms: None,
+    };
+    let mut groups = Vec::new();
+    let mut group = empty();
+    for (_, kind, value) in tokens {
+        match kind {
+            "locations" => group.location_ids.push(value.unwrap()),
+            "and_groups" => {
+                if group.location_ids.is_empty() {
+                    return Err("--and requires a preceding --in group".into());
+                }
+                groups.push(group);
+                group = empty();
+            }
+            "not_groups" => {
+                if !group.location_ids.is_empty()
+                    || group.negated
+                    || group.verified_within_ms.is_some()
+                {
+                    return Err("--not must start a group; separate groups with --and".into());
+                }
+                group.negated = true;
+            }
+            "verified_within" => {
+                if group.location_ids.is_empty() || group.verified_within_ms.is_some() {
+                    return Err(
+                        "--verified-within must follow --in and may appear once per group".into(),
+                    );
+                }
+                group.verified_within_ms = Some(parse_file_evidence_age(&value.unwrap())?);
+            }
+            _ => unreachable!(),
+        }
+    }
+    if group.location_ids.is_empty() {
+        return Err("Location group requires --in".into());
+    }
+    groups.push(group);
+    Ok(groups)
+}
+
+fn parse_file_evidence_age(value: &str) -> Result<u64, String> {
+    let invalid = || {
+        "--verified-within expects a positive integer and unit s, m, h, d, or w (e.g. 30d)"
+            .to_owned()
+    };
+    let (number, unit) = value.split_at(
+        value
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(invalid)?,
+    );
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return Err(invalid()),
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .and_then(|n| n.checked_mul(multiplier))
+        .filter(|n| *n <= i64::MAX as u64)
+        .ok_or_else(invalid)
+}
+
+fn resolve_file_location_groups(
+    args: &FileFindArgs,
+    locations: &[LocationSnapshot],
+) -> Result<Vec<FileLocationGroup>, AppError> {
+    args.location_groups
+        .iter()
+        .map(|group| {
+            let mut resolved = group.clone();
+            resolved.location_ids = group
+                .location_ids
+                .iter()
+                .map(|selector| {
+                    select_location(locations, selector)?
+                        .map(|location| location.location_id)
+                        .ok_or_else(|| AppError::Input(format!("Location not found: {selector:?}")))
+                })
+                .collect::<Result<_, _>>()?;
+            resolved.location_ids.sort();
+            resolved.location_ids.dedup();
+            Ok(resolved)
+        })
+        .collect()
 }
 
 #[derive(Debug, Subcommand)]
@@ -1995,7 +2132,24 @@ fn main() -> ExitCode {
         }
     };
     let json_requested = argument_json_requested || environment_json_requested;
-    let mut cli = match Cli::try_parse() {
+    let parsed = Cli::command().try_get_matches().and_then(|matches| {
+        let mut cli = Cli::from_arg_matches(&matches)?;
+        if let Command::File {
+            command: FileCommand::Find(args),
+        } = &mut cli.command
+        {
+            let find = matches
+                .subcommand_matches("file")
+                .unwrap()
+                .subcommand_matches("find")
+                .unwrap();
+            args.location_groups = parse_file_location_groups(find).map_err(|message| {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, message)
+            })?;
+        }
+        Ok(cli)
+    });
+    let mut cli = match parsed {
         Ok(cli) => cli,
         Err(error) => {
             if error.exit_code() == 0 {
@@ -17729,6 +17883,111 @@ fn parse_snapshot<T: serde::de::DeserializeOwned>(snapshot: &str) -> Result<T, A
         .map_err(|error| AppError::Input(format!("invalid registry snapshot JSON: {error}")))
 }
 
+fn print_found_files(
+    args: &FileFindArgs,
+    as_json: bool,
+    mut request: FilePageRequest,
+    find: impl Fn(FilePageRequest) -> Result<FilePage, ReviewError>,
+) -> Result<(), AppError> {
+    if args.print0 {
+        if as_json {
+            return Err(AppError::Input(
+                "--print0 cannot be combined with JSON output".into(),
+            ));
+        }
+        let source = request
+            .filter
+            .location_groups
+            .iter()
+            .find(|group| !group.negated);
+        if !source.is_some_and(|group| group.location_ids.len() == 1) {
+            return Err(AppError::Input("--print0 requires exactly one Location in the first positive --in group; use --json for multiple sources".into()));
+        }
+        eprintln!("Catalog evidence only; unresolved content identities are excluded. Archive content is not read or changed.");
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        loop {
+            let page = find(request.clone())?;
+            for file in page.items {
+                for source in file.matching_sources {
+                    let path = source.relative_path;
+                    let bytes =
+                        match path.encoding.as_str() {
+                            "utf8" => path
+                                .text
+                                .ok_or_else(|| {
+                                    AppError::Input("UTF-8 source path lacks text".into())
+                                })?
+                                .into_bytes(),
+                            "unix_bytes" => base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .decode(path.base64.ok_or_else(|| {
+                                    AppError::Input("source path lacks bytes".into())
+                                })?)
+                                .map_err(|error| {
+                                    AppError::Input(format!("invalid source path: {error}"))
+                                })?,
+                            _ => return Err(AppError::Input(
+                                "--print0 cannot represent this source path encoding; use --json"
+                                    .into(),
+                            )),
+                        };
+                    if bytes.contains(&0) {
+                        return Err(AppError::Input("source path contains NUL".into()));
+                    }
+                    output.write_all(&bytes)?;
+                    output.write_all(&[0])?;
+                }
+            }
+            match page.next {
+                Some(next) => request.continuation = Some(next),
+                None => break,
+            }
+        }
+        output.flush()?;
+        return Ok(());
+    }
+    let grouped = !request.filter.location_groups.is_empty();
+    let page = find(request)?;
+    if as_json {
+        let mut value = serde_json::to_value(&page)?;
+        if grouped {
+            value["selection_evidence"] = json!({"basis": "catalog", "unresolved_identities": "excluded", "fresh_verification": false});
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if page.items.is_empty() {
+        println!("No Files matched.");
+    } else {
+        for file in &page.items {
+            println!(
+                "{}  [{}]  {} present / {} known copies  {}",
+                file.logical_path.display,
+                file.collection_name,
+                file.present_copy_count,
+                file.current_copy_count,
+                file.identity_state
+            );
+            println!(
+                "  file: {}  object: {}",
+                file.file_ref_id,
+                file.object_id.as_deref().unwrap_or("unresolved")
+            );
+            for source in &file.matching_sources {
+                println!(
+                    "  source: {} — {}",
+                    source.location_name, source.relative_path.display
+                );
+            }
+        }
+        if let Some(next) = page.next {
+            println!("More results: rerun with --continue {next}");
+        }
+    }
+    if grouped && !as_json {
+        eprintln!("Catalog evidence only; unresolved content identities are excluded. Archive content is not read or changed.");
+    }
+    Ok(())
+}
+
 fn execute_file(
     database: &ProjectionDb,
     command: &FileCommand,
@@ -17736,39 +17995,33 @@ fn execute_file(
 ) -> Result<u8, AppError> {
     match command {
         FileCommand::Find(args) => {
-            let page = database.find_files(FilePageRequest {
+            let state = database.registry_state(false)?;
+            let collection_id = args
+                .collection
+                .as_deref()
+                .map(|selector| {
+                    select_collection(&state.collections, selector)?.ok_or_else(|| {
+                        AppError::Input(format!("Collection not found: {selector:?}"))
+                    })
+                })
+                .transpose()?
+                .map(|collection| collection.collection_id);
+            let groups = resolve_file_location_groups(args, &state.locations)?;
+            let request = FilePageRequest {
                 filter: FileFilter {
-                    collection_id: args.collection.clone(),
+                    collection_id,
                     exact_path: args.exact.clone().map(utf8_path),
                     path_prefix: args.prefix.clone().map(utf8_path),
                     identity_state: args.identity_state.clone(),
+                    location_groups: groups,
                     ..FileFilter::default()
                 },
                 limit: args.limit,
                 continuation: args.continuation.clone(),
+            };
+            print_found_files(args, as_json, request, |request| {
+                database.find_files(request)
             })?;
-            if as_json {
-                println!("{}", serde_json::to_string_pretty(&page)?);
-            } else {
-                for file in &page.items {
-                    println!(
-                        "{}  [{}]  {} present / {} known copies  {}",
-                        file.logical_path.display,
-                        file.collection_name,
-                        file.present_copy_count,
-                        file.current_copy_count,
-                        file.identity_state
-                    );
-                    println!(
-                        "  file: {}  object: {}",
-                        file.file_ref_id,
-                        file.object_id.as_deref().unwrap_or("unresolved")
-                    );
-                }
-                if let Some(next) = page.next {
-                    println!("More results: rerun with --continue {next}");
-                }
-            }
         }
         FileCommand::Show { file_ref_id } => {
             let review = database.review_file(file_ref_id)?;
@@ -18009,52 +18262,33 @@ fn execute_v2_file(
 ) -> Result<u8, AppError> {
     match command {
         FileCommand::Find(args) => {
+            let state = database.registry_state(false)?;
             let collection_id = args
                 .collection
                 .as_deref()
                 .map(|selector| {
-                    let state = database.registry_state(false)?;
                     select_collection(&state.collections, selector)?.ok_or_else(|| {
                         AppError::Input(format!("Collection not found: {selector:?}"))
                     })
                 })
                 .transpose()?
                 .map(|collection| collection.collection_id);
-            let page = database.find_files(FilePageRequest {
+            let groups = resolve_file_location_groups(args, &state.locations)?;
+            let request = FilePageRequest {
                 filter: FileFilter {
                     collection_id,
                     exact_path: args.exact.clone().map(utf8_path),
                     path_prefix: args.prefix.clone().map(utf8_path),
                     identity_state: args.identity_state.clone(),
+                    location_groups: groups,
                     ..FileFilter::default()
                 },
                 limit: args.limit,
                 continuation: args.continuation.clone(),
+            };
+            print_found_files(args, as_json, request, |request| {
+                database.find_files(request)
             })?;
-            if as_json {
-                println!("{}", serde_json::to_string_pretty(&page)?);
-            } else if page.items.is_empty() {
-                println!("No Files matched.");
-            } else {
-                for file in &page.items {
-                    println!(
-                        "{}  [{}]  {} present / {} known copies  {}",
-                        file.logical_path.display,
-                        file.collection_name,
-                        file.present_copy_count,
-                        file.current_copy_count,
-                        file.identity_state
-                    );
-                    println!(
-                        "  file: {}  object: {}",
-                        file.file_ref_id,
-                        file.object_id.as_deref().unwrap_or("unresolved")
-                    );
-                }
-                if let Some(next) = page.next {
-                    println!("More results: rerun with --continue {next}");
-                }
-            }
         }
         FileCommand::Show { file_ref_id } => {
             let review = database.review_file(file_ref_id)?;

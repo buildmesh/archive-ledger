@@ -218,7 +218,9 @@ through Compose; plain `docker run` does not inherit them.
 
 The container runs as `ARCHIVE_LEDGER_UID:ARCHIVE_LEDGER_GID`; the state directory must be writable
 and Location files readable by that identity. `findmnt` runs inside the container, and Docker may
-not expose the underlying filesystem UUID for every bind mount. Always inspect a representative
+not expose the underlying filesystem UUID for every bind mount. Version 0.1.9 uses `findmnt --uniq`
+to select the visible filesystem when a disk is mounted over a systemd automount at the same
+path; covered `autofs` entries do not make the mounted disk ambiguous. Always inspect a representative
 root with `location discover`. If stable identity is unavailable, `--allow-unidentified-root` is an
 explicit weaker fallback whose safety depends on keeping both the container mount path and
 `ARCHIVE_LEDGER_HOST_ID` stable. Mounting a host root at the same absolute container path is also
@@ -701,6 +703,64 @@ and supports `--exact` and `--prefix` logical-path filters. `file show` reports 
 Copy count and returns at most 1,000 detailed Copy rows; JSON sets `copies_truncated` when more
 rows exist. `object show` similarly returns a bounded, continuable page of the logical Files that
 refer to one content Object, so heavily deduplicated content cannot produce an unbounded response.
+
+### Find content across primary and backup Locations
+
+`file find` can combine Location groups. Repeated `--in` arguments within a group
+mean **any** of those Locations; `--and` separates groups that must all match.
+`--not` at the start of a group means **none** of its Locations may match.
+Location selectors accept names or stable IDs. The first positive group selects
+the source paths to list; later groups test whether matching content exists at
+other Locations. Comparison uses resolved content identity, so a backup can have
+a different filename. Unresolved identities are
+excluded from these comparisons; absence means no matching present copy in the
+catalog, not proof that a drive does not contain the bytes.
+
+List disk10 content absent from the entire backup set:
+
+```bash
+archive file find --collection "Files" \
+  --in "Files on disk10" \
+  --and --not \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03"
+```
+
+List USB content with a backup that passed checksum verification within 30 days:
+
+```bash
+archive file find --collection "Files" \
+  --in "Files on usb" \
+  --and \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03" \
+  --verified-within 30d
+```
+
+`--verified-within` applies only to the group it follows. At least one current
+present copy in that group must have successful checksum verification within the
+specified age. Durations use a positive integer followed by `s`, `m`, `h`, `d`,
+or `w`; `30d` means 30 days. A later missing, corrupt, or failed-verification state does not
+qualify. A presence-only scan does not refresh checksum verification. These
+queries read catalog evidence only: they do not hash files, copy, delete, or
+require writable drive mounts. Recent verification is evidence for your chosen
+backup tradeoff, not an unconditional guarantee that deletion is safe.
+
+List primary-drive content absent from both the backup set and USB:
+
+```bash
+archive file find --collection "Files" \
+  --in "Files on disk7" --in "Files on disk9" --in "Files on disk10" \
+  --and --not \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03" \
+  --and --not --in "Files on usb"
+```
+
+Use `--json` for source-qualified paths when several primary Locations match.
+Normal human and JSON listings retain pagination. For a single source Location
+in the first positive group, `--print0` streams all matching source-relative
+paths separated by NUL bytes, without pagination messages on stdout. Check its
+exit status before using the output; a failed stream can be partial. Paths refer
+to cataloged entries, including annex symlinks, and are not a copy or deletion
+plan.
 
 `file history` and `object history` are explicit audit operations. They authenticate and stream
 canonical event records in bounded memory because full event payloads are deliberately not

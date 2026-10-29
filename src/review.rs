@@ -104,8 +104,24 @@ impl LosslessPath {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileLocationGroup {
+    pub location_ids: Vec<String>,
+    pub negated: bool,
+    pub verified_within_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileMatchingSource {
+    pub location_id: String,
+    pub location_name: String,
+    pub relative_path: LosslessPath,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FileFilter {
+    pub location_groups: Vec<FileLocationGroup>,
+    pub as_of_utc_ms: Option<u64>,
     pub collection_id: Option<String>,
     pub exact_path: Option<EncodedPath>,
     pub path_prefix: Option<EncodedPath>,
@@ -123,6 +139,8 @@ pub struct FilePageRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matching_sources: Vec<FileMatchingSource>,
     pub file_ref_id: String,
     pub collection_id: String,
     pub collection_name: String,
@@ -275,6 +293,8 @@ pub struct ObjectReview {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileToken {
+    #[serde(default)]
+    as_of_utc_ms: Option<u64>,
     version: u32,
     applied_event_seq: u64,
     query_hash: String,
@@ -314,16 +334,18 @@ struct V2BatchHistoryContext {
 }
 
 impl ProjectionDb {
-    pub fn find_files(&self, request: FilePageRequest) -> Result<FilePage> {
+    pub fn find_files(&self, mut request: FilePageRequest) -> Result<FilePage> {
         validate_limit(request.limit)?;
         validate_filter(&request.filter)?;
         let applied_event_seq = self.status()?.cursor.applied_seq;
-        let query_hash = file_query_hash(&request.filter);
         let cursor = request
             .continuation
             .as_deref()
             .map(decode_file_token)
             .transpose()?;
+        freeze_file_query_time(&mut request.filter, cursor.as_ref())?;
+        validate_filter(&request.filter)?;
+        let query_hash = file_query_hash(&request.filter);
         if cursor.as_ref().is_some_and(|cursor| {
             cursor.applied_event_seq != applied_event_seq || cursor.query_hash != query_hash
         }) {
@@ -386,6 +408,36 @@ impl ProjectionDb {
                    AND (?7 IS NULL OR f.identity_state = ?7)
                    AND (?8 IS NULL OR f.object_id = ?8)
                    AND (?9 IS NULL OR f.external_identity_id = ?9)
+                   AND (json_array_length(?15) = 0 OR (
+                     f.object_id IS NOT NULL AND f.identity_state = 'resolved'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?15) g
+                       WHERE EXISTS (
+                         SELECT 1 FROM copy_claims cc
+                         WHERE cc.object_id = f.object_id AND cc.state = 'present'
+                           AND cc.location_id IN (SELECT value FROM json_each(g.value, '$.location_ids'))
+                           AND (json_extract(g.value, '$.verified_within_ms') IS NULL OR (
+                             cc.last_verification_result = 'ok'
+                             AND cc.last_verified_time_utc_ms BETWEEN
+                               MAX(0, ?16 - json_extract(g.value, '$.verified_within_ms')) AND ?16
+                           ))
+                       ) = json_extract(g.value, '$.negated')
+                     )
+                     AND (?17 IS NULL OR EXISTS (
+                       SELECT 1 FROM path_observations po
+                       JOIN copy_claims src ON src.location_id = po.location_id
+                         AND src.object_id = po.object_id AND src.state = 'present'
+                         AND ((src.relative_path_encoding = po.observed_path_encoding
+                           AND src.relative_path_bytes = po.observed_path_bytes)
+                           OR (po.representation = 'annex_locked_symlink'
+                             AND src.external_identity_id = po.external_identity_id))
+                       WHERE po.file_ref_id = f.file_ref_id AND po.object_id = f.object_id
+                         AND po.state = 'present'
+                         AND po.location_id IN (SELECT value FROM json_each(?17))
+                         AND (?18 IS NULL OR (src.last_verification_result = 'ok'
+                           AND src.last_verified_time_utc_ms BETWEEN MAX(0, ?16 - ?18) AND ?16))
+                     ))
+                   ))
                    AND (?10 IS NULL OR (f.collection_id, f.logical_path_encoding,
                         f.logical_path_bytes, f.file_ref_id) > (?10, ?11, ?12, ?13))
                  ORDER BY f.collection_id, f.logical_path_encoding,
@@ -393,6 +445,14 @@ impl ProjectionDb {
                  LIMIT ?14",
             )
             .map_err(|source| sqlite_error(self.path(), source))?;
+        let groups_json = serde_json::to_string(&request.filter.location_groups).unwrap();
+        let source_group = request
+            .filter
+            .location_groups
+            .iter()
+            .find(|group| !group.negated);
+        let source_json =
+            source_group.map(|group| serde_json::to_string(&group.location_ids).unwrap());
         let exact = request.filter.exact_path.as_ref();
         let prefix = request.filter.path_prefix.as_ref();
         let rows = statement
@@ -412,6 +472,12 @@ impl ProjectionDb {
                     cursor_bytes,
                     cursor.as_ref().map(|cursor| cursor.file_ref_id.as_str()),
                     i64::try_from(request.limit + 1).unwrap_or(i64::MAX),
+                    groups_json,
+                    request.filter.as_of_utc_ms.map(|v| v as i64),
+                    source_json,
+                    source_group
+                        .and_then(|g| g.verified_within_ms)
+                        .map(|v| v as i64),
                 ],
                 file_summary_from_row,
             )
@@ -424,11 +490,19 @@ impl ProjectionDb {
         let next = if has_more {
             items
                 .last()
-                .map(|item| encode_file_token(item, applied_event_seq, &query_hash))
+                .map(|item| {
+                    encode_file_token(
+                        item,
+                        applied_event_seq,
+                        &query_hash,
+                        request.filter.as_of_utc_ms,
+                    )
+                })
                 .transpose()?
         } else {
             None
         };
+        populate_matching_sources(&connection, self.path(), &request.filter, &mut items, false)?;
         Ok(FilePage {
             version: OUTPUT_VERSION,
             applied_event_seq,
@@ -853,17 +927,19 @@ impl ProjectionDb {
 }
 
 impl V2ProjectionDb {
-    pub fn find_files(&self, request: FilePageRequest) -> Result<FilePage> {
+    pub fn find_files(&self, mut request: FilePageRequest) -> Result<FilePage> {
         validate_limit(request.limit)?;
         validate_filter(&request.filter)?;
         let status = self.status()?;
         let applied_event_seq = status.records;
-        let query_hash = file_query_hash_at(&request.filter, &status.applied_frontier_hash);
         let cursor = request
             .continuation
             .as_deref()
             .map(decode_file_token)
             .transpose()?;
+        freeze_file_query_time(&mut request.filter, cursor.as_ref())?;
+        validate_filter(&request.filter)?;
+        let query_hash = file_query_hash_at(&request.filter, &status.applied_frontier_hash);
         if cursor.as_ref().is_some_and(|cursor| {
             cursor.applied_event_seq != applied_event_seq || cursor.query_hash != query_hash
         }) {
@@ -926,6 +1002,39 @@ impl V2ProjectionDb {
                    AND (?7 IS NULL OR f.identity_state = ?7)
                    AND (?8 IS NULL OR f.object_id = ?8)
                    AND (?9 IS NULL OR f.external_identity_id = ?9)
+                   AND (json_array_length(?15) = 0 OR (
+                     f.object_id IS NOT NULL AND f.identity_state = 'resolved'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?15) g
+                       WHERE EXISTS (
+                         SELECT 1 FROM copy_claims cc
+                         WHERE cc.object_id = f.object_id AND cc.state = 'present'
+                           AND cc.location_id IN (SELECT value FROM json_each(g.value, '$.location_ids'))
+                           AND (json_extract(g.value, '$.verified_within_ms') IS NULL OR (
+                             cc.last_verification_result = 'ok'
+                             AND cc.last_verified_time_utc_ms BETWEEN
+                               MAX(0, ?16 - json_extract(g.value, '$.verified_within_ms')) AND ?16
+                           ))
+                       ) = json_extract(g.value, '$.negated')
+                     )
+                     AND (?17 IS NULL OR EXISTS (
+                       SELECT 1 FROM path_observations po
+                       JOIN copy_claims src ON src.location_id = po.location_id
+                         AND src.object_id = po.object_id AND src.state = 'present'
+                         AND EXISTS (SELECT 1 FROM file_locations binding
+                           JOIN file_objects source_file ON source_file.id = binding.file_id
+                           JOIN locations source_location ON source_location.id = binding.location_id
+                           JOIN copy_bindings physical ON physical.id = binding.copy_id
+                           WHERE source_file.canonical_id = po.file_ref_id
+                             AND source_location.location_id = po.location_id
+                             AND physical.canonical_id = src.copy_claim_id)
+                       WHERE po.file_ref_id = f.file_ref_id AND po.object_id = f.object_id
+                         AND po.state = 'present'
+                         AND po.location_id IN (SELECT value FROM json_each(?17))
+                         AND (?18 IS NULL OR (src.last_verification_result = 'ok'
+                           AND src.last_verified_time_utc_ms BETWEEN MAX(0, ?16 - ?18) AND ?16))
+                     ))
+                   ))
                    AND (?10 IS NULL OR (f.collection_id, f.logical_path_encoding,
                         f.logical_path_bytes, f.file_ref_id) > (?10, ?11, ?12, ?13))
                  ORDER BY f.collection_id, f.logical_path_encoding,
@@ -933,6 +1042,14 @@ impl V2ProjectionDb {
                  LIMIT ?14",
             )
             .map_err(|source| sqlite_error(self.path(), source))?;
+        let groups_json = serde_json::to_string(&request.filter.location_groups).unwrap();
+        let source_group = request
+            .filter
+            .location_groups
+            .iter()
+            .find(|group| !group.negated);
+        let source_json =
+            source_group.map(|group| serde_json::to_string(&group.location_ids).unwrap());
         let exact = request.filter.exact_path.as_ref();
         let prefix = request.filter.path_prefix.as_ref();
         let rows = statement
@@ -952,6 +1069,12 @@ impl V2ProjectionDb {
                     cursor_bytes,
                     cursor.as_ref().map(|cursor| cursor.file_ref_id.as_str()),
                     i64::try_from(request.limit + 1).unwrap_or(i64::MAX),
+                    groups_json,
+                    request.filter.as_of_utc_ms.map(|v| v as i64),
+                    source_json,
+                    source_group
+                        .and_then(|g| g.verified_within_ms)
+                        .map(|v| v as i64),
                 ],
                 file_summary_from_row,
             )
@@ -964,11 +1087,19 @@ impl V2ProjectionDb {
         let next = if has_more {
             items
                 .last()
-                .map(|item| encode_file_token(item, applied_event_seq, &query_hash))
+                .map(|item| {
+                    encode_file_token(
+                        item,
+                        applied_event_seq,
+                        &query_hash,
+                        request.filter.as_of_utc_ms,
+                    )
+                })
                 .transpose()?
         } else {
             None
         };
+        populate_matching_sources(&connection, self.path(), &request.filter, &mut items, true)?;
         Ok(FilePage {
             version: 2,
             applied_event_seq,
@@ -1517,6 +1648,7 @@ fn history_query(
 
 fn file_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileSummary> {
     Ok(FileSummary {
+        matching_sources: Vec::new(),
         file_ref_id: row.get(0)?,
         collection_id: row.get(1)?,
         collection_name: row.get(2)?,
@@ -1567,7 +1699,128 @@ fn validate_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
+fn freeze_file_query_time(filter: &mut FileFilter, cursor: Option<&FileToken>) -> Result<()> {
+    if let Some(cursor) = cursor {
+        if filter.as_of_utc_ms.is_some() && filter.as_of_utc_ms != cursor.as_of_utc_ms {
+            return Err(ReviewError::StaleContinuation);
+        }
+        filter.as_of_utc_ms = cursor.as_of_utc_ms;
+    } else if filter
+        .location_groups
+        .iter()
+        .any(|group| group.verified_within_ms.is_some())
+        && filter.as_of_utc_ms.is_none()
+    {
+        filter.as_of_utc_ms = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| ReviewError::InvalidFilter("system clock precedes Unix epoch".into()))?
+                .as_millis()
+                .try_into()
+                .map_err(|_| ReviewError::InvalidFilter("system clock out of range".into()))?,
+        );
+    }
+    Ok(())
+}
+
+fn populate_matching_sources(
+    connection: &Connection,
+    path: &Path,
+    filter: &FileFilter,
+    items: &mut [FileSummary],
+    v2: bool,
+) -> Result<()> {
+    let Some(group) = filter.location_groups.iter().find(|group| !group.negated) else {
+        return Ok(());
+    };
+    let locations = serde_json::to_string(&group.location_ids).unwrap();
+    let binding_clause = if v2 {
+        "AND EXISTS (SELECT 1 FROM file_locations binding
+          JOIN file_objects source_file ON source_file.id = binding.file_id
+          JOIN locations source_location ON source_location.id = binding.location_id
+          JOIN copy_bindings physical ON physical.id = binding.copy_id
+          WHERE source_file.canonical_id = po.file_ref_id
+            AND source_location.location_id = po.location_id
+            AND physical.canonical_id = cc.copy_claim_id)"
+    } else {
+        "AND ((cc.relative_path_encoding = po.observed_path_encoding
+          AND cc.relative_path_bytes = po.observed_path_bytes)
+          OR (po.representation = 'annex_locked_symlink'
+            AND cc.external_identity_id = po.external_identity_id))"
+    };
+    // Compact path observations expose the collection path. Ordinary files can
+    // live at a different Copy locator; locked annex paths remain worktree paths.
+    let source_path_columns = if v2 {
+        "CASE WHEN po.representation = 'annex_locked_symlink' THEN po.observed_path_encoding ELSE cc.relative_path_encoding END,
+         CASE WHEN po.representation = 'annex_locked_symlink' THEN po.observed_path_bytes ELSE cc.relative_path_bytes END,
+         CASE WHEN po.representation = 'annex_locked_symlink' THEN po.observed_path_display ELSE cc.relative_path_display END"
+    } else {
+        "po.observed_path_encoding, po.observed_path_bytes, po.observed_path_display"
+    };
+    let query = format!(
+        "SELECT DISTINCT po.location_id, l.display_name, {source_path_columns}
+         FROM path_observations po JOIN locations l ON l.location_id = po.location_id
+         JOIN copy_claims cc ON cc.location_id = po.location_id
+           AND cc.object_id = po.object_id AND cc.state = 'present'
+         WHERE po.file_ref_id = ?1 AND po.object_id = ?2 AND po.state = 'present'
+           AND po.location_id IN (SELECT value FROM json_each(?3))
+           {binding_clause}
+           AND (?4 IS NULL OR (cc.last_verification_result = 'ok'
+             AND cc.last_verified_time_utc_ms BETWEEN MAX(0, ?5 - ?4) AND ?5))
+         ORDER BY 1, 3, 4
+         LIMIT 1001",
+    );
+    let mut statement = connection
+        .prepare(&query)
+        .map_err(|source| sqlite_error(path, source))?;
+    for item in items {
+        item.matching_sources = statement
+            .query_map(
+                params![
+                    item.file_ref_id,
+                    item.object_id,
+                    locations,
+                    group.verified_within_ms.map(|v| v as i64),
+                    filter.as_of_utc_ms.map(|v| v as i64)
+                ],
+                |row| {
+                    Ok(FileMatchingSource {
+                        location_id: row.get(0)?,
+                        location_name: row.get(1)?,
+                        relative_path: LosslessPath::from_parts(
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ),
+                    })
+                },
+            )
+            .map_err(|source| sqlite_error(path, source))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|source| sqlite_error(path, source))?;
+        if item.matching_sources.len() > 1000 {
+            return Err(ReviewError::InvalidFilter(
+                "more than 1000 source paths for a file; narrow the source location group".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_filter(filter: &FileFilter) -> Result<()> {
+    if filter.location_groups.iter().any(|group| {
+        group.location_ids.is_empty()
+            || group
+                .verified_within_ms
+                .is_some_and(|age| age > i64::MAX as u64)
+    }) || filter
+        .as_of_utc_ms
+        .is_some_and(|time| time > i64::MAX as u64)
+    {
+        return Err(ReviewError::InvalidFilter(
+            "empty location group or out-of-range time".into(),
+        ));
+    }
     if filter.exact_path.is_some() && filter.path_prefix.is_some() {
         return Err(ReviewError::InvalidContinuation);
     }
@@ -1596,6 +1849,8 @@ fn file_query_hash_at(filter: &FileFilter, projection_snapshot: &str) -> String 
             "object_id": filter.object_id,
             "external_identity_id": filter.external_identity_id,
             "projection_snapshot": projection_snapshot,
+            "location_groups": filter.location_groups,
+            "as_of_utc_ms": filter.as_of_utc_ms,
         }))
         .expect("file query shape is serializable")
         .as_bytes(),
@@ -1604,7 +1859,12 @@ fn file_query_hash_at(filter: &FileFilter, projection_snapshot: &str) -> String 
     .to_string()
 }
 
-fn encode_file_token(item: &FileSummary, applied_seq: u64, query_hash: &str) -> Result<String> {
+fn encode_file_token(
+    item: &FileSummary,
+    applied_seq: u64,
+    query_hash: &str,
+    as_of_utc_ms: Option<u64>,
+) -> Result<String> {
     let bytes = item
         .logical_path
         .text
@@ -1618,6 +1878,7 @@ fn encode_file_token(item: &FileSummary, applied_seq: u64, query_hash: &str) -> 
         })
         .ok_or(ReviewError::InvalidContinuation)?;
     let token = FileToken {
+        as_of_utc_ms,
         version: TOKEN_VERSION,
         applied_event_seq: applied_seq,
         query_hash: query_hash.to_owned(),
@@ -1902,6 +2163,213 @@ mod tests {
             V2ProjectionDb::open_existing(database_path).unwrap(),
             object_id,
         )
+    }
+
+    #[test]
+    fn location_groups_use_content_union_negation_and_recent_success() {
+        let temp = TempDir::new().unwrap();
+        let database = seeded_database(&temp);
+        let connection = Connection::open(database.path()).unwrap();
+        connection.execute_batch("INSERT INTO locations SELECT 'backup', 'Backup', kind, archive_root_id,
+            relative_path_bytes, relative_path_encoding, relative_path_display, device_id, site_id,
+            encryption_state, trust_level, expected_availability, is_writable, status, created_event_id,
+            last_event_id FROM locations WHERE location_id='location_1';
+            INSERT INTO path_observations(file_ref_id,location_id,observed_path_bytes,observed_path_encoding,
+              observed_path_display,representation,object_id,state,first_seen_event_id,last_seen_time_utc_ms)
+            VALUES ('file_a','location_1',X'612e6a7067','utf8','a.jpg','regular','object_1','present','event_1',250),
+              ('file_non_utf8','location_1',X'ff61','unix_bytes','escaped','regular','object_1','present','event_1',250),
+              ('file_b','backup',X'72656e616d6564','utf8','renamed','regular','object_1','present','event_1',250);
+            INSERT INTO copy_claims(copy_claim_id,location_id,relative_path_bytes,relative_path_encoding,
+              relative_path_display,object_id,claim_basis,state,state_event_seq,first_seen_event_id,
+              last_verified_time_utc_ms,last_verification_result)
+            VALUES ('backup_copy','backup',X'72656e616d6564','utf8','renamed','object_1','observed_bytes',
+              'present',2,'event_1',240,'ok'),
+              ('non_utf8_copy','location_1',X'ff61','unix_bytes','escaped','object_1','observed_bytes',
+              'present',2,'event_1',240,'ok');").unwrap();
+        let group = |ids: &[&str], negated, age| FileLocationGroup {
+            location_ids: ids.iter().map(|id| (*id).into()).collect(),
+            negated,
+            verified_within_ms: age,
+        };
+        let filter = FileFilter {
+            location_groups: vec![
+                group(&["location_1"], false, None),
+                group(&["nonexistent", "backup"], false, Some(60)),
+            ],
+            as_of_utc_ms: Some(300),
+            ..Default::default()
+        };
+        let query = |filter: FileFilter, continuation| {
+            database.find_files(FilePageRequest {
+                filter,
+                limit: 1,
+                continuation,
+            })
+        };
+        let first = query(filter.clone(), None).unwrap();
+        assert_eq!(first.items[0].file_ref_id, "file_non_utf8");
+        assert_eq!(
+            first.items[0].matching_sources[0]
+                .relative_path
+                .base64
+                .as_deref(),
+            Some("_2E")
+        );
+        let mut resumed = filter.clone();
+        resumed.as_of_utc_ms = None;
+        let second = query(resumed, first.next.clone()).unwrap();
+        assert_eq!(second.items[0].file_ref_id, "file_a");
+        assert_eq!(
+            second.items[0].matching_sources[0]
+                .relative_path
+                .text
+                .as_deref(),
+            Some("a.jpg")
+        );
+        assert!(second.next.is_none());
+        let mut changed = filter.clone();
+        changed.as_of_utc_ms = Some(301);
+        assert!(matches!(
+            query(changed, first.next),
+            Err(ReviewError::StaleContinuation)
+        ));
+        let mut stale = filter.clone();
+        stale.location_groups[1].verified_within_ms = Some(59);
+        assert!(query(stale, None).unwrap().items.is_empty());
+        let mut future = filter.clone();
+        future.as_of_utc_ms = Some(239);
+        assert!(query(future, None).unwrap().items.is_empty());
+        let mut absent = filter.clone();
+        absent.location_groups[1].negated = true;
+        assert!(query(absent.clone(), None).unwrap().items.is_empty());
+        connection
+            .execute(
+                "UPDATE copy_claims SET state='missing' WHERE copy_claim_id='backup_copy'",
+                [],
+            )
+            .unwrap();
+        assert!(!query(absent, None).unwrap().items.is_empty());
+        assert!(query(filter.clone(), None).unwrap().items.is_empty());
+        connection.execute("UPDATE copy_claims SET state='present',last_verification_result='hash_mismatch' WHERE copy_claim_id='backup_copy'", []).unwrap();
+        assert!(query(filter, None).unwrap().items.is_empty());
+        let unresolved = FileFilter {
+            location_groups: vec![group(&["nonexistent"], true, None)],
+            ..Default::default()
+        };
+        let all = database
+            .find_files(FilePageRequest {
+                filter: unresolved,
+                limit: 100,
+                continuation: None,
+            })
+            .unwrap();
+        assert!(all.items.iter().all(|file| file.object_id.is_some()));
+    }
+
+    #[test]
+    fn v2_location_query_uses_observed_source_paths_and_copy_checks() {
+        let temp = TempDir::new().unwrap();
+        let (_, database, _) = seeded_v2_database(&temp);
+        let connection = Connection::open(database.path()).unwrap();
+        connection.execute_batch("INSERT INTO sites(site_id,display_name,site_kind,status,last_record_id)
+            VALUES ('site_test','Test','home','active','seed');
+            INSERT INTO locations(location_id,display_name,kind,site_id,expected_availability,status,created_record_id,last_record_id)
+            VALUES ('usb','USB','service','site_test','offline','active','seed','seed');
+            INSERT INTO file_locations(file_id,location_id,representation,content_id,presence,first_record,last_record,seen_time)
+            SELECT f.id,l.id,'regular',f.content_id,1,f.first_record,f.last_record,300
+            FROM file_objects f,locations l WHERE f.canonical_id='file_a' AND l.location_id='usb';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record)
+            SELECT 'copy_usb',p.id,p.location_id,zeroblob(32),p.content_id,'observed_bytes','present',p.first_record,p.last_record
+            FROM file_locations p;
+            UPDATE file_locations SET copy_id=(SELECT id FROM copy_bindings);
+            INSERT INTO checks(file_location_id,checked_at,presence,integrity)
+            SELECT id,240,1,1 FROM file_locations;
+            UPDATE copy_bindings SET latest_integrity=(SELECT id FROM checks),latest_presence=(SELECT id FROM checks);").unwrap();
+        connection.execute_batch("UPDATE file_locations SET representation='ordinary_file';
+            UPDATE copy_bindings SET locator_encoding='utf8',locator_bytes=CAST('nested/a.jpg' AS BLOB),locator_display=NULL;").unwrap();
+        let filter = FileFilter {
+            location_groups: vec![FileLocationGroup {
+                location_ids: vec!["usb".into()],
+                negated: false,
+                verified_within_ms: Some(60),
+            }],
+            as_of_utc_ms: Some(300),
+            ..Default::default()
+        };
+        let found = database
+            .find_files(FilePageRequest {
+                filter: filter.clone(),
+                limit: 100,
+                continuation: None,
+            })
+            .unwrap();
+        assert_eq!(found.items.len(), 1);
+        assert_eq!(found.items[0].file_ref_id, "file_a");
+        assert_eq!(
+            found.items[0].matching_sources[0]
+                .relative_path
+                .text
+                .as_deref(),
+            Some("nested/a.jpg")
+        );
+        assert_eq!(found.items[0].logical_path.text.as_deref(), Some("a.jpg"));
+        connection
+            .execute(
+                "UPDATE file_locations SET representation='annex_locked_symlink'",
+                [],
+            )
+            .unwrap();
+        let annex = database
+            .find_files(FilePageRequest {
+                filter: filter.clone(),
+                limit: 100,
+                continuation: None,
+            })
+            .unwrap();
+        assert_eq!(
+            annex.items[0].matching_sources[0]
+                .relative_path
+                .text
+                .as_deref(),
+            Some("a.jpg")
+        );
+        connection
+            .execute(
+                "UPDATE file_locations SET representation='ordinary_file'",
+                [],
+            )
+            .unwrap();
+        connection.execute_batch("INSERT INTO file_locations(file_id,location_id,representation,content_id,presence,first_record,last_record,seen_time)
+            SELECT f.id,l.id,'regular',f.content_id,1,f.first_record,f.last_record,300
+            FROM file_objects f,locations l WHERE f.canonical_id='file_b' AND l.location_id='usb';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record,latest_integrity)
+            SELECT 'copy_second',p.id,p.location_id,randomblob(32),p.content_id,'observed_bytes','present',p.first_record,p.last_record,
+              (SELECT MIN(id) FROM checks)
+            FROM file_locations p JOIN file_objects f ON f.id=p.file_id WHERE f.canonical_id='file_b';
+            UPDATE file_locations SET copy_id=(SELECT id FROM copy_bindings WHERE canonical_id='copy_second')
+              WHERE file_id=(SELECT id FROM file_objects WHERE canonical_id='file_b');
+            UPDATE copy_bindings SET state='corrupt' WHERE canonical_id='copy_usb';").unwrap();
+        let remaining = database
+            .find_files(FilePageRequest {
+                filter: filter.clone(),
+                limit: 100,
+                continuation: None,
+            })
+            .unwrap();
+        assert_eq!(remaining.items.len(), 1);
+        assert_eq!(remaining.items[0].file_ref_id, "file_b");
+        connection
+            .execute("UPDATE copy_bindings SET state='corrupt'", [])
+            .unwrap();
+        assert!(database
+            .find_files(FilePageRequest {
+                filter,
+                limit: 100,
+                continuation: None
+            })
+            .unwrap()
+            .items
+            .is_empty());
     }
 
     #[test]
