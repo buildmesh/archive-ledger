@@ -677,7 +677,7 @@ archive c ls
 archive l ls
 archive d ls
 archive s ls
-archive file find --collection "Documents" --limit 100
+archive file find --collection "Documents"
 archive file show <file-id>
 archive file history <file-id> --limit 100
 archive object show <object-id> --limit 100
@@ -696,10 +696,19 @@ rolls those figures up across its Locations and, when the Device is currently mo
 filesystem identity still matches, reports live free space. Site status rolls them up by Device.
 Unavailable or unconfirmed facts are shown explicitly rather than guessed.
 
-File and copy lists use stable continuations, so directories with thousands of entries and
-Collections with hundreds of thousands of Files remain reviewable without running the equivalent
-of `ls` or loading the full result in memory. `file find` accepts a Collection name or stable ID
-and supports `--exact` and `--prefix` logical-path filters. `file show` reports the exact total
+`file find` prints **all matching logical paths**, one per line, without manual
+pagination or per-file metadata. It streams bounded database batches rather than
+loading the whole result into memory. `--limit` controls the batch size, not the
+total number of text results. Use `--json` for a detailed, bounded page with File
+IDs, copy counts, source paths, and a `next` continuation token. Copy lists also
+use stable continuations.
+
+`file find` accepts a Collection name or stable ID and supports `--exact` and
+`--prefix` logical-path filters. For a single known path, use
+`archive file find --collection "Documents" --exact "path/to/file"`; the lookup
+uses the Collection/path index. Add `--json` to obtain its File ID for `file show`.
+Copy summaries are calculated only for the selected identities, not the entire catalog.
+`file show` reports the exact total
 Copy count and returns at most 1,000 detailed Copy rows; JSON sets `copies_truncated` when more
 rows exist. `object show` similarly returns a bounded, continuable page of the logical Files that
 refer to one content Object, so heavily deduplicated content cannot produce an unbounded response.
@@ -755,8 +764,8 @@ archive file find --collection "Files" \
 ```
 
 Use `--json` for source-qualified paths when several primary Locations match.
-Normal human and JSON listings retain pagination. For a single source Location
-in the first positive group, `--print0` streams all matching source-relative
+Normal text output lists all logical paths; JSON returns a bounded detailed page.
+For a single source Location in the first positive group, `--print0` streams all matching source-relative
 paths separated by NUL bytes, without pagination messages on stdout. Check its
 exit status before using the output; a failed stream can be partial. Paths refer
 to cataloged entries, including annex symlinks, and are not a copy or deletion

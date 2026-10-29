@@ -13,13 +13,13 @@ use archive_ledger::{
     ArchiveRootSnapshot, CachedPolicyStatus, CatalogError, CatalogRegistry, CollectionSnapshot,
     CopyFilter, CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot, DiscoveryItem,
     EventReferences, EventRequest, EventStore, EventStoreConfig, EventStoreError, FileDiscovery,
-    FileFilter, FileLocationGroup, FilePage, FilePageRequest, LocationScanner, LocationSnapshot,
-    LocationStatus, MetadataDestinationSnapshot, MetadataError, MetadataProtector,
-    MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter,
-    PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb,
-    ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError, RegistryPath,
-    ReviewError, RiskAssignment, RiskDomainSnapshot, SafeCopyError, ScanConfig, ScanError,
-    ScanMode, ScanStatus, SiteSnapshot, StageAuditOptions, StageError, StatusError,
+    FileFilter, FileLocationGroup, FilePage, FilePageRequest, FilePathPage, LocationScanner,
+    LocationSnapshot, LocationStatus, MetadataDestinationSnapshot, MetadataError,
+    MetadataProtector, MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding,
+    PolicyFindingFilter, PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig,
+    ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError,
+    RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, SafeCopyError, ScanConfig,
+    ScanError, ScanMode, ScanStatus, SiteSnapshot, StageAuditOptions, StageError, StatusError,
     StorageDiscoveryError, V2FsckError, V2FsckOptions, V2OriginStore, V2ProjectionDb,
     V2ProjectionError, V2Registry, V2StoreError,
 };
@@ -746,8 +746,8 @@ enum RestoreCommand {
 
 #[derive(Debug, Subcommand)]
 enum FileCommand {
-    /// Find active logical paths from SQLite without scanning storage.
-    Find(FileFindArgs),
+    /// List all matching logical paths from SQLite; --json returns a detailed page.
+    Find(Box<FileFindArgs>),
     /// Show one logical file and all current copy evidence.
     Show { file_ref_id: String },
     /// Stream authenticated canonical history for one logical File.
@@ -1376,8 +1376,10 @@ struct FileFindArgs {
     prefix: Option<String>,
     #[arg(long)]
     identity_state: Option<String>,
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
+    /// Batch size for all-results text/--print0 (default 1000); JSON page size (default 100).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Resume after this cursor; text output lists all remaining matches.
     #[arg(long = "continue")]
     continuation: Option<String>,
 }
@@ -5090,6 +5092,16 @@ fn push_v2_risk_finding(
     });
 }
 
+// Resolve the Location once, then visit only its present compact Copy bindings.
+// Joining compatibility views here materializes every Object before filtering.
+const V2_LOCATION_METRICS_SQL: &str = "SELECT COUNT(*), COALESCE(SUM(o.size_bytes), 0),
+    COALESCE(SUM(CASE WHEN p.checked_at IS NULL OR p.checked_at < ?2 THEN 1 ELSE 0 END), 0)
+ FROM locations l
+ JOIN copy_bindings b ON b.location_id = l.id
+ LEFT JOIN content_objects o ON o.id = b.content_id
+ LEFT JOIN checks p ON p.id = b.latest_presence
+ WHERE l.location_id = ?1 AND b.state = 'present'";
+
 fn v2_location_metrics(
     database: &V2ProjectionDb,
     state: &archive_ledger::RegistryState,
@@ -5110,11 +5122,7 @@ fn v2_location_metrics(
     );
     let (files, bytes, stale): (i64, i64, i64) = v2_cli_connection(database)?
         .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(o.size_bytes), 0),
-                    COALESCE(SUM(CASE WHEN c.last_seen_time_utc_ms IS NULL OR c.last_seen_time_utc_ms < ?2 THEN 1 ELSE 0 END), 0)
-             FROM copy_claims c
-             LEFT JOIN objects o ON o.object_id = c.object_id
-             WHERE c.location_id = ?1 AND c.state = 'present'",
+            V2_LOCATION_METRICS_SQL,
             params![location_id, cutoff],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -17888,6 +17896,7 @@ fn print_found_files(
     as_json: bool,
     mut request: FilePageRequest,
     find: impl Fn(FilePageRequest) -> Result<FilePage, ReviewError>,
+    find_paths: impl Fn(FilePageRequest) -> Result<FilePathPage, ReviewError>,
 ) -> Result<(), AppError> {
     if args.print0 {
         if as_json {
@@ -17903,7 +17912,7 @@ fn print_found_files(
         if !source.is_some_and(|group| group.location_ids.len() == 1) {
             return Err(AppError::Input("--print0 requires exactly one Location in the first positive --in group; use --json for multiple sources".into()));
         }
-        eprintln!("Catalog evidence only; unresolved content identities are excluded. Archive content is not read or changed.");
+        eprintln!("Unresolved identities are excluded.");
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
         loop {
@@ -17947,44 +17956,48 @@ fn print_found_files(
         return Ok(());
     }
     let grouped = !request.filter.location_groups.is_empty();
-    let page = find(request)?;
     if as_json {
+        let page = find(request)?;
         let mut value = serde_json::to_value(&page)?;
         if grouped {
             value["selection_evidence"] = json!({"basis": "catalog", "unresolved_identities": "excluded", "fresh_verification": false});
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if page.items.is_empty() {
-        println!("No Files matched.");
-    } else {
-        for file in &page.items {
-            println!(
-                "{}  [{}]  {} present / {} known copies  {}",
-                file.logical_path.display,
-                file.collection_name,
-                file.present_copy_count,
-                file.current_copy_count,
-                file.identity_state
-            );
-            println!(
-                "  file: {}  object: {}",
-                file.file_ref_id,
-                file.object_id.as_deref().unwrap_or("unresolved")
-            );
-            for source in &file.matching_sources {
-                println!(
-                    "  source: {} — {}",
-                    source.location_name, source.relative_path.display
-                );
+        return Ok(());
+    }
+    if grouped {
+        eprintln!("Unresolved identities are excluded.");
+    }
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let page = find_paths(request.clone())?;
+        for path in page.paths {
+            // Preserve readable display paths but keep embedded newlines and
+            // terminal control characters from creating extra output lines.
+            let display = path.display;
+            if display.chars().any(char::is_control) {
+                let escaped: String = display
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() {
+                            character.escape_default().to_string()
+                        } else {
+                            character.to_string()
+                        }
+                    })
+                    .collect();
+                writeln!(output, "{escaped}")?;
+            } else {
+                writeln!(output, "{display}")?;
             }
         }
-        if let Some(next) = page.next {
-            println!("More results: rerun with --continue {next}");
+        match page.next {
+            Some(next) => request.continuation = Some(next),
+            None => break,
         }
     }
-    if grouped && !as_json {
-        eprintln!("Catalog evidence only; unresolved content identities are excluded. Archive content is not read or changed.");
-    }
+    output.flush()?;
     Ok(())
 }
 
@@ -18016,12 +18029,16 @@ fn execute_file(
                     location_groups: groups,
                     ..FileFilter::default()
                 },
-                limit: args.limit,
+                limit: args.limit.unwrap_or(if as_json { 100 } else { 1000 }),
                 continuation: args.continuation.clone(),
             };
-            print_found_files(args, as_json, request, |request| {
-                database.find_files(request)
-            })?;
+            print_found_files(
+                args,
+                as_json,
+                request,
+                |request| database.find_files(request),
+                |request| database.find_file_paths(request),
+            )?;
         }
         FileCommand::Show { file_ref_id } => {
             let review = database.review_file(file_ref_id)?;
@@ -18283,12 +18300,16 @@ fn execute_v2_file(
                     location_groups: groups,
                     ..FileFilter::default()
                 },
-                limit: args.limit,
+                limit: args.limit.unwrap_or(if as_json { 100 } else { 1000 }),
                 continuation: args.continuation.clone(),
             };
-            print_found_files(args, as_json, request, |request| {
-                database.find_files(request)
-            })?;
+            print_found_files(
+                args,
+                as_json,
+                request,
+                |request| database.find_files(request),
+                |request| database.find_file_paths(request),
+            )?;
         }
         FileCommand::Show { file_ref_id } => {
             let review = database.review_file(file_ref_id)?;
@@ -18968,4 +18989,72 @@ fn now_utc_ms() -> Result<u64, AppError> {
         .map_err(|_| AppError::Clock)?
         .as_millis();
     u64::try_from(millis).map_err(|_| AppError::Clock)
+}
+
+#[cfg(test)]
+mod location_metrics_tests {
+    use super::V2_LOCATION_METRICS_SQL;
+    use rusqlite::{Connection, StatementStatus};
+
+    #[test]
+    fn location_metrics_preserve_unknown_and_stale_copies_without_scanning_other_content() {
+        // Minimal compact columns consumed by this query; CLI integration tests
+        // exercise these metrics against the full, canonically built schema.
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE locations(id INTEGER PRIMARY KEY, location_id TEXT UNIQUE);
+            CREATE TABLE content_objects(id INTEGER PRIMARY KEY, size_bytes INTEGER NOT NULL);
+            CREATE TABLE checks(id INTEGER PRIMARY KEY, checked_at INTEGER NOT NULL);
+            CREATE TABLE copy_bindings(id INTEGER PRIMARY KEY, location_id INTEGER NOT NULL,
+                content_id INTEGER, state TEXT NOT NULL, latest_presence INTEGER);
+            CREATE INDEX compact_copy_location ON copy_bindings(location_id,state);
+            INSERT INTO locations VALUES (1,'selected'),(2,'other'),(3,'empty');
+            INSERT INTO content_objects VALUES (1,8),(2,16);
+            INSERT INTO checks VALUES (1,500),(2,499);
+            INSERT INTO copy_bindings VALUES
+                (1,1,1,'present',1),(2,1,2,'present',2),(3,1,NULL,'present',NULL),
+                (4,1,1,'missing',1),(5,1,1,'corrupt',1),(6,1,1,'unknown',1),
+                (7,1,1,'superseded',1);",
+            )
+            .unwrap();
+        let measure = |location: &str| {
+            let mut statement = connection.prepare(V2_LOCATION_METRICS_SQL).unwrap();
+            let values: (i64, i64, i64) = statement
+                .query_row((location, 500), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            (values, statement.get_status(StatementStatus::VmStep))
+        };
+        let (expected, before) = measure("selected");
+        assert_eq!(expected, (3, 24, 2));
+        assert_eq!(measure("empty").0, (0, 0, 0));
+        connection.execute_batch("WITH RECURSIVE numbers(n) AS (
+                SELECT 100 UNION ALL SELECT n+1 FROM numbers WHERE n<10100)
+            INSERT INTO content_objects SELECT n,1000 FROM numbers;
+            INSERT INTO copy_bindings SELECT id,2,id,'present',1 FROM content_objects WHERE id>=100;").unwrap();
+        let (actual, after) = measure("selected");
+        assert_eq!(actual, expected);
+        assert!(
+            after <= before + 20,
+            "unrelated content increased SQL work: {before} -> {after}"
+        );
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {V2_LOCATION_METRICS_SQL}"))
+            .unwrap()
+            .query_map(("selected", 500), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("SEARCH b USING INDEX compact_copy_location"),
+            "{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN") && !plan.contains("MATERIALIZE"),
+            "{plan}"
+        );
+    }
 }

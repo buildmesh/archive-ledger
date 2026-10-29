@@ -187,6 +187,64 @@ fn file_find_groups_match_backup_content_and_stream_lossless_paths() {
         "--in=Backup",
     ]));
     assert_eq!(repeated["items"].as_array().unwrap().len(), 2);
+    let listed =
+        success(archive(&temp).args(["file", "find", "--collection", "Files", "--limit", "1"]));
+    let expected: String = alternatives["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            let display = item["logical_path"]["display"].as_str().unwrap();
+            let escaped: String = display
+                .chars()
+                .map(|ch| {
+                    if ch.is_control() {
+                        ch.escape_default().to_string()
+                    } else {
+                        ch.to_string()
+                    }
+                })
+                .collect();
+            format!("{escaped}\n")
+        })
+        .collect();
+    assert_eq!(String::from_utf8(listed.stdout).unwrap(), expected);
+    assert_eq!(expected.lines().count(), 4);
+    assert!(expected.contains("new\\nfile.txt\n"));
+    let first_page = json(archive(&temp).args([
+        "--json",
+        "file",
+        "find",
+        "--collection",
+        "Files",
+        "--limit",
+        "1",
+    ]));
+    assert_eq!(first_page["items"].as_array().unwrap().len(), 1);
+    assert!(first_page["items"][0]["file_ref_id"].as_str().is_some());
+    let resumed = success(archive(&temp).args([
+        "file",
+        "find",
+        "--collection",
+        "Files",
+        "--limit",
+        "1",
+        "--continue",
+        first_page["next"].as_str().unwrap(),
+    ]));
+    assert_eq!(
+        String::from_utf8(resumed.stdout).unwrap(),
+        expected.split_once('\n').unwrap().1
+    );
+    let empty = success(archive(&temp).args([
+        "file",
+        "find",
+        "--collection",
+        "Files",
+        "--exact",
+        "no-such-file",
+    ]));
+    assert!(empty.stdout.is_empty());
     let ambiguous = archive(&temp)
         .args(["file", "find", "--in", source_id, "--in=Backup", "--print0"])
         .output()
