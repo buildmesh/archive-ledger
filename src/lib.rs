@@ -17,6 +17,7 @@ pub mod registry;
 pub mod review;
 pub mod safe_copy;
 pub mod scan;
+pub mod sqlite_catalog;
 pub mod stage;
 pub mod status;
 pub mod storage;
@@ -135,4 +136,9 @@ pub use v2_store::{
     V2ArchiveInitialization, V2CanonicalCursor, V2CatalogProtection, V2CoordinationLease,
     V2OriginCursor, V2OriginStore, V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport,
     VerifiedV2Client,
+};
+
+pub use sqlite_catalog::{
+    CatalogMetadata, SqliteCatalog, SqliteCatalogError, CATALOG_APPLICATION_ID,
+    CATALOG_SCHEMA_VERSION,
 };
