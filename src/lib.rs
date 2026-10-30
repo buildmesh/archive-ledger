@@ -20,6 +20,7 @@ pub mod scan;
 pub mod sqlite_backup;
 pub mod sqlite_catalog;
 pub mod sqlite_queries;
+pub mod sqlite_removed;
 pub mod sqlite_registry;
 pub mod stage;
 pub mod status;
