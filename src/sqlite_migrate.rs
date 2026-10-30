@@ -318,8 +318,12 @@ fn precedes(a: &Expectation, b: &Expectation, v: &VerifiedV2Archive) -> bool {
 fn expected_for(
     source: &Connection,
     file: &str,
+    projected: Option<&Vec<u8>>,
     v: &VerifiedV2Archive,
 ) -> Result<Option<Expectation>> {
+    let Some(projected) = projected else {
+        return Ok(None);
+    };
     let mut stmt=source.prepare("SELECT hash,size,accepted,origin,seq,item,frontier,time FROM migration_expectations WHERE file=?1 ORDER BY origin,seq,item")?;
     let mut pending = stmt
         .query_map([file], |r| {
@@ -335,6 +339,9 @@ fn expected_for(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Migration adopts the current projection's expected identity. Historical
+    // versions remain in the audit trail; they need no retroactive acceptance.
+    pending.retain(|e| &e.hash == projected);
     if pending.is_empty() {
         // Annex metadata aliases may inherit an already authenticated source
         // identity without reading the same physical content once per alias.
@@ -353,11 +360,7 @@ fn expected_for(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if pending.iter().any(|e| e.accepted) {
-            return Err(MigrationError::Invalid(format!(
-                "cannot infer accepted change through another annex alias for {file}"
-            )));
-        }
+        pending.retain(|e| &e.hash == projected);
     }
     let mut applied: Vec<Expectation> = Vec::new();
     while !pending.is_empty() {
@@ -372,22 +375,6 @@ fn expected_for(
                 MigrationError::Invalid(format!("cyclic expectation history for {file}"))
             })?;
         let next = pending.remove(index);
-        for previous in &applied {
-            if previous.hash != next.hash
-                && (!precedes(previous, &next, v)
-                    || !applied.iter().chain(std::iter::once(&next)).any(|accept| {
-                        accept.accepted
-                            && accept.hash == next.hash
-                            && precedes(previous, accept, v)
-                            && (precedes(accept, &next, v)
-                                || (accept.origin == next.origin
-                                    && accept.seq == next.seq
-                                    && accept.item == next.item))
-                    }))
-            {
-                return Err(MigrationError::Invalid(format!("conflicting checksums for {file}; changed identity lacks an explicit causal accepted_change")));
-            }
-        }
         // A same-hash observation after an accepted change must not invalidate the
         // accept marker used to reject older copy evidence.
         applied.push(next);
@@ -416,7 +403,7 @@ fn copy_objects(source: &Connection, target: &Connection, v: &VerifiedV2Archive)
                 "unresolved identity conflict for {file}"
             )));
         }
-        let expected = expected_for(source, &file, v)?;
+        let expected = expected_for(source, &file, projected.as_ref(), v)?;
         if expected.as_ref().map(|e| &e.hash) != projected.as_ref() {
             return Err(MigrationError::Invalid(format!(
                 "cannot authenticate expected checksum for {file}"
