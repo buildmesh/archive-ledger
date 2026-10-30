@@ -22,6 +22,7 @@ use crate::discovery::{
 };
 use crate::policy::{PolicyError, PolicyRequirements};
 use crate::projection::{ProjectionDb, ProjectionError};
+use crate::sqlite_catalog::{SqliteCatalog, SqliteCatalogError};
 use crate::v2_projection::{V2ProjectionDb, V2ProjectionError};
 
 pub const DEFAULT_STAGE_DIRECTORY: &str = ".archive-ledger-stage";
@@ -34,6 +35,8 @@ pub type Result<T> = std::result::Result<T, StageError>;
 
 #[derive(Debug, Error)]
 pub enum StageError {
+    #[error(transparent)]
+    Catalog(#[from] SqliteCatalogError),
     #[error(transparent)]
     Discovery(#[from] DiscoveryError),
 
@@ -80,6 +83,7 @@ impl StageError {
             Self::Discovery(error) => error.code(),
             Self::Projection(error) => error.code(),
             Self::V2Projection(error) => error.code(),
+            Self::Catalog(_) => "stage_catalog",
             Self::Policy(error) => error.code(),
             Self::Sqlite { .. } => "stage_sqlite",
             Self::Io { .. } => "stage_io",
@@ -119,6 +123,8 @@ pub struct StageReport {
     pub audit_status: String,
     pub archive_id: String,
     pub applied_event_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_revision: Option<u64>,
     pub selected_collection_id: Option<String>,
     pub files_seen: u64,
     pub bytes_seen: u64,
@@ -371,6 +377,46 @@ pub fn audit_stage_v2(
     database: &V2ProjectionDb,
     options: &StageAuditOptions,
 ) -> Result<StageReport> {
+    audit_stage_catalog(StageCatalog::Projection(database), options)
+}
+
+/// Audit using the authoritative catalog and the existing reusable checksum manifest.
+pub fn audit_stage_sqlite(
+    database: &SqliteCatalog,
+    options: &StageAuditOptions,
+) -> Result<StageReport> {
+    audit_stage_catalog(StageCatalog::Authoritative(database), options)
+}
+
+#[derive(Clone, Copy)]
+enum StageCatalog<'a> {
+    Projection(&'a V2ProjectionDb),
+    Authoritative(&'a SqliteCatalog),
+}
+impl<'a> StageCatalog<'a> {
+    fn path(self) -> &'a Path {
+        match self {
+            Self::Projection(db) => db.path(),
+            Self::Authoritative(db) => {
+                Path::new(db.connection().path().expect("catalog has a file path"))
+            }
+        }
+    }
+    fn identity(self) -> Result<(String, u64)> {
+        match self {
+            Self::Projection(db) => {
+                let status = db.status()?;
+                Ok((status.archive_id, status.records))
+            }
+            Self::Authoritative(db) => Ok((db.metadata()?.archive_id, 0)),
+        }
+    }
+}
+
+fn audit_stage_catalog(
+    database: StageCatalog<'_>,
+    options: &StageAuditOptions,
+) -> Result<StageReport> {
     let source = fs::canonicalize(&options.source)
         .map_err(|error| io_error("resolve stage source", &options.source, error))?;
     if !fs::metadata(&source)
@@ -495,7 +541,7 @@ pub fn audit_stage_v2(
         "completed_time_utc_ms",
         &now_utc_ms()?.to_string(),
     )?;
-    classify_manifest_v2(
+    classify_manifest_catalog(
         database,
         &mut connection,
         &manifest,
@@ -520,6 +566,7 @@ pub fn prepare_stage_import(
         &archive.archive_id,
         source,
         manifest_override,
+        false,
     )
 }
 
@@ -534,6 +581,47 @@ pub fn prepare_stage_import_v2(
         &archive.archive_id,
         source,
         manifest_override,
+        false,
+    )
+}
+
+pub fn prepare_stage_import_sqlite(
+    database: &SqliteCatalog,
+    source: &Path,
+    manifest: Option<&Path>,
+) -> Result<StageImportPlan> {
+    prepare_stage_import_at(
+        StageCatalog::Authoritative(database).path(),
+        &database.metadata()?.archive_id,
+        source,
+        manifest,
+        true,
+    )
+}
+pub fn select_stage_import_sqlite(
+    database: &SqliteCatalog,
+    plan: StageImportPlan,
+    job_id: &str,
+) -> Result<StageImportPlan> {
+    select_stage_import_at(
+        StageCatalog::Authoritative(database).path(),
+        plan,
+        job_id,
+        true,
+    )
+}
+pub fn stage_import_candidates_sqlite(
+    database: &SqliteCatalog,
+    plan: &StageImportPlan,
+    after: Option<&StageImportCursor>,
+    limit: usize,
+) -> Result<StageImportPage> {
+    stage_import_candidates_at(
+        StageCatalog::Authoritative(database).path(),
+        plan,
+        after,
+        limit,
+        true,
     )
 }
 
@@ -542,6 +630,7 @@ fn prepare_stage_import_at(
     archive_id: &str,
     source: &Path,
     manifest_override: Option<&Path>,
+    authoritative: bool,
 ) -> Result<StageImportPlan> {
     let source = fs::canonicalize(source)
         .map_err(|error| io_error("resolve stage import source", source, error))?;
@@ -576,7 +665,7 @@ fn prepare_stage_import_at(
     let mut eligible_bytes = 0_u64;
     for row in rows {
         let (size, hash) = row.map_err(|source| sqlite_error(&manifest, source))?;
-        if object_is_cataloged(&catalog, database_path, &hash)? {
+        if object_is_cataloged(&catalog, database_path, &hash, authoritative)? {
             continue;
         }
         let size = u64::try_from(size)
@@ -607,7 +696,7 @@ pub fn select_stage_import(
     plan: StageImportPlan,
     job_id: &str,
 ) -> Result<StageImportPlan> {
-    select_stage_import_at(database.path(), plan, job_id)
+    select_stage_import_at(database.path(), plan, job_id, false)
 }
 
 pub fn select_stage_import_v2(
@@ -615,13 +704,14 @@ pub fn select_stage_import_v2(
     plan: StageImportPlan,
     job_id: &str,
 ) -> Result<StageImportPlan> {
-    select_stage_import_at(database.path(), plan, job_id)
+    select_stage_import_at(database.path(), plan, job_id, false)
 }
 
 fn select_stage_import_at(
     database_path: &Path,
     mut plan: StageImportPlan,
     job_id: &str,
+    authoritative: bool,
 ) -> Result<StageImportPlan> {
     let mut manifest = open_manifest(&plan.manifest)?;
     initialize_manifest(&manifest, &plan.manifest)?;
@@ -673,7 +763,7 @@ fn select_stage_import_at(
             let hash: String = row
                 .get(2)
                 .map_err(|source| sqlite_error(&plan.manifest, source))?;
-            if object_is_cataloged(&catalog, database_path, &hash)? {
+            if object_is_cataloged(&catalog, database_path, &hash, authoritative)? {
                 continue;
             }
             transaction
@@ -722,7 +812,7 @@ pub fn stage_import_candidates(
     after: Option<&StageImportCursor>,
     limit: usize,
 ) -> Result<StageImportPage> {
-    stage_import_candidates_at(database.path(), plan, after, limit)
+    stage_import_candidates_at(database.path(), plan, after, limit, false)
 }
 
 pub fn stage_import_candidates_v2(
@@ -731,7 +821,7 @@ pub fn stage_import_candidates_v2(
     after: Option<&StageImportCursor>,
     limit: usize,
 ) -> Result<StageImportPage> {
-    stage_import_candidates_at(database.path(), plan, after, limit)
+    stage_import_candidates_at(database.path(), plan, after, limit, false)
 }
 
 fn stage_import_candidates_at(
@@ -739,6 +829,7 @@ fn stage_import_candidates_at(
     plan: &StageImportPlan,
     after: Option<&StageImportCursor>,
     limit: usize,
+    authoritative: bool,
 ) -> Result<StageImportPage> {
     if limit == 0 {
         return Err(StageError::InvalidManifest(
@@ -808,7 +899,7 @@ fn stage_import_candidates_at(
             path_bytes: bytes.clone(),
         };
         if let Some(catalog) = &catalog {
-            if object_is_cataloged(catalog, database_path, &hash)? {
+            if object_is_cataloged(catalog, database_path, &hash, authoritative)? {
                 last_cursor = Some(cursor);
                 continue;
             }
@@ -998,6 +1089,7 @@ fn classify_manifest(
         audit_status: audit_status.to_owned(),
         archive_id: archive.archive_id,
         applied_event_seq: archive.cursor.applied_seq,
+        catalog_revision: None,
         selected_collection_id: selected_collection.map(ToOwned::to_owned),
         files_seen: counts.files_seen,
         bytes_seen: counts.bytes_seen,
@@ -1030,8 +1122,8 @@ fn classify_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn classify_manifest_v2(
-    database: &V2ProjectionDb,
+fn classify_manifest_catalog(
+    database: StageCatalog<'_>,
     manifest_connection: &mut Connection,
     manifest: &Path,
     source: &Path,
@@ -1042,7 +1134,7 @@ fn classify_manifest_v2(
     selected_collection: Option<&str>,
     list_limit: usize,
 ) -> Result<StageReport> {
-    let archive = database.status()?;
+    let (archive_id, archive_sequence) = database.identity()?;
     let catalog = Connection::open_with_flags(
         database.path(),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1084,7 +1176,23 @@ fn classify_manifest_v2(
         let review = if let Some(review) = review_cache.get(&hash) {
             review
         } else {
-            let review = v2_object_archive_review(&catalog, database.path(), &hash)?;
+            let review = match database {
+                StageCatalog::Projection(_) => {
+                    v2_object_archive_review(&catalog, database.path(), &hash)?
+                }
+                StageCatalog::Authoritative(_) => {
+                    let mut query = catalog.prepare_cached("SELECT DISTINCT collection_id FROM objects WHERE expected_blake3=unhex(?1) ORDER BY collection_id").map_err(|source| sqlite_error(database.path(),source))?;
+                    let collections = query
+                        .query_map([&hash], |row| row.get(0))
+                        .map_err(|source| sqlite_error(database.path(), source))?
+                        .collect::<std::result::Result<Vec<String>, _>>()
+                        .map_err(|source| sqlite_error(database.path(), source))?;
+                    ObjectArchiveReview {
+                        collections,
+                        protection: ProtectionState::Unknown,
+                    }
+                }
+            };
             review_cache.insert(hash.clone(), review);
             review_cache.get(&hash).expect("review was inserted")
         };
@@ -1113,8 +1221,8 @@ fn classify_manifest_v2(
                 "UPDATE staged_files SET archive_id = ?1, archive_event_seq = ?2, archive_state = ?3
                  WHERE path_encoding = ?4 AND path_bytes = ?5",
                 params![
-                    archive.archive_id,
-                    i64::try_from(archive.records).unwrap_or(i64::MAX),
+                    archive_id,
+                    i64::try_from(archive_sequence).unwrap_or(i64::MAX),
                     state,
                     encoding,
                     bytes,
@@ -1159,13 +1267,13 @@ fn classify_manifest_v2(
         manifest_connection,
         manifest,
         "last_archive_id",
-        &archive.archive_id,
+        &archive_id,
     )?;
     set_meta(
         manifest_connection,
         manifest,
         "last_archive_event_seq",
-        &archive.records.to_string(),
+        &archive_sequence.to_string(),
     )?;
     Ok(StageReport {
         version: 2,
@@ -1173,8 +1281,12 @@ fn classify_manifest_v2(
         manifest: manifest.to_path_buf(),
         manifest_is_source_local,
         audit_status: audit_status.to_owned(),
-        archive_id: archive.archive_id,
-        applied_event_seq: archive.records,
+        archive_id,
+        applied_event_seq: archive_sequence,
+        catalog_revision: match database {
+            StageCatalog::Authoritative(db) => Some(db.metadata()?.revision),
+            _ => None,
+        },
         selected_collection_id: selected_collection.map(ToOwned::to_owned),
         files_seen: counts.files_seen,
         bytes_seen: counts.bytes_seen,
@@ -1189,7 +1301,8 @@ fn classify_manifest_v2(
         known_policy_unknown_files: policy_unknown,
         policy_evidence_stale_policies: 0,
         policy_unconfigured_collections: 0,
-        source_removal_ready: audit_status == "complete"
+        source_removal_ready: matches!(database, StageCatalog::Projection(_))
+            && audit_status == "complete"
             && new_files == 0
             && policy_at_risk == 0
             && policy_unknown == 0,
@@ -1699,7 +1812,21 @@ fn object_archive_review(
     })
 }
 
-fn object_is_cataloged(connection: &Connection, path: &Path, hash: &str) -> Result<bool> {
+fn object_is_cataloged(
+    connection: &Connection,
+    path: &Path,
+    hash: &str,
+    authoritative: bool,
+) -> Result<bool> {
+    if authoritative {
+        return connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM objects WHERE expected_blake3=unhex(?1))",
+                [hash],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(path, source));
+    }
     connection
         .query_row(
             "SELECT EXISTS(
@@ -1896,5 +2023,57 @@ mod tests {
             FileDiscovery::with_exclusions(&source, vec![DEFAULT_STAGE_DIRECTORY.into()]).unwrap();
         assert!(discovery.next().is_some());
         assert!(discovery.all(|item| !matches!(item, DiscoveryItem::File(_))));
+    }
+    #[test]
+    fn authoritative_stage_reuses_manifest_and_freezes_unknown_content_selection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("known"), b"known").unwrap();
+        fs::write(source.join("new"), b"new").unwrap();
+        let catalog =
+            SqliteCatalog::create(temp.path().join("catalog.db"), "arc", "Archive").unwrap();
+        catalog.connection().execute("INSERT INTO collections(collection_id,display_name,status) VALUES ('collection','Files','active')",[]).unwrap();
+        let known = blake3::hash(b"known");
+        catalog.connection().execute("INSERT INTO objects(object_id,collection_id,relative_path_encoding,relative_path_bytes,relative_path_display,expected_blake3,expected_size_bytes) VALUES ('known','collection','utf8',X'6b6e6f776e','known',?1,5)",[known.as_bytes().as_slice()]).unwrap();
+        let options = StageAuditOptions {
+            source: source.clone(),
+            manifest: None,
+            collection_id: Some("collection".into()),
+            list_limit: 100,
+        };
+        let first = audit_stage_sqlite(&catalog, &options).unwrap();
+        assert_eq!(
+            (
+                first.new_to_archive_files,
+                first.known_in_selected_collection,
+                first.checksums_computed
+            ),
+            (1, 1, 2)
+        );
+        assert_eq!(first.known_policy_unknown_files, 1);
+        assert!(!first.source_removal_ready);
+        let second = audit_stage_sqlite(&catalog, &options).unwrap();
+        assert_eq!((second.checksums_computed, second.checksums_reused), (0, 2));
+        let plan = prepare_stage_import_sqlite(&catalog, &source, None).unwrap();
+        assert_eq!(plan.eligible_files, 1);
+        let frozen = select_stage_import_sqlite(&catalog, plan, "job_test").unwrap();
+        let new = blake3::hash(b"new");
+        catalog.connection().execute("INSERT INTO objects(object_id,collection_id,relative_path_encoding,relative_path_bytes,relative_path_display,expected_blake3,expected_size_bytes) VALUES ('new','collection','utf8',X'6e6577','new',?1,3)",[new.as_bytes().as_slice()]).unwrap();
+        assert_eq!(
+            prepare_stage_import_sqlite(&catalog, &source, None)
+                .unwrap()
+                .eligible_files,
+            0
+        );
+        let candidates = stage_import_candidates_sqlite(&catalog, &frozen, None, 1).unwrap();
+        assert_eq!(candidates.items.len(), 1);
+        assert_eq!(candidates.items[0].relative_path, PathBuf::from("new"));
+        assert!(candidates.next.is_none());
+        assert_eq!(
+            catalog.metadata().unwrap().revision,
+            0,
+            "staging must not write catalog facts"
+        );
     }
 }

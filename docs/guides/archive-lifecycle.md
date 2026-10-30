@@ -1,250 +1,155 @@
 # From first Archive to routine maintenance
 
-This guide walks through the normal life of an Archive in order: create it, add files, protect the
-catalog itself, add a second copy somewhere else, review Policy, keep the catalog current, and
-maintain it over time. Each step links to the [README](../../README.md) section with the details
-instead of repeating them.
+An Archive is a local SQLite catalog of expected file contents, Locations, and check history.
+It does not contain your files. This guide creates a Collection, checks its files, makes a backup,
+and backs up the catalog itself.
 
-The examples use one Collection of documents in `~/Documents` on the main computer, a backup disk
-mounted at `/media/backup-disk`, and a second disk kept at another site and mounted at
-`/media/offsite-disk`. Replace names and paths with your own.
+The examples use documents in `~/Documents`, a backup disk at `/media/backup-disk`, and separate
+storage for catalog backups at `/media/offsite-disk`. Replace these paths and names with your own.
+Every `bash` block runs in order against disposable fixtures in `scripts/test-lifecycle-guide.py`.
+The `text` examples are not run by that script.
 
-Every `bash` block in this guide is run in order against a disposable Archive by
-`scripts/test-lifecycle-guide.py`. `text` blocks are illustrations that the script does not run.
+## 1. Create an Archive
 
-## 1. Create the Archive
-
-An Archive is the catalog. Creating it does not look at any files.
+Creating an Archive does not scan files or require Git. The first Archive becomes the default.
 
 ```bash
-archive init "Personal archive"
+archive init "Personal archive" --non-interactive
 ```
 
-The first Archive becomes the default. For several Archives, see
-[Create an Archive and first Collection](../../README.md#create-an-archive-and-first-collection).
-The command also warns that the new catalog history is not yet on a sync remote. Step 3 deals
-with that.
+## 2. Register and check your primary files
 
-## 2. Create a Collection and inventory its files
-
-A Collection is the logical set of files you care about. Create it from its root directory, then
-add the files. Adding reads and hashes every file, which records a verified first copy.
+A Collection identifies files by their relative paths. The first successful checksum establishes
+each path's expected contents. A Location identifies where those paths are stored.
 
 ```bash
 cd ~/Documents
-archive collection init --name "Documents" \
+archive collection init --name "Documents" --location-name "Primary documents" \
   --device "Main computer" --site "Home" --non-interactive
 archive collection add . --collection "Documents"
 ```
 
-Without `--non-interactive`, setup asks for the Device and Site only when it cannot infer them.
-If the filesystem has no stable identity, setup stops. Read
-[Create an Archive and first Collection](../../README.md#create-an-archive-and-first-collection)
-before using `--allow-unidentified-root`.
+Setup records filesystem identity where available. If it cannot identify the filesystem, review
+that limitation before explicitly allowing `--allow-unidentified-root`. The disposable test runner
+uses that option because its temporary directories have no stable disk identity.
 
-For a git-annex repository, use `archive collection init --import-annex` instead. For a very large
-repository, use `--inventory-only` followed by a `location scan`. See
-[Import git-annex repositories](../../README.md#import-git-annex-repositories) and the
-[annex workflows guide](annex-workflows.md).
+For annex repositories, `collection init --import-annex` imports logical worktree paths.
+`--inventory-only` defers checksumming: unknown contents do not qualify as verified backups.
+A later `location scan` checks local bytes against annex keys before establishing expected contents.
 
-## 3. Protect the catalog itself
+## 3. Register a backup Location and copy files
 
-The catalog history lives in a Git repository inside the Archive directory, on the main computer's
-disk. Every change is committed there, but a local Git commit is not a backup. If that disk fails,
-the catalog is gone together with the knowledge of where every copy is. Make independent protection
-of the catalog part of setup, not an afterthought.
-
-Give the Archive a sync remote on storage that fails independently of the main computer, then
-synchronize. Here the remote is a bare Git repository on the offsite disk:
-
-```bash
-git init --bare /media/offsite-disk/personal-archive.git
-archive sync remote add offsite /media/offsite-disk/personal-archive.git
-archive sync
-archive status
-```
-
-An SSH remote works the same way:
-
-```text
-archive sync remote add offsite ssh://backup.example/personal-archive.git
-```
-
-Until the history has reached a sync remote, `archive status` and every command that changes the
-catalog print one warning line with the next step:
-
-```text
-WARNING: 3 catalog commits are not yet on a sync remote; a local Git commit is not a backup. Next: archive sync
-```
-
-The warning stops once the history is on a configured remote. Archive Ledger does not yet check
-whether that remote is on a different device and site; that is your responsibility. See
-[Protect and recover the catalog](../../README.md#protect-and-recover-the-catalog) for supported
-remotes, other installations, and recovery.
-
-## 4. Add a second Location on another Device
-
-A Location is one place where a Collection's files are stored. Register an empty directory on the
-backup disk as another Location, then copy verified files to it from the main Location:
+The backup Location uses the same Collection-relative paths as the primary Location. Equal bytes
+under a different path do not count as a backup of the original path.
 
 ```bash
 mkdir -p /media/backup-disk/Documents
-cd /media/backup-disk/Documents
-archive location init --collection "Documents" \
-  --device "Backup disk" --site "Office" --non-interactive
+archive location init /media/backup-disk/Documents --collection "Documents" \
+  --location-name "Backup documents" --device "Backup disk" --site "Office" --non-interactive
 cd ~/Documents
-archive copy --to "Documents on Backup disk" --yes --non-interactive
+archive copy --from "Primary documents" --to "Backup documents" --collection "Documents" --dry-run
+archive copy --from "Primary documents" --to "Backup documents" --collection "Documents" --yes
 ```
 
-Copy checks each file against its recorded hash while writing and reads the result back. It never
-overwrites or deletes files. To register a disk that already holds copies, run
-`archive collection add .` from that Location instead of copying. See
-[Make a verified copy at another Location](../../README.md#make-a-verified-copy-at-another-location)
-and [Add another Device or partial Location](../../README.md#add-another-device-or-partial-location).
-
-## 5. Review Policy and risk
-
-Each Collection has a Policy: how many qualifying copies it needs, on how many Devices and Sites,
-and how old verification, presence, and Device check-in evidence may be. The starter Policy asks
-for two copies on two Devices at two Sites, including one offsite, with evidence no older than 365
-days. Review it and change only what should differ:
+Copy verifies bytes and preserves existing destination files. A conflicting destination produces an
+error; it is not overwritten. If files were copied with another program, scan their Location to
+record and verify them:
 
 ```bash
-archive policy list
-archive policy show "Two copies at two sites"
-archive policy update "Two copies at two sites" --verification-days 180
-archive report policy
-archive report risk
+archive location scan "Backup documents" --collection "Documents"
 ```
 
-Expect findings at first. A copy counts toward Policy only when its Device has confirmed identity.
-Setup records the filesystem's identity, which is not the physical Device. Until you record
-hardware evidence for each Device, reports list its copies as not qualifying:
+For Locations mounted read-only into a container, use the listing commands below and perform
+copies outside the container. Scan afterward to record the resulting evidence.
+
+## 4. Find files missing from the backup set
+
+Human output lists every matching path, one per line. `--json` returns a bounded page with Object
+IDs and a continuation token; `--print0` emits lossless NUL-separated paths for scripts.
+
+```bash
+archive file find --collection "Documents" --in "Primary documents" \
+  --and --not --in "Backup documents" --verified-within 30d
+```
+
+Repeated `--in` values within a group mean “any of these Locations.” `--and` starts another group,
+and `--not` excludes its matches. For several backup disks:
 
 ```text
-archive device identity "Backup disk" --kind serial --fingerprint '<disk serial number>'
+archive file find --collection Files --in "Files on disk10" \
+  --and --not --in "Files on sd" --in "Files on sd02" --in "Files on sd03" \
+  --verified-within 30d
 ```
 
-See [Create an Archive and first Collection](../../README.md#create-an-archive-and-first-collection)
-for which evidence to use. A Device's Site is where it is normally kept. Once both Devices are
-confirmed, a backup disk kept at the Office provides the second Site. Record shared failure causes
-that topology cannot show, such as two disks in one safe, as risk domains. See
-[Review status, integrity, and disaster risk](../../README.md#review-status-integrity-and-disaster-risk).
+The age condition applies to its group. This example accepts a successful backup checksum within
+30 days; it does not reread the backup drives. Damaged, missing, or unresolved copies do not qualify.
+Use `file show <object-id>` for current Location evidence and `file history <object-id>` for checks
+and changes. Obtain IDs with `file find --json`.
 
-## 6. Keep the catalog current
+## 5. Keep current state and verification evidence up to date
 
-Use the two scan commands for different jobs:
-
-- `archive collection add .` records new and changed files under the current directory. It only
-  adds; it never marks anything missing. Use it after putting new files in place.
-- `archive location scan` reconciles a whole Location, so a complete run can also mark files that
-  are gone as missing, and it refreshes presence for everything it saw.
-
-Both read only new and changed files. Files whose size and modification time are unchanged are
-not read again. Re-reading their bytes is the job of `verify` (step 7), so routine scans stay fast.
+`collection add` checks files under the selected directory without declaring other paths missing.
+`location scan` checks an entire Location; only a completed scan with adequate coverage can mark
+unseen paths missing. Both preserve the expected checksum when bytes differ, recording damage.
 
 ```bash
 cd ~/Documents
-echo "New notes" > notes-2026.txt
+printf '%s\n' "New notes" > notes-2026.txt
 archive collection add . --collection "Documents"
-archive location scan
-```
-
-Cataloged content is immutable by default. If a known file's bytes change, add and scan report
-"content differs from catalog", mark that copy corrupt, and exit with code 10. They do not accept
-the edit silently. To accept an intentional edit, use `--accept-changes` as described in
-[Add files and reconcile a Location](../../README.md#add-files-and-reconcile-a-location).
-
-Long scans show progress on a terminal and print a job ID first. If a scan is interrupted, list
-the unfinished jobs and resume or cancel:
-
-```bash
+archive location scan "Primary documents" --collection "Documents"
+archive verify "Backup documents" --all
 archive job list
 ```
 
-```text
-archive job resume <job-id>
-archive job cancel <job-id> --dry-run
-archive job cancel <job-id>
-```
+Without `--all`, verification selects copies due for another check. `job resume <job-id>` continues
+interrupted work; mounting a different disk at the old path is not permission to resume against it.
 
-While a Location has an unfinished scan, a new `location scan` of it is refused and names that job,
-so progress is never discarded silently. See
-[Verify bytes and resume work](../../README.md#verify-bytes-and-resume-work).
-
-To see what a scan or add would do before running it, add `--dry-run`. It lists new, changed,
-and missing files from metadata alone, reads no file content, and records nothing. It exits with
-code 10 when there is something to record:
-
-```bash
-cd ~/Documents
-archive location scan --dry-run
-archive collection add . --collection "Documents" --dry-run
-```
-
-Files copied into a Location by hand appear as new at that Location; add them with
-`collection add`, or use `archive copy` next time, which records copies as it writes them.
-
-## 7. Routine maintenance
-
-Start with the summary views. They read the local SQLite catalog and do not touch storage.
-`archive location scan --dry-run` (step 6) shows what has changed on a connected disk before you
-record it:
-
-```bash
-archive status
-archive report risk
-archive report integrity
-archive report stale-presence --locations
-```
-
-`status` also points at unfinished jobs. `report stale-presence` says which Device to mount and
-refresh next.
-
-Re-read bytes to catch silent corruption. `verify` reads only the copies that are due: never
-verified, failed their last check, or past their Policy's age or within 30 days of it. It starts
-with the least recently verified. Without a Location it covers every connected Location whose
-identity is confirmed as matching, and `--all` re-reads everything. Use `--fingerprint-status match` only after confirming that the
-mounted disk is the registered Device:
-
-```bash
-archive verify "Documents on Backup disk" --path /media/backup-disk/Documents \
-  --fingerprint-status match
-```
-
-For bounded, unattended checking of stale copies on connected Devices, enable the one-shot
-background runner and call it from your scheduler:
-
-```bash
-archive background enable --max-items 100
-archive background run
-```
+To accept an intentional edit, explicitly name the changed path:
 
 ```text
-# crontab: every night at 02:30, at low CPU and I/O priority
-30 2 * * * nice -n 19 ionice -c3 archive background run
+archive collection add . --collection Documents --accept-changes notes-2026.txt --dry-run
+archive collection add . --collection Documents --accept-changes notes-2026.txt --yes
 ```
 
-When a Policy report shows under-replicated Files, make another verified copy (step 4).
-`report integrity` lists corrupt copies and, for each, where verified copies of the same content
-are and whether they are connected. With a good copy connected, `archive repair <Location>
---dry-run` shows the plan and `--yes` performs it. The corrupt bytes are kept in the Location's
-`.archive-ledger/quarantine` until you delete them. Check the catalog's own consistency
-occasionally:
+Acceptance changes that Object's expected checksum and invalidates previous backup verification.
+It does not change any backup bytes. A checksum mismatch is otherwise reported as damage and exits
+with code 10.
+
+## 6. Preview catalog removal without deleting files
+
+`file removed` records that a copy has been removed. It never deletes filesystem contents.
+Preview the exact affected paths first:
 
 ```bash
-archive fsck
+archive file removed --collection "Documents" --location "Primary documents" \
+  --path letter.txt --dry-run
 ```
 
-## 8. Keep catalog protection current
+After deliberately removing a real copy outside Archive Ledger, use the same command without
+`--dry-run` to update the catalog. A later successful checksum is required before a rediscovered
+copy qualifies as verified again.
 
-Every catalog change creates new local history. Synchronize after a session of changes, or
-routinely from your scheduler, and confirm that the warning is gone:
+For a temporary USB backup, select paths that also have a recent verified copy in the backup set:
+
+```text
+archive file find --collection Files --in "Files on usb" --and \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03" --verified-within 30d
+```
+
+Listing these paths does not delete them. Filesystem deletion and any subsequent catalog update
+remain explicit operations.
+
+## 7. Back up and rehearse restoring the catalog
+
+The catalog is user data too. Use `backup` to create a consistent standalone SQLite backup on
+independent storage. Choose a new destination filename for each backup; existing files are preserved.
 
 ```bash
-archive sync
+archive backup --to /media/offsite-disk/personal-catalog.db
+archive restore catalog /media/offsite-disk/personal-catalog.db --to ~/restored-personal-catalog.db
 archive status
 ```
 
-`archive status --json` reports the same information as `catalog_protection`, with the number of
-local commits not yet on a sync remote.
+Restore validates the backup and creates a new database file. It does not replace or activate your
+current catalog. Keep a recent catalog backup after recording new files, checks, or removals.
+Catalog backup protects the index and history; file contents still need their own verified copies.

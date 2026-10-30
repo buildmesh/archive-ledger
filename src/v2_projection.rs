@@ -2471,7 +2471,7 @@ fn validate_projected_item_defaults(item_schema_version: u64, defaults: &Value) 
     }
 }
 
-fn materialize_batch_item(
+pub(crate) fn materialize_batch_item(
     item: &Value,
     defaults: &Value,
 ) -> Result<serde_json::Map<String, Value>> {

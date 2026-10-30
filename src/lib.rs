@@ -17,6 +17,12 @@ pub mod registry;
 pub mod review;
 pub mod safe_copy;
 pub mod scan;
+pub mod sqlite_backup;
+pub mod sqlite_catalog;
+pub mod sqlite_migrate;
+pub mod sqlite_queries;
+pub mod sqlite_registry;
+pub mod sqlite_removed;
 pub mod stage;
 pub mod status;
 pub mod storage;
@@ -81,9 +87,9 @@ pub use registry::{
 };
 pub use review::{
     utf8_path, CopyFilter, CopyPage, CopyPageRequest, CopyReview, FileFilter, FileLocationGroup,
-    FileMatchingSource, FilePage, FilePageRequest, FileReview, FileSummary, HistoryEntry,
-    HistoryPage, LosslessPath, ObjectHashReview, ObjectReview, ReviewError, V2HistoryEntry,
-    V2HistoryPage,
+    FileMatchingSource, FilePage, FilePageRequest, FilePathPage, FileReview, FileSummary,
+    HistoryEntry, HistoryPage, LosslessPath, ObjectHashReview, ObjectReview, ReviewError,
+    V2HistoryEntry, V2HistoryPage,
 };
 pub use safe_copy::{
     copy_verified_no_replace, place_directory_no_replace, place_file_no_replace,
@@ -136,3 +142,10 @@ pub use v2_store::{
     V2OriginCursor, V2OriginStore, V2StoreError, V2SyncRemote, V2SyncResult, V2VerificationReport,
     VerifiedV2Client,
 };
+
+pub use sqlite_catalog::{
+    CatalogMetadata, SqliteCatalog, SqliteCatalogError, CATALOG_APPLICATION_ID,
+    CATALOG_SCHEMA_VERSION,
+};
+
+pub mod sqlite_writes;

@@ -155,6 +155,12 @@ pub struct FileSummary {
     pub last_verified_time_utc_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FilePathPage {
+    pub paths: Vec<LosslessPath>,
+    pub next: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FilePage {
     pub version: u32,
@@ -334,7 +340,27 @@ struct V2BatchHistoryContext {
 }
 
 impl ProjectionDb {
-    pub fn find_files(&self, mut request: FilePageRequest) -> Result<FilePage> {
+    pub fn find_files(&self, request: FilePageRequest) -> Result<FilePage> {
+        self.find_files_page(request, true)
+    }
+
+    pub fn find_file_paths(&self, request: FilePageRequest) -> Result<FilePathPage> {
+        let page = self.find_files_page(request, false)?;
+        Ok(FilePathPage {
+            paths: page
+                .items
+                .into_iter()
+                .map(|file| file.logical_path)
+                .collect(),
+            next: page.next,
+        })
+    }
+
+    fn find_files_page(
+        &self,
+        mut request: FilePageRequest,
+        include_details: bool,
+    ) -> Result<FilePage> {
         validate_limit(request.limit)?;
         validate_filter(&request.filter)?;
         let applied_event_seq = self.status()?.cursor.applied_seq;
@@ -353,6 +379,10 @@ impl ProjectionDb {
         }
 
         let connection = open(self.path())?;
+        // Keep candidate rows, copy metrics, and source paths in one read snapshot.
+        let _read_transaction = connection
+            .unchecked_transaction()
+            .map_err(|source| sqlite_error(self.path(), source))?;
         let prefix_upper = request
             .filter
             .path_prefix
@@ -363,87 +393,9 @@ impl ProjectionDb {
             .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.path_bytes))
             .transpose()
             .map_err(|_| ReviewError::InvalidContinuation)?;
+        let query = file_find_sql(&request.filter, false, cursor.is_some());
         let mut statement = connection
-            .prepare(
-                "WITH object_copy_metrics AS (
-                    SELECT object_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NOT NULL
-                    GROUP BY object_id
-                 ), external_copy_metrics AS (
-                    SELECT external_identity_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NULL
-                      AND external_identity_id IS NOT NULL
-                    GROUP BY external_identity_id
-                 )
-                 SELECT f.file_ref_id, f.collection_id, c.display_name,
-                        f.logical_path_encoding, f.logical_path_bytes,
-                        f.logical_path_display, f.identity_state, f.object_id,
-                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
-                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
-                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
-                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
-                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
-                 FROM file_refs f
-                 JOIN collections c ON c.collection_id = f.collection_id
-                 LEFT JOIN objects o ON o.object_id = f.object_id
-                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
-                 LEFT JOIN external_copy_metrics em
-                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
-                 WHERE f.path_state = 'active'
-                   AND (?1 IS NULL OR f.collection_id = ?1)
-                   AND (?2 IS NULL OR (f.logical_path_encoding = ?2 AND f.logical_path_bytes = ?3))
-                   AND (?4 IS NULL OR (f.logical_path_encoding = ?4
-                        AND f.logical_path_bytes >= ?5
-                        AND (?6 IS NULL OR f.logical_path_bytes < ?6)))
-                   AND (?7 IS NULL OR f.identity_state = ?7)
-                   AND (?8 IS NULL OR f.object_id = ?8)
-                   AND (?9 IS NULL OR f.external_identity_id = ?9)
-                   AND (json_array_length(?15) = 0 OR (
-                     f.object_id IS NOT NULL AND f.identity_state = 'resolved'
-                     AND NOT EXISTS (
-                       SELECT 1 FROM json_each(?15) g
-                       WHERE EXISTS (
-                         SELECT 1 FROM copy_claims cc
-                         WHERE cc.object_id = f.object_id AND cc.state = 'present'
-                           AND cc.location_id IN (SELECT value FROM json_each(g.value, '$.location_ids'))
-                           AND (json_extract(g.value, '$.verified_within_ms') IS NULL OR (
-                             cc.last_verification_result = 'ok'
-                             AND cc.last_verified_time_utc_ms BETWEEN
-                               MAX(0, ?16 - json_extract(g.value, '$.verified_within_ms')) AND ?16
-                           ))
-                       ) = json_extract(g.value, '$.negated')
-                     )
-                     AND (?17 IS NULL OR EXISTS (
-                       SELECT 1 FROM path_observations po
-                       JOIN copy_claims src ON src.location_id = po.location_id
-                         AND src.object_id = po.object_id AND src.state = 'present'
-                         AND ((src.relative_path_encoding = po.observed_path_encoding
-                           AND src.relative_path_bytes = po.observed_path_bytes)
-                           OR (po.representation = 'annex_locked_symlink'
-                             AND src.external_identity_id = po.external_identity_id))
-                       WHERE po.file_ref_id = f.file_ref_id AND po.object_id = f.object_id
-                         AND po.state = 'present'
-                         AND po.location_id IN (SELECT value FROM json_each(?17))
-                         AND (?18 IS NULL OR (src.last_verification_result = 'ok'
-                           AND src.last_verified_time_utc_ms BETWEEN MAX(0, ?16 - ?18) AND ?16))
-                     ))
-                   ))
-                   AND (?10 IS NULL OR (f.collection_id, f.logical_path_encoding,
-                        f.logical_path_bytes, f.file_ref_id) > (?10, ?11, ?12, ?13))
-                 ORDER BY f.collection_id, f.logical_path_encoding,
-                          f.logical_path_bytes, f.file_ref_id
-                 LIMIT ?14",
-            )
+            .prepare(&query)
             .map_err(|source| sqlite_error(self.path(), source))?;
         let groups_json = serde_json::to_string(&request.filter.location_groups).unwrap();
         let source_group = request
@@ -502,7 +454,16 @@ impl ProjectionDb {
         } else {
             None
         };
-        populate_matching_sources(&connection, self.path(), &request.filter, &mut items, false)?;
+        if include_details {
+            populate_file_metrics(&connection, self.path(), &mut items, false)?;
+            populate_matching_sources(
+                &connection,
+                self.path(),
+                &request.filter,
+                &mut items,
+                false,
+            )?;
+        }
         Ok(FilePage {
             version: OUTPUT_VERSION,
             applied_event_seq,
@@ -514,52 +475,23 @@ impl ProjectionDb {
     pub fn review_file(&self, file_ref_id: &str) -> Result<FileReview> {
         let applied_event_seq = self.status()?.cursor.applied_seq;
         let connection = open(self.path())?;
-        let file = connection
-            .query_row(
-                "WITH object_copy_metrics AS (
-                    SELECT object_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NOT NULL
-                    GROUP BY object_id
-                 ), external_copy_metrics AS (
-                    SELECT external_identity_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NULL
-                      AND external_identity_id IS NOT NULL
-                    GROUP BY external_identity_id
-                 )
-                 SELECT f.file_ref_id, f.collection_id, c.display_name,
-                        f.logical_path_encoding, f.logical_path_bytes,
-                        f.logical_path_display, f.identity_state, f.object_id,
-                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
-                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
-                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
-                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
-                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
-                 FROM file_refs f
-                 JOIN collections c ON c.collection_id = f.collection_id
-                 LEFT JOIN objects o ON o.object_id = f.object_id
-                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
-                 LEFT JOIN external_copy_metrics em
-                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
-                 WHERE f.file_ref_id = ?1",
-                [file_ref_id],
-                file_summary_from_row,
-            )
+        let _read_transaction = connection
+            .unchecked_transaction()
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let mut file = connection
+            .query_row(FILE_REVIEW_SQL, [file_ref_id], file_summary_from_row)
             .optional()
             .map_err(|source| sqlite_error(self.path(), source))?
             .ok_or_else(|| ReviewError::NotFound {
                 kind: "file",
                 id: file_ref_id.to_owned(),
             })?;
+        populate_file_metrics(
+            &connection,
+            self.path(),
+            std::slice::from_mut(&mut file),
+            false,
+        )?;
         let (external_namespace, external_key) = file
             .external_identity_id
             .as_ref()
@@ -579,29 +511,12 @@ impl ProjectionDb {
             .map_or((None, None), |(namespace, key)| {
                 (Some(namespace), Some(key))
             });
+        let copy_query = file_review_copies_sql(
+            file.object_id.is_some(),
+            file.external_identity_id.is_some(),
+        );
         let mut statement = connection
-            .prepare(
-                "SELECT cc.copy_claim_id, cc.state, cc.claim_basis,
-                        cc.relative_path_encoding, cc.relative_path_bytes,
-                        cc.relative_path_display, l.location_id, l.display_name,
-                        l.kind, l.status, l.archive_root_id, ar.display_name,
-                        l.device_id, d.display_name, d.identity_state,
-                        COALESCE(l.site_id, d.current_site_id), s.display_name,
-                        l.encryption_state, l.trust_level, l.expected_availability,
-                        cc.last_seen_time_utc_ms, cc.last_verified_time_utc_ms,
-                        cc.last_verification_result, cc.last_error_code, cc.last_error_detail
-                 FROM copy_claims cc
-                 JOIN locations l ON l.location_id = cc.location_id
-                 LEFT JOIN archive_roots ar ON ar.archive_root_id = l.archive_root_id
-                 LEFT JOIN devices d ON d.device_id = l.device_id
-                 LEFT JOIN sites s ON s.site_id = COALESCE(l.site_id, d.current_site_id)
-                 WHERE cc.state != 'superseded'
-                   AND ((?1 IS NOT NULL AND cc.object_id = ?1)
-                     OR (?1 IS NULL AND ?2 IS NOT NULL AND cc.external_identity_id = ?2))
-                 ORDER BY l.display_name, cc.relative_path_encoding,
-                          cc.relative_path_bytes, cc.copy_claim_id
-                 LIMIT ?3",
-            )
+            .prepare(&copy_query)
             .map_err(|source| sqlite_error(self.path(), source))?;
         let mut copies = statement
             .query_map(
@@ -927,7 +842,27 @@ impl ProjectionDb {
 }
 
 impl V2ProjectionDb {
-    pub fn find_files(&self, mut request: FilePageRequest) -> Result<FilePage> {
+    pub fn find_files(&self, request: FilePageRequest) -> Result<FilePage> {
+        self.find_files_page(request, true)
+    }
+
+    pub fn find_file_paths(&self, request: FilePageRequest) -> Result<FilePathPage> {
+        let page = self.find_files_page(request, false)?;
+        Ok(FilePathPage {
+            paths: page
+                .items
+                .into_iter()
+                .map(|file| file.logical_path)
+                .collect(),
+            next: page.next,
+        })
+    }
+
+    fn find_files_page(
+        &self,
+        mut request: FilePageRequest,
+        include_details: bool,
+    ) -> Result<FilePage> {
         validate_limit(request.limit)?;
         validate_filter(&request.filter)?;
         let status = self.status()?;
@@ -947,6 +882,10 @@ impl V2ProjectionDb {
         }
 
         let connection = open(self.path())?;
+        // Keep candidate rows, copy metrics, and source paths in one read snapshot.
+        let _read_transaction = connection
+            .unchecked_transaction()
+            .map_err(|source| sqlite_error(self.path(), source))?;
         let prefix_upper = request
             .filter
             .path_prefix
@@ -957,90 +896,9 @@ impl V2ProjectionDb {
             .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.path_bytes))
             .transpose()
             .map_err(|_| ReviewError::InvalidContinuation)?;
+        let query = file_find_sql(&request.filter, true, cursor.is_some());
         let mut statement = connection
-            .prepare(
-                "WITH object_copy_metrics AS (
-                    SELECT object_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NOT NULL
-                    GROUP BY object_id
-                 ), external_copy_metrics AS (
-                    SELECT external_identity_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NULL
-                      AND external_identity_id IS NOT NULL
-                    GROUP BY external_identity_id
-                 )
-                 SELECT f.file_ref_id, f.collection_id, c.display_name,
-                        f.logical_path_encoding, f.logical_path_bytes,
-                        f.logical_path_display, f.identity_state, f.object_id,
-                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
-                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
-                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
-                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
-                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
-                 FROM file_refs f
-                 JOIN collections c ON c.collection_id = f.collection_id
-                 LEFT JOIN objects o ON o.object_id = f.object_id
-                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
-                 LEFT JOIN external_copy_metrics em
-                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
-                 WHERE f.path_state = 'active'
-                   AND (?1 IS NULL OR f.collection_id = ?1)
-                   AND (?2 IS NULL OR (f.logical_path_encoding = ?2 AND f.logical_path_bytes = ?3))
-                   AND (?4 IS NULL OR (f.logical_path_encoding = ?4
-                        AND f.logical_path_bytes >= ?5
-                        AND (?6 IS NULL OR f.logical_path_bytes < ?6)))
-                   AND (?7 IS NULL OR f.identity_state = ?7)
-                   AND (?8 IS NULL OR f.object_id = ?8)
-                   AND (?9 IS NULL OR f.external_identity_id = ?9)
-                   AND (json_array_length(?15) = 0 OR (
-                     f.object_id IS NOT NULL AND f.identity_state = 'resolved'
-                     AND NOT EXISTS (
-                       SELECT 1 FROM json_each(?15) g
-                       WHERE EXISTS (
-                         SELECT 1 FROM copy_claims cc
-                         WHERE cc.object_id = f.object_id AND cc.state = 'present'
-                           AND cc.location_id IN (SELECT value FROM json_each(g.value, '$.location_ids'))
-                           AND (json_extract(g.value, '$.verified_within_ms') IS NULL OR (
-                             cc.last_verification_result = 'ok'
-                             AND cc.last_verified_time_utc_ms BETWEEN
-                               MAX(0, ?16 - json_extract(g.value, '$.verified_within_ms')) AND ?16
-                           ))
-                       ) = json_extract(g.value, '$.negated')
-                     )
-                     AND (?17 IS NULL OR EXISTS (
-                       SELECT 1 FROM path_observations po
-                       JOIN copy_claims src ON src.location_id = po.location_id
-                         AND src.object_id = po.object_id AND src.state = 'present'
-                         AND EXISTS (SELECT 1 FROM file_locations binding
-                           JOIN file_objects source_file ON source_file.id = binding.file_id
-                           JOIN locations source_location ON source_location.id = binding.location_id
-                           JOIN copy_bindings physical ON physical.id = binding.copy_id
-                           WHERE source_file.canonical_id = po.file_ref_id
-                             AND source_location.location_id = po.location_id
-                             AND physical.canonical_id = src.copy_claim_id)
-                       WHERE po.file_ref_id = f.file_ref_id AND po.object_id = f.object_id
-                         AND po.state = 'present'
-                         AND po.location_id IN (SELECT value FROM json_each(?17))
-                         AND (?18 IS NULL OR (src.last_verification_result = 'ok'
-                           AND src.last_verified_time_utc_ms BETWEEN MAX(0, ?16 - ?18) AND ?16))
-                     ))
-                   ))
-                   AND (?10 IS NULL OR (f.collection_id, f.logical_path_encoding,
-                        f.logical_path_bytes, f.file_ref_id) > (?10, ?11, ?12, ?13))
-                 ORDER BY f.collection_id, f.logical_path_encoding,
-                          f.logical_path_bytes, f.file_ref_id
-                 LIMIT ?14",
-            )
+            .prepare(&query)
             .map_err(|source| sqlite_error(self.path(), source))?;
         let groups_json = serde_json::to_string(&request.filter.location_groups).unwrap();
         let source_group = request
@@ -1099,7 +957,10 @@ impl V2ProjectionDb {
         } else {
             None
         };
-        populate_matching_sources(&connection, self.path(), &request.filter, &mut items, true)?;
+        if include_details {
+            populate_file_metrics(&connection, self.path(), &mut items, true)?;
+            populate_matching_sources(&connection, self.path(), &request.filter, &mut items, true)?;
+        }
         Ok(FilePage {
             version: 2,
             applied_event_seq,
@@ -1112,52 +973,23 @@ impl V2ProjectionDb {
         let status = self.status()?;
         let applied_event_seq = status.records;
         let connection = open(self.path())?;
-        let file = connection
-            .query_row(
-                "WITH object_copy_metrics AS (
-                    SELECT object_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NOT NULL
-                    GROUP BY object_id
-                 ), external_copy_metrics AS (
-                    SELECT external_identity_id,
-                           COUNT(*) AS current_copy_count,
-                           SUM(CASE WHEN state = 'present' THEN 1 ELSE 0 END) AS present_copy_count,
-                           MAX(last_seen_time_utc_ms) AS last_seen_time_utc_ms,
-                           MAX(last_verified_time_utc_ms) AS last_verified_time_utc_ms
-                    FROM copy_claims
-                    WHERE state != 'superseded' AND object_id IS NULL
-                      AND external_identity_id IS NOT NULL
-                    GROUP BY external_identity_id
-                 )
-                 SELECT f.file_ref_id, f.collection_id, c.display_name,
-                        f.logical_path_encoding, f.logical_path_bytes,
-                        f.logical_path_display, f.identity_state, f.object_id,
-                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
-                        COALESCE(om.current_copy_count, em.current_copy_count, 0),
-                        COALESCE(om.present_copy_count, em.present_copy_count, 0),
-                        COALESCE(om.last_seen_time_utc_ms, em.last_seen_time_utc_ms),
-                        COALESCE(om.last_verified_time_utc_ms, em.last_verified_time_utc_ms)
-                 FROM file_refs f
-                 JOIN collections c ON c.collection_id = f.collection_id
-                 LEFT JOIN objects o ON o.object_id = f.object_id
-                 LEFT JOIN object_copy_metrics om ON om.object_id = f.object_id
-                 LEFT JOIN external_copy_metrics em
-                   ON f.object_id IS NULL AND em.external_identity_id = f.external_identity_id
-                 WHERE f.file_ref_id = ?1",
-                [file_ref_id],
-                file_summary_from_row,
-            )
+        let _read_transaction = connection
+            .unchecked_transaction()
+            .map_err(|source| sqlite_error(self.path(), source))?;
+        let mut file = connection
+            .query_row(FILE_REVIEW_SQL, [file_ref_id], file_summary_from_row)
             .optional()
             .map_err(|source| sqlite_error(self.path(), source))?
             .ok_or_else(|| ReviewError::NotFound {
                 kind: "file",
                 id: file_ref_id.to_owned(),
             })?;
+        populate_file_metrics(
+            &connection,
+            self.path(),
+            std::slice::from_mut(&mut file),
+            true,
+        )?;
         let (external_namespace, external_key) = file
             .external_identity_id
             .as_ref()
@@ -1177,29 +1009,12 @@ impl V2ProjectionDb {
             .map_or((None, None), |(namespace, key)| {
                 (Some(namespace), Some(key))
             });
+        let copy_query = file_review_copies_sql(
+            file.object_id.is_some(),
+            file.external_identity_id.is_some(),
+        );
         let mut statement = connection
-            .prepare(
-                "SELECT cc.copy_claim_id, cc.state, cc.claim_basis,
-                        cc.relative_path_encoding, cc.relative_path_bytes,
-                        cc.relative_path_display, l.location_id, l.display_name,
-                        l.kind, l.status, l.archive_root_id, ar.display_name,
-                        l.device_id, d.display_name, d.identity_state,
-                        COALESCE(l.site_id, d.current_site_id), s.display_name,
-                        l.encryption_state, l.trust_level, l.expected_availability,
-                        cc.last_seen_time_utc_ms, cc.last_verified_time_utc_ms,
-                        cc.last_verification_result, cc.last_error_code, cc.last_error_detail
-                 FROM copy_claims cc
-                 JOIN locations l ON l.location_id = cc.location_id
-                 LEFT JOIN archive_roots ar ON ar.archive_root_id = l.archive_root_id
-                 LEFT JOIN devices d ON d.device_id = l.device_id
-                 LEFT JOIN sites s ON s.site_id = COALESCE(l.site_id, d.current_site_id)
-                 WHERE cc.state != 'superseded'
-                   AND ((?1 IS NOT NULL AND cc.object_id = ?1)
-                     OR (?1 IS NULL AND ?2 IS NOT NULL AND cc.external_identity_id = ?2))
-                 ORDER BY l.display_name, cc.relative_path_encoding,
-                          cc.relative_path_bytes, cc.copy_claim_id
-                 LIMIT ?3",
-            )
+            .prepare(&copy_query)
             .map_err(|source| sqlite_error(self.path(), source))?;
         let mut copies = statement
             .query_map(
@@ -1723,6 +1538,317 @@ fn freeze_file_query_time(filter: &mut FileFilter, cursor: Option<&FileToken>) -
     Ok(())
 }
 
+const FILE_REVIEW_SQL: &str = "SELECT f.file_ref_id, f.collection_id, c.display_name,
+                        f.logical_path_encoding, f.logical_path_bytes,
+                        f.logical_path_display, f.identity_state, f.object_id,
+                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
+                        0, 0, NULL, NULL
+                 FROM file_refs f
+                 JOIN collections c ON c.collection_id = f.collection_id
+                 LEFT JOIN objects o ON o.object_id = f.object_id
+                 WHERE f.file_ref_id = ?1";
+
+const FILE_REVIEW_COPIES_SQL: &str = "SELECT cc.copy_claim_id, cc.state, cc.claim_basis,
+                        cc.relative_path_encoding, cc.relative_path_bytes,
+                        cc.relative_path_display, l.location_id, l.display_name,
+                        l.kind, l.status, l.archive_root_id, ar.display_name,
+                        l.device_id, d.display_name, d.identity_state,
+                        COALESCE(l.site_id, d.current_site_id), s.display_name,
+                        l.encryption_state, l.trust_level, l.expected_availability,
+                        cc.last_seen_time_utc_ms, cc.last_verified_time_utc_ms,
+                        cc.last_verification_result, cc.last_error_code, cc.last_error_detail
+                 FROM copy_claims cc
+                 JOIN locations l ON l.location_id = cc.location_id
+                 LEFT JOIN archive_roots ar ON ar.archive_root_id = l.archive_root_id
+                 LEFT JOIN devices d ON d.device_id = l.device_id
+                 LEFT JOIN sites s ON s.site_id = COALESCE(l.site_id, d.current_site_id)
+                 WHERE cc.state != 'superseded'
+                   AND {identity_filter}
+                 ORDER BY l.display_name, cc.relative_path_encoding,
+                          cc.relative_path_bytes, cc.copy_claim_id
+                 LIMIT ?3";
+
+const FILE_FIND_SQL: &str = "SELECT f.file_ref_id, f.collection_id, c.display_name,
+                        f.logical_path_encoding, f.logical_path_bytes,
+                        f.logical_path_display, f.identity_state, f.object_id,
+                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
+                        0, 0, NULL, NULL
+                 FROM file_refs f
+                 JOIN collections c ON c.collection_id = f.collection_id
+                 LEFT JOIN objects o ON o.object_id = f.object_id
+                 WHERE f.path_state = 'active'
+                   AND {collection_filter}
+                   AND {exact_filter}
+                   AND {prefix_filter}
+                   AND (?7 IS NULL OR f.identity_state = ?7)
+                   AND {object_filter}
+                   AND {external_filter}
+                   AND (json_array_length(?15) = 0 OR (
+                     f.object_id IS NOT NULL AND f.identity_state = 'resolved'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?15) g
+                       WHERE EXISTS (
+                         SELECT 1 FROM copy_claims cc
+                         WHERE cc.object_id = f.object_id AND cc.state = 'present'
+                           AND cc.location_id IN (SELECT value FROM json_each(g.value, '$.location_ids'))
+                           AND (json_extract(g.value, '$.verified_within_ms') IS NULL OR (
+                             cc.last_verification_result = 'ok'
+                             AND cc.last_verified_time_utc_ms BETWEEN
+                               MAX(0, ?16 - json_extract(g.value, '$.verified_within_ms')) AND ?16
+                           ))
+                       ) = json_extract(g.value, '$.negated')
+                     )
+                     AND (?17 IS NULL OR EXISTS (
+                       SELECT 1 FROM path_observations po
+                       JOIN copy_claims src ON src.location_id = po.location_id
+                         AND src.object_id = po.object_id AND src.state = 'present'
+                         AND ((src.relative_path_encoding = po.observed_path_encoding
+                           AND src.relative_path_bytes = po.observed_path_bytes)
+                           OR (po.representation = 'annex_locked_symlink'
+                             AND src.external_identity_id = po.external_identity_id))
+                       WHERE po.file_ref_id = f.file_ref_id AND po.object_id = f.object_id
+                         AND po.state = 'present'
+                         AND po.location_id IN (SELECT value FROM json_each(?17))
+                         AND (?18 IS NULL OR (src.last_verification_result = 'ok'
+                           AND src.last_verified_time_utc_ms BETWEEN MAX(0, ?16 - ?18) AND ?16))
+                     ))
+                   ))
+                   AND {cursor_filter}
+                 ORDER BY {file_order}
+                 LIMIT ?14";
+
+const V2_FILE_FIND_SQL: &str = "SELECT f.file_ref_id, f.collection_id, c.display_name,
+                        f.logical_path_encoding, f.logical_path_bytes,
+                        f.logical_path_display, f.identity_state, f.object_id,
+                        f.external_identity_id, COALESCE(o.size_bytes, f.observed_size_bytes),
+                        0, 0, NULL, NULL
+                 FROM collections c
+                 CROSS JOIN file_objects native_file {file_index} ON native_file.collection_id = c.id
+                 JOIN file_refs f ON f.file_ref_id = native_file.canonical_id
+                 LEFT JOIN objects o ON o.object_id = f.object_id
+                 WHERE native_file.active = 1
+                   AND {collection_filter}
+                   AND {exact_filter}
+                   AND {prefix_filter}
+                   AND (?7 IS NULL OR f.identity_state = ?7)
+                   AND {object_filter}
+                   AND {external_filter}
+                   AND (json_array_length(?15) = 0 OR (
+                     native_file.content_id IS NOT NULL AND native_file.identity_state = 'resolved'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?15) g
+                       WHERE EXISTS (
+                         SELECT 1 FROM copy_bindings member
+                         JOIN locations member_location ON member_location.id = member.location_id
+                         WHERE member.content_id = native_file.content_id AND member.state = 'present'
+                           AND member_location.location_id IN (SELECT value FROM json_each(g.value, '$.location_ids'))
+                           AND (json_extract(g.value, '$.verified_within_ms') IS NULL OR EXISTS (
+                             SELECT 1 FROM checks verified LEFT JOIN check_errors error ON error.check_id = verified.id
+                             WHERE verified.id = member.latest_integrity AND verified.integrity = 1
+                               AND (error.code IS NULL OR error.code NOT IN ('read_error','identity_mismatch'))
+                               AND verified.checked_at BETWEEN
+                                 MAX(0, ?16 - json_extract(g.value, '$.verified_within_ms')) AND ?16
+                           ))
+                       ) = json_extract(g.value, '$.negated')
+                     )
+                     AND (?17 IS NULL OR EXISTS (
+                       SELECT 1 FROM file_locations binding
+                       JOIN locations source_location ON source_location.id = binding.location_id
+                       JOIN copy_bindings physical ON physical.id = binding.copy_id
+                       WHERE binding.file_id = native_file.id AND binding.presence = 1
+                         AND binding.representation != 'annex_content'
+                         AND (binding.content_id IS NULL OR binding.content_id = native_file.content_id)
+                         AND physical.location_id = binding.location_id
+                         AND physical.content_id = native_file.content_id AND physical.state = 'present'
+                         AND source_location.location_id IN (SELECT value FROM json_each(?17))
+                         AND (?18 IS NULL OR EXISTS (
+                           SELECT 1 FROM checks verified LEFT JOIN check_errors error ON error.check_id = verified.id
+                           WHERE verified.id = physical.latest_integrity AND verified.integrity = 1
+                             AND (error.code IS NULL OR error.code NOT IN ('read_error','identity_mismatch'))
+                             AND verified.checked_at BETWEEN MAX(0, ?16 - ?18) AND ?16
+                         ))
+                     ))
+                   ))
+                   AND {cursor_filter}
+                 ORDER BY {file_order}
+                 LIMIT ?14";
+
+// Use concrete predicates so the compact active-path index can seek directly.
+// Optional-parameter OR predicates prevent SQLite from proving those bounds.
+fn file_find_sql(filter: &FileFilter, v2: bool, has_cursor: bool) -> String {
+    let mut query = if v2 { V2_FILE_FIND_SQL } else { FILE_FIND_SQL }.to_owned();
+    let collection = if filter.collection_id.is_none() {
+        "1"
+    } else if v2 {
+        "c.collection_id = ?1"
+    } else {
+        "f.collection_id = ?1"
+    };
+    query = query.replace("{collection_filter}", collection);
+    let exact = if filter.exact_path.is_none() {
+        "1"
+    } else if v2 {
+        "(native_file.path_encoding = ?2 AND native_file.path_bytes = ?3)"
+    } else {
+        "(f.logical_path_encoding = ?2 AND f.logical_path_bytes = ?3)"
+    };
+    query = query.replace("{exact_filter}", exact);
+    let prefix = if filter.path_prefix.is_none() {
+        "1"
+    } else if v2 {
+        "(native_file.path_encoding = ?4 AND native_file.path_bytes >= ?5 AND (?6 IS NULL OR native_file.path_bytes < ?6))"
+    } else {
+        "(f.logical_path_encoding = ?4 AND f.logical_path_bytes >= ?5 AND (?6 IS NULL OR f.logical_path_bytes < ?6))"
+    };
+    query = query.replace("{prefix_filter}", prefix);
+    let object = if filter.object_id.is_none() {
+        "1"
+    } else if v2 {
+        "native_file.content_id = (SELECT id FROM content_objects WHERE object_id = ?8)"
+    } else {
+        "f.object_id = ?8"
+    };
+    let external = if filter.external_identity_id.is_none() {
+        "1"
+    } else if v2 {
+        "native_file.external_id = (SELECT id FROM source_identities WHERE canonical_id = ?9)"
+    } else {
+        "f.external_identity_id = ?9"
+    };
+    let scoped = filter.collection_id.is_some();
+    let order = if v2 && scoped {
+        "native_file.path_encoding, native_file.path_bytes"
+    } else if v2 {
+        "c.collection_id, native_file.path_encoding, native_file.path_bytes"
+    } else {
+        "f.collection_id, f.logical_path_encoding, f.logical_path_bytes, f.file_ref_id"
+    };
+    let cursor = if !has_cursor {
+        "1"
+    } else if v2 && scoped {
+        "(native_file.path_encoding, native_file.path_bytes) > (?11, ?12)"
+    } else if v2 {
+        // Each Collection drives an indexed path range. The inclusive minimum
+        // for later Collections includes every encoded path, including empty bytes.
+        "c.collection_id >= ?10
+         AND (native_file.path_encoding, native_file.path_bytes) >=
+           (CASE WHEN c.collection_id = ?10 THEN ?11 ELSE '' END,
+            CASE WHEN c.collection_id = ?10 THEN ?12 ELSE X'' END)
+         AND (c.collection_id != ?10 OR (native_file.path_encoding, native_file.path_bytes) > (?11, ?12))"
+    } else {
+        "(f.collection_id, f.logical_path_encoding, f.logical_path_bytes, f.file_ref_id) > (?10, ?11, ?12, ?13)"
+    };
+    // An identity-only lookup must not choose the ordering index and walk
+    // unrelated paths. Exact/prefix queries retain their selective path range.
+    let file_index = if filter.exact_path.is_none() && filter.path_prefix.is_none() {
+        if filter.object_id.is_some() {
+            "INDEXED BY compact_file_content"
+        } else if filter.external_identity_id.is_some() {
+            "INDEXED BY compact_file_external"
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
+    query
+        .replace("{file_index}", file_index)
+        .replace("{object_filter}", object)
+        .replace("{external_filter}", external)
+        .replace("{cursor_filter}", cursor)
+        .replace("{file_order}", order)
+}
+
+fn file_review_copies_sql(has_object: bool, has_external: bool) -> String {
+    FILE_REVIEW_COPIES_SQL.replace(
+        "{identity_filter}",
+        if has_object {
+            "cc.object_id = ?1"
+        } else if has_external {
+            "cc.external_identity_id = ?2"
+        } else {
+            "0"
+        },
+    )
+}
+
+fn file_metrics_sql(v2: bool, object: bool) -> &'static str {
+    match (v2, object) {
+        (true, true) => "SELECT COUNT(*), COALESCE(SUM(b.state='present'),0), MAX(p.checked_at), MAX(v.checked_at)
+          FROM copy_bindings b LEFT JOIN checks p ON p.id=b.latest_presence
+          LEFT JOIN checks v ON v.id=b.latest_integrity
+          WHERE b.content_id=(SELECT id FROM content_objects WHERE object_id=?1) AND b.state!='superseded'",
+        (true, false) => "SELECT COUNT(*), COALESCE(SUM(b.state='present'),0), MAX(p.checked_at), MAX(v.checked_at)
+          FROM copy_bindings b LEFT JOIN checks p ON p.id=b.latest_presence
+          LEFT JOIN checks v ON v.id=b.latest_integrity
+          WHERE b.external_id=(SELECT id FROM source_identities WHERE canonical_id=?1)
+            AND b.content_id IS NULL AND b.state!='superseded'",
+        (false, true) => "SELECT COUNT(*), COALESCE(SUM(state='present'),0), MAX(last_seen_time_utc_ms), MAX(last_verified_time_utc_ms)
+          FROM copy_claims WHERE object_id=?1 AND state!='superseded'",
+        (false, false) => "SELECT COUNT(*), COALESCE(SUM(state='present'),0), MAX(last_seen_time_utc_ms), MAX(last_verified_time_utc_ms)
+          FROM copy_claims WHERE external_identity_id=?1 AND object_id IS NULL AND state!='superseded'",
+    }
+}
+
+type FileCopyMetrics = (u64, u64, Option<u64>, Option<u64>);
+
+fn file_metrics_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileCopyMetrics> {
+    Ok((
+        sql_u64_sql(row.get(0)?)?,
+        sql_u64_sql(row.get(1)?)?,
+        optional_u64(row.get(2)?)?,
+        optional_u64(row.get(3)?)?,
+    ))
+}
+
+// Copy summaries belong to the returned page, not to every identity in the
+// catalog. Aliases of one identity reuse the same indexed lookup within a page.
+fn populate_file_metrics(
+    connection: &Connection,
+    path: &Path,
+    items: &mut [FileSummary],
+    v2: bool,
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut objects = connection
+        .prepare(file_metrics_sql(v2, true))
+        .map_err(|source| sqlite_error(path, source))?;
+    let mut externals = connection
+        .prepare(file_metrics_sql(v2, false))
+        .map_err(|source| sqlite_error(path, source))?;
+    let mut cache = BTreeMap::new();
+    for item in items {
+        let identity = item
+            .object_id
+            .as_ref()
+            .map(|id| (true, id))
+            .or_else(|| item.external_identity_id.as_ref().map(|id| (false, id)));
+        let Some((object, id)) = identity else {
+            continue;
+        };
+        let key = (object, id.clone());
+        let metrics = if let Some(metrics) = cache.get(&key) {
+            *metrics
+        } else {
+            let statement = if object { &mut objects } else { &mut externals };
+            let metrics = statement
+                .query_row([id], file_metrics_from_row)
+                .map_err(|source| sqlite_error(path, source))?;
+            cache.insert(key, metrics);
+            metrics
+        };
+        (
+            item.current_copy_count,
+            item.present_copy_count,
+            item.last_seen_time_utc_ms,
+            item.last_verified_time_utc_ms,
+        ) = metrics;
+    }
+    Ok(())
+}
+
 fn populate_matching_sources(
     connection: &Connection,
     path: &Path,
@@ -1757,12 +1883,17 @@ fn populate_matching_sources(
     } else {
         "po.observed_path_encoding, po.observed_path_bytes, po.observed_path_display"
     };
+    let observation_identity = if v2 {
+        "(po.object_id IS NULL OR po.object_id = ?2)"
+    } else {
+        "po.object_id = ?2"
+    };
     let query = format!(
         "SELECT DISTINCT po.location_id, l.display_name, {source_path_columns}
          FROM path_observations po JOIN locations l ON l.location_id = po.location_id
          JOIN copy_claims cc ON cc.location_id = po.location_id
-           AND cc.object_id = po.object_id AND cc.state = 'present'
-         WHERE po.file_ref_id = ?1 AND po.object_id = ?2 AND po.state = 'present'
+           AND cc.object_id = ?2 AND cc.state = 'present'
+         WHERE po.file_ref_id = ?1 AND {observation_identity} AND po.state = 'present'
            AND po.location_id IN (SELECT value FROM json_each(?3))
            {binding_clause}
            AND (?4 IS NULL OR (cc.last_verification_result = 'ok'
@@ -2165,6 +2296,530 @@ mod tests {
         )
     }
 
+    fn exact_find_work(
+        connection: &Connection,
+        query: &str,
+        path: &str,
+        metrics: bool,
+        grouped: bool,
+    ) -> (Vec<FileSummary>, i32) {
+        use rusqlite::{types::Value, StatementStatus};
+        let mut parameters = vec![Value::Null; 18];
+        parameters[0] = Value::Text("collection_1".into());
+        parameters[1] = Value::Text("utf8".into());
+        parameters[2] = Value::Blob(path.as_bytes().to_vec());
+        parameters[13] = Value::Integer(101);
+        parameters[14] = Value::Text(
+            if grouped {
+                r#"[{"location_ids":["source"],"negated":false,"verified_within_ms":null}]"#
+            } else {
+                "[]"
+            }
+            .into(),
+        );
+        if grouped {
+            parameters[16] = Value::Text(r#"["source"]"#.into());
+        }
+        let mut statement = connection.prepare(query).unwrap();
+        let items = statement
+            .query_map(
+                rusqlite::params_from_iter(parameters),
+                file_summary_from_row,
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut steps = statement.get_status(StatementStatus::VmStep);
+        if metrics {
+            for item in &items {
+                if let Some(identity) = item
+                    .object_id
+                    .as_ref()
+                    .or(item.external_identity_id.as_ref())
+                {
+                    let mut statement = connection
+                        .prepare(file_metrics_sql(true, item.object_id.is_some()))
+                        .unwrap();
+                    statement
+                        .query_row([identity], file_metrics_from_row)
+                        .unwrap();
+                    steps += statement.get_status(StatementStatus::VmStep);
+                }
+            }
+        }
+        (items, steps)
+    }
+
+    #[test]
+    fn paged_copy_metrics_preserve_identity_and_lifecycle_semantics() {
+        let temp = TempDir::new().unwrap();
+        let (_, database, _) = seeded_v2_database(&temp);
+        let connection = Connection::open(database.path()).unwrap();
+        connection.execute_batch("INSERT INTO sites(site_id,display_name,site_kind,status,last_record_id)
+            VALUES ('site_test','Test','home','active','seed');
+            INSERT INTO locations(location_id,display_name,kind,site_id,expected_availability,status,created_record_id,last_record_id)
+            VALUES ('source','Source','service','site_test','offline','active','seed','seed');
+            INSERT INTO source_identities(canonical_id,namespace,source_key,resolution,first_record)
+            VALUES ('external_test','git-annex','test-key','unresolved',(SELECT MIN(id) FROM records));
+            INSERT INTO file_objects(canonical_id,collection_id,path_encoding,path_bytes,external_id,identity_state,first_record,last_record)
+            SELECT 'file_external',c.id,'utf8',CAST('external' AS BLOB),e.id,'unresolved',r.id,r.id
+            FROM collections c,source_identities e,records r WHERE r.id=(SELECT MIN(id) FROM records);
+            INSERT INTO content_objects(digest,size_bytes,first_record,first_time)
+            VALUES (zeroblob(32),20,(SELECT MIN(id) FROM records),100);
+            INSERT INTO file_objects(canonical_id,collection_id,path_encoding,path_bytes,content_id,external_id,identity_state,first_record,last_record)
+            SELECT 'file_no_copies',c.id,'utf8',CAST('no-copies' AS BLOB),o.id,e.id,'resolved',r.id,r.id
+            FROM collections c,source_identities e,content_objects o,records r
+            WHERE o.digest=zeroblob(32) AND r.id=(SELECT MIN(id) FROM records);
+            INSERT INTO file_locations(file_id,location_id,representation,content_id,external_id,presence,first_record,last_record,seen_time)
+            SELECT f.id,l.id,'ordinary_file',f.content_id,f.external_id,1,f.first_record,f.last_record,300
+            FROM file_objects f,locations l WHERE f.canonical_id IN ('file_a','file_external');
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,external_id,basis,state,first_record,state_record)
+            SELECT 'copy_present',p.id,p.location_id,randomblob(32),p.content_id,(SELECT id FROM source_identities),
+              'observed_bytes','present',p.first_record,p.last_record
+            FROM file_locations p JOIN file_objects f ON f.id=p.file_id WHERE f.canonical_id='file_a';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record)
+            SELECT 'copy_missing',owner,location_id,randomblob(32),content_id,basis,'missing',first_record,state_record
+            FROM copy_bindings WHERE canonical_id='copy_present';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record)
+            SELECT 'copy_superseded',owner,location_id,randomblob(32),content_id,basis,'superseded',first_record,state_record
+            FROM copy_bindings WHERE canonical_id='copy_present';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,external_id,basis,state,first_record,state_record)
+            SELECT 'copy_external',p.id,p.location_id,randomblob(32),p.external_id,'source_metadata','unknown',p.first_record,p.last_record
+            FROM file_locations p JOIN file_objects f ON f.id=p.file_id WHERE f.canonical_id='file_external';
+            INSERT INTO checks(file_location_id,checked_at,presence,integrity)
+            SELECT owner,240,1,1 FROM copy_bindings WHERE canonical_id='copy_present';
+            UPDATE copy_bindings SET latest_presence=(SELECT MIN(id) FROM checks),latest_integrity=(SELECT MIN(id) FROM checks)
+              WHERE canonical_id='copy_present';
+            INSERT INTO checks(file_location_id,checked_at,presence,integrity)
+            SELECT owner,999,1,1 FROM copy_bindings WHERE canonical_id='copy_superseded';
+            UPDATE copy_bindings SET latest_presence=(SELECT MAX(id) FROM checks),latest_integrity=(SELECT MAX(id) FROM checks)
+              WHERE canonical_id='copy_superseded';").unwrap();
+        let page = database
+            .find_files(FilePageRequest {
+                filter: FileFilter::default(),
+                limit: 100,
+                continuation: None,
+            })
+            .unwrap();
+        for item in &page.items {
+            // Listing and single-file review must expose the same public summary.
+            assert_eq!(*item, database.review_file(&item.file_ref_id).unwrap().file);
+        }
+        let object = page
+            .items
+            .iter()
+            .find(|item| item.file_ref_id == "file_a")
+            .unwrap();
+        assert_eq!(
+            (object.current_copy_count, object.present_copy_count),
+            (2, 1)
+        );
+        assert_eq!(object.last_verified_time_utc_ms, Some(240));
+        let external = page
+            .items
+            .iter()
+            .find(|item| item.file_ref_id == "file_external")
+            .unwrap();
+        assert_eq!(
+            (external.current_copy_count, external.present_copy_count),
+            (1, 0)
+        );
+        let no_copies = page
+            .items
+            .iter()
+            .find(|item| item.file_ref_id == "file_no_copies")
+            .unwrap();
+        assert_eq!(
+            no_copies.current_copy_count, 0,
+            "resolved identities must not fall back to external-only copies"
+        );
+        assert_eq!(no_copies.last_verified_time_utc_ms, None);
+    }
+
+    fn file_show_work(connection: &Connection, file_ref_id: &str) -> i32 {
+        use rusqlite::StatementStatus;
+        let mut statement = connection.prepare(FILE_REVIEW_SQL).unwrap();
+        let file = statement
+            .query_row([file_ref_id], file_summary_from_row)
+            .unwrap();
+        let mut steps = statement.get_status(StatementStatus::VmStep);
+        if let Some(identity) = file
+            .object_id
+            .as_ref()
+            .or(file.external_identity_id.as_ref())
+        {
+            let mut statement = connection
+                .prepare(file_metrics_sql(true, file.object_id.is_some()))
+                .unwrap();
+            statement
+                .query_row([identity], file_metrics_from_row)
+                .unwrap();
+            steps += statement.get_status(StatementStatus::VmStep);
+        }
+        let query = file_review_copies_sql(
+            file.object_id.is_some(),
+            file.external_identity_id.is_some(),
+        );
+        let mut statement = connection.prepare(&query).unwrap();
+        statement
+            .query_map(
+                params![file.object_id, file.external_identity_id, 1001],
+                copy_review_from_row,
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        steps += statement.get_status(StatementStatus::VmStep);
+        steps
+    }
+
+    fn object_find_work(connection: &Connection, object_id: &str) -> i32 {
+        use rusqlite::{types::Value, StatementStatus};
+        let filter = FileFilter {
+            object_id: Some(object_id.into()),
+            ..Default::default()
+        };
+        let query = file_find_sql(&filter, true, false);
+        let mut parameters = vec![Value::Null; 18];
+        parameters[7] = Value::Text(object_id.into());
+        parameters[13] = Value::Integer(101);
+        parameters[14] = Value::Text("[]".into());
+        let mut statement = connection.prepare(&query).unwrap();
+        let items = statement
+            .query_map(
+                rusqlite::params_from_iter(parameters),
+                file_summary_from_row,
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        statement.get_status(StatementStatus::VmStep)
+    }
+
+    fn add_bulk_review_copies(connection: &Connection, start: u64, count: u64) {
+        let end = start + count - 1;
+        let transaction = connection.unchecked_transaction().unwrap();
+        transaction.execute_batch(&format!("WITH RECURSIVE n(x) AS (SELECT {start} UNION ALL SELECT x+1 FROM n WHERE x<{end})
+            INSERT INTO content_objects(digest,size_bytes,first_record,first_time)
+            SELECT unhex(printf('%064x',x)),42,(SELECT MIN(id) FROM records),{start} FROM n;
+            INSERT INTO file_objects(canonical_id,collection_id,path_encoding,path_bytes,content_id,identity_state,first_record,last_record)
+            SELECT printf('bulk_%d',c.id),(SELECT id FROM collections WHERE collection_id='collection_1'),
+              'utf8',CAST(printf('bulk/%012d.dat',c.id) AS BLOB),c.id,'resolved',c.first_record,c.first_record
+            FROM content_objects c WHERE c.first_time={start};
+            INSERT INTO file_locations(file_id,location_id,representation,content_id,presence,first_record,last_record,seen_time)
+            SELECT f.id,(SELECT id FROM locations WHERE location_id='source'),'ordinary_file',f.content_id,1,f.first_record,f.last_record,{start}
+            FROM file_objects f JOIN content_objects c ON c.id=f.content_id WHERE c.first_time={start};
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record)
+            SELECT printf('copy_%d',p.id),p.id,p.location_id,randomblob(32),p.content_id,'observed_bytes','present',p.first_record,p.last_record
+            FROM file_locations p WHERE p.seen_time={start};
+            UPDATE file_locations SET copy_id=(SELECT id FROM copy_bindings WHERE canonical_id=printf('copy_%d',file_locations.id))
+            WHERE seen_time={start};")).unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn whole_collection_filter() -> FileFilter {
+        FileFilter {
+            collection_id: Some("collection_1".into()),
+            location_groups: vec![
+                FileLocationGroup {
+                    location_ids: vec!["source".into()],
+                    negated: false,
+                    verified_within_ms: None,
+                },
+                FileLocationGroup {
+                    location_ids: vec!["backup".into()],
+                    negated: true,
+                    verified_within_ms: None,
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn grouped_collection_work(connection: &Connection, scoped: bool) -> (usize, i64) {
+        use rusqlite::{types::Value, StatementStatus};
+        let mut filter = whole_collection_filter();
+        if !scoped {
+            filter.collection_id = None;
+        }
+        let mut cursor: Option<FileSummary> = None;
+        let mut count = 0;
+        let mut steps = 0_i64;
+        loop {
+            let query = file_find_sql(&filter, true, cursor.is_some());
+            let mut parameters = vec![Value::Null; 18];
+            if scoped {
+                parameters[0] = Value::Text("collection_1".into());
+            }
+            parameters[13] = Value::Integer(1001);
+            parameters[14] = Value::Text(serde_json::to_string(&filter.location_groups).unwrap());
+            parameters[16] = Value::Text(r#"["source"]"#.into());
+            if let Some(cursor) = &cursor {
+                parameters[9] = Value::Text(cursor.collection_id.clone());
+                parameters[10] = Value::Text(cursor.logical_path.encoding.clone());
+                parameters[11] = Value::Blob(
+                    cursor
+                        .logical_path
+                        .text
+                        .as_ref()
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec(),
+                );
+                parameters[12] = Value::Text(cursor.file_ref_id.clone());
+            }
+            let mut statement = connection.prepare(&query).unwrap();
+            let mut items = statement
+                .query_map(
+                    rusqlite::params_from_iter(parameters),
+                    file_summary_from_row,
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            steps += i64::from(statement.get_status(StatementStatus::VmStep));
+            let more = items.len() > 1000;
+            items.truncate(1000);
+            count += items.len();
+            if !more {
+                break;
+            }
+            cursor = items.pop();
+        }
+        (count, steps)
+    }
+
+    #[test]
+    fn grouped_collection_pages_seek_without_repeated_catalog_scans() {
+        let temp = TempDir::new().unwrap();
+        let (_, database, _) = seeded_v2_database(&temp);
+        let connection = Connection::open(database.path()).unwrap();
+        connection.execute_batch("INSERT INTO sites(site_id,display_name,site_kind,status,last_record_id)
+            VALUES ('site_test','Test','home','active','seed');
+            INSERT INTO locations(location_id,display_name,kind,site_id,expected_availability,status,created_record_id,last_record_id)
+            VALUES ('source','Source','service','site_test','offline','active','seed','seed'),
+              ('backup','Backup','service','site_test','offline','active','seed','seed');").unwrap();
+        add_bulk_review_copies(&connection, 10000, 5000);
+        let (small_count, small_steps) = grouped_collection_work(&connection, true);
+        let (_, small_unscoped_steps) = grouped_collection_work(&connection, false);
+        add_bulk_review_copies(&connection, 20000, 5000);
+        let (large_count, large_steps) = grouped_collection_work(&connection, true);
+        let (_, large_unscoped_steps) = grouped_collection_work(&connection, false);
+        eprintln!(
+            "unscoped complete-list VM steps: {small_unscoped_steps} -> {large_unscoped_steps}"
+        );
+        assert!(large_unscoped_steps < small_unscoped_steps * 23 / 10);
+        assert_eq!((small_count, large_count), (5000, 10000));
+        eprintln!("grouped complete-list VM steps: 5000={small_steps}, 10000={large_steps}");
+        assert!(
+            large_steps < small_steps * 23 / 10,
+            "pagination should scale linearly, not re-sort/rescan the catalog for each page"
+        );
+    }
+
+    #[test]
+    fn annex_metadata_refresh_keeps_resolved_bound_copy_findable() {
+        use crate::registry::RegistryPath;
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("annex-refresh");
+        initialize_v2_archive(&archive, "arc_metadata_review", "Files", 1_782_000_000_000).unwrap();
+        let store = V2OriginStore::open(archive.join("canonical")).unwrap();
+        let path = archive.join("archive.db");
+        V2ProjectionDb::create_from_store(&store, &path).unwrap();
+        let database = V2ProjectionDb::open_existing(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("INSERT INTO collections(collection_id,display_name,status,last_record_id)
+            VALUES ('collection_1','Files','active','seed');
+            INSERT INTO sites(site_id,display_name,site_kind,status,last_record_id)
+            VALUES ('site_test','Test','home','active','seed');
+            INSERT INTO locations(location_id,display_name,kind,site_id,expected_availability,status,created_record_id,last_record_id)
+            VALUES ('source','Source','service','site_test','offline','active','seed','seed'),
+              ('backup','Backup','service','site_test','offline','active','seed','seed');").unwrap();
+        let hash = "11".repeat(32);
+        let mut entry = json!({
+            "kind":"annex_entry_observed", "operation_key":"metadata_initial",
+            "collection_id":"collection_1", "file_ref_id":"file_metadata",
+            "logical_path":RegistryPath::utf8("worktree-file"),
+            "external_identity_id":"external_metadata", "external_key":"SHA256-key",
+            "expected_hash_algo":"sha256", "expected_hash_hex":hash,
+            "expected_size_bytes":42, "observed_size_bytes":42, "resolution_state":"resolved",
+            "worktree_location_id":"source", "cas_location_id":"source", "source_repo_id":"repo",
+            "representation":"annex_locked_symlink", "path_state":"present", "local_availability":"present",
+            "object_id":format!("blake3:{hash}"), "blake3_hex":hash, "sha256_hex":hash,
+            "claim_basis":"observed_bytes", "copy_claim_id":"copy_metadata", "copy_location_id":"source",
+            "copy_path":RegistryPath::utf8("objects/content"), "copy_state":"present", "verification_result":"ok"
+        });
+        store
+            .append_batch("annex_import", 1, json!({}), json!({}), vec![entry.clone()])
+            .unwrap();
+        database.apply(&store).unwrap();
+        entry["operation_key"] = json!("metadata_refresh");
+        for field in [
+            "object_id",
+            "blake3_hex",
+            "sha256_hex",
+            "verification_result",
+        ] {
+            entry[field] = serde_json::Value::Null;
+        }
+        entry["claim_basis"] = json!("source_metadata");
+        entry["copy_state"] = json!("unknown");
+        entry["resolution_state"] = json!("unresolved");
+        store
+            .append_batch("annex_inventory", 1, json!({}), json!({}), vec![entry])
+            .unwrap();
+        database.apply(&store).unwrap();
+        let evidence: (String, Option<i64>, String) = connection
+            .query_row(
+                "SELECT f.identity_state,p.content_id,b.state FROM file_objects f
+             JOIN file_locations p ON p.file_id=f.id JOIN copy_bindings b ON b.id=p.copy_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(evidence, ("resolved".into(), None, "present".into()));
+        let request = || FilePageRequest {
+            filter: whole_collection_filter(),
+            limit: 100,
+            continuation: None,
+        };
+        let found = database.find_files(request()).unwrap();
+        assert_eq!(found.items.len(), 1);
+        assert_eq!(
+            found.items[0].matching_sources[0]
+                .relative_path
+                .text
+                .as_deref(),
+            Some("worktree-file")
+        );
+        assert_eq!(database.find_file_paths(request()).unwrap().paths.len(), 1);
+        connection.execute_batch("INSERT INTO content_objects(digest,size_bytes,first_record,first_time)
+            VALUES (zeroblob(32),42,(SELECT MIN(id) FROM records),1);
+            UPDATE file_locations SET content_id=(SELECT id FROM content_objects WHERE digest=zeroblob(32));").unwrap();
+        assert!(
+            database.find_files(request()).unwrap().items.is_empty(),
+            "known path identity mismatches still exclude the source"
+        );
+        assert!(database
+            .find_file_paths(request())
+            .unwrap()
+            .paths
+            .is_empty());
+    }
+
+    #[test]
+    fn unscoped_path_pages_cross_collection_boundaries_in_canonical_order() {
+        let temp = TempDir::new().unwrap();
+        let (_, database, _) = seeded_v2_database(&temp);
+        let connection = Connection::open(database.path()).unwrap();
+        // Allocate the lexically earlier Collection later, so local integer
+        // identity cannot accidentally stand in for canonical Collection order.
+        connection.execute_batch("INSERT INTO collections(collection_id,display_name,status,last_record_id)
+            VALUES ('collection_0','Earlier','active','seed');
+            WITH paths(name,path) AS (VALUES ('earlier_empty',''),('earlier_a','a.jpg'))
+            INSERT INTO file_objects(canonical_id,collection_id,path_encoding,path_bytes,identity_state,first_record,last_record)
+            SELECT name,(SELECT id FROM collections WHERE collection_id='collection_0'),'utf8',CAST(path AS BLOB),'unknown',
+              (SELECT MIN(id) FROM records),(SELECT MIN(id) FROM records) FROM paths;").unwrap();
+        let mut continuation = None;
+        let mut paths = Vec::new();
+        loop {
+            let page = database
+                .find_file_paths(FilePageRequest {
+                    filter: FileFilter::default(),
+                    limit: 1,
+                    continuation,
+                })
+                .unwrap();
+            paths.extend(page.paths.into_iter().map(|path| path.text.unwrap()));
+            continuation = page.next;
+            if continuation.is_none() {
+                break;
+            }
+            assert!(paths.len() < 5, "cursor must advance across Collections");
+        }
+        assert_eq!(paths, ["", "a.jpg", "a.jpg", "b.jpg"]);
+    }
+
+    #[test]
+    fn exact_find_work_is_bounded_by_matches_not_unrelated_catalog_rows() {
+        let temp = TempDir::new().unwrap();
+        let (_, database, object_id) = seeded_v2_database(&temp);
+        let connection = Connection::open(database.path()).unwrap();
+        connection.execute_batch("INSERT INTO sites(site_id,display_name,site_kind,status,last_record_id)
+            VALUES ('site_test','Test','home','active','seed');
+            INSERT INTO locations(location_id,display_name,kind,site_id,expected_availability,status,created_record_id,last_record_id)
+            VALUES ('source','Source','service','site_test','offline','active','seed','seed');
+            INSERT INTO file_locations(file_id,location_id,representation,content_id,presence,first_record,last_record,seen_time)
+            SELECT f.id,l.id,'ordinary_file',f.content_id,1,f.first_record,f.last_record,300
+            FROM file_objects f,locations l WHERE f.canonical_id='file_a';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record)
+            SELECT 'copy_a',p.id,p.location_id,zeroblob(32),p.content_id,'observed_bytes','present',p.first_record,p.last_record
+            FROM file_locations p;
+            UPDATE file_locations SET copy_id=(SELECT id FROM copy_bindings);").unwrap();
+        let filter = FileFilter {
+            collection_id: Some("collection_1".into()),
+            exact_path: Some(utf8_path("a.jpg")),
+            ..Default::default()
+        };
+        let query = file_find_sql(&filter, true, false);
+        let small_show_steps = file_show_work(&connection, "file_a");
+        let small_object_steps = object_find_work(&connection, &object_id);
+        let (small, small_steps) = exact_find_work(&connection, &query, "a.jpg", true, false);
+        assert_eq!(small.len(), 1);
+        let (_, small_grouped_steps) = exact_find_work(&connection, &query, "a.jpg", true, true);
+        let (_, small_absent_steps) =
+            exact_find_work(&connection, &query, "absent.jpg", true, false);
+        // Same Collection, distinct content and copies: neither candidate lookup
+        // nor returned-page metrics should visit these unrelated rows.
+        connection.execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5000)
+            INSERT INTO content_objects(digest,size_bytes,first_record,first_time)
+            SELECT unhex(printf('%064x',x)),42,(SELECT MIN(id) FROM records),12345 FROM n;
+            INSERT INTO file_objects(canonical_id,collection_id,path_encoding,path_bytes,content_id,identity_state,first_record,last_record)
+            SELECT printf('bulk_%d',c.id),(SELECT id FROM collections WHERE collection_id='collection_1'),
+              'utf8',CAST(printf('bulk/%d.dat',c.id) AS BLOB),c.id,'resolved',c.first_record,c.first_record
+            FROM content_objects c WHERE c.first_time=12345;
+            INSERT INTO file_locations(file_id,location_id,representation,content_id,presence,first_record,last_record,seen_time)
+            SELECT f.id,(SELECT id FROM locations WHERE location_id='source'),'ordinary_file',f.content_id,1,f.first_record,f.last_record,300
+            FROM file_objects f WHERE f.canonical_id LIKE 'bulk_%';
+            INSERT INTO copy_bindings(canonical_id,owner,location_id,path_key,content_id,basis,state,first_record,state_record)
+            SELECT printf('copy_%d',p.id),p.id,p.location_id,randomblob(32),p.content_id,'observed_bytes','present',p.first_record,p.last_record
+            FROM file_locations p JOIN file_objects f ON f.id=p.file_id WHERE f.canonical_id LIKE 'bulk_%';").unwrap();
+        let large_show_steps = file_show_work(&connection, "file_a");
+        let large_object_steps = object_find_work(&connection, &object_id);
+        eprintln!("show VM steps: {small_show_steps} -> {large_show_steps}; object find: {small_object_steps} -> {large_object_steps}");
+        assert!(large_show_steps <= small_show_steps + 100);
+        assert!(large_object_steps <= small_object_steps + 100);
+        let (large, large_steps) = exact_find_work(&connection, &query, "a.jpg", true, false);
+        let (absent, large_absent_steps) =
+            exact_find_work(&connection, &query, "absent.jpg", true, false);
+        let (_, large_grouped_steps) = exact_find_work(&connection, &query, "a.jpg", true, true);
+        eprintln!("grouped exact VM steps: {small_grouped_steps} -> {large_grouped_steps}");
+        assert!(large_grouped_steps <= small_grouped_steps + 100);
+        assert_eq!(small, large);
+        assert!(absent.is_empty());
+        eprintln!("exact lookup VM steps: {small_steps} -> {large_steps}; absent: {small_absent_steps} -> {large_absent_steps}");
+        assert!(
+            large_steps <= small_steps + 100,
+            "exact lookup grew: {small_steps} -> {large_steps}"
+        );
+        assert!(
+            large_absent_steps <= small_absent_steps + 100,
+            "absent lookup grew: {small_absent_steps} -> {large_absent_steps}"
+        );
+        assert!(large_steps < 1500);
+        let page = database
+            .find_files(FilePageRequest {
+                filter,
+                limit: 100,
+                continuation: None,
+            })
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].current_copy_count, 1);
+        assert_eq!(page.items[0].present_copy_count, 1);
+    }
+
     #[test]
     fn location_groups_use_content_union_negation_and_recent_success() {
         let temp = TempDir::new().unwrap();
@@ -2287,12 +2942,21 @@ mod tests {
             UPDATE copy_bindings SET latest_integrity=(SELECT id FROM checks),latest_presence=(SELECT id FROM checks);").unwrap();
         connection.execute_batch("UPDATE file_locations SET representation='ordinary_file';
             UPDATE copy_bindings SET locator_encoding='utf8',locator_bytes=CAST('nested/a.jpg' AS BLOB),locator_display=NULL;").unwrap();
+        connection.execute("INSERT INTO locations(location_id,display_name,kind,site_id,expected_availability,status,created_record_id,last_record_id)
+            VALUES ('backup','Backup','service','site_test','offline','active','seed','seed')", []).unwrap();
         let filter = FileFilter {
-            location_groups: vec![FileLocationGroup {
-                location_ids: vec!["usb".into()],
-                negated: false,
-                verified_within_ms: Some(60),
-            }],
+            location_groups: vec![
+                FileLocationGroup {
+                    location_ids: vec!["usb".into()],
+                    negated: false,
+                    verified_within_ms: Some(60),
+                },
+                FileLocationGroup {
+                    location_ids: vec!["backup".into()],
+                    negated: true,
+                    verified_within_ms: None,
+                },
+            ],
             as_of_utc_ms: Some(300),
             ..Default::default()
         };

@@ -6,33 +6,84 @@ Archive Ledger is a local-first command-line catalog for answering three practic
 - Are those copies still readable and recent enough to trust?
 - Which files could be permanently lost if a disk, site, account, or shared dependency fails?
 
-It inventories ordinary directories and git-annex repositories, verifies bytes, evaluates backup
-policy and disaster risks, protects its own catalog history, and can make verified copies between
-registered Locations. It does not move, delete, repair, or drop archive content.
+It inventories ordinary directories and git-annex repositories, verifies bytes,
+and makes verified copies between registered Locations. New Archives keep their
+current state and audit history in one authoritative SQLite catalog. Catalog-only
+removal declarations never delete archive contents.
 
-> Development status: new Archives use the signed version 2 event tree and a
-> rebuildable compact schema-7 SQLite projection. Setup, inventory, git-annex import,
-> Location scanning and verification, staging, verified copy, resumable jobs,
-> opt-in targeted background verification, status, risk reporting, enrollment,
-> verified Git synchronization, and portable
-> snapshot clone and layered catalog `fsck` use the v2 path. Topology-aware
-> metadata protection reporting and destructive content operations remain under
-> development. Keep
-> an independent backup of each Archive's canonical event tree and do not rely on
-> this pre-production build as the only catalog for irreplaceable data.
+## Current SQLite catalog workflow
 
-New to Archive Ledger? [From first Archive to routine maintenance](docs/guides/archive-lifecycle.md)
-walks through setup, protecting the catalog itself, adding copies, Policy, keeping the catalog
-current, and maintenance in order. A test script runs every command in it against a disposable
-Archive.
+`archive init` now creates an authoritative SQLite catalog without Git or a signed
+event tree. Supported workflows include registry/setup, inventory and annex import,
+Location scans, verification, verified copy, staging, resumable jobs, current status,
+file find/show/history, catalog-only removal, SQLite health checks, and catalog
+backup/restore. Ordinary `file find` prints every matching path; JSON is paginated.
 
-See [Example workflows](docs/workflows.md) for task-oriented walkthroughs based on realistic
-Archive Ledger use.
+Policy/risk evaluation, app access/change feeds, repair, background verification,
+Git synchronization, enrollment, and event replay are **not available for the new
+format**. Their examples later in this document apply only to legacy event-backed
+Archives. Existing Archives retain their legacy format until explicitly migrated;
+opening them does not silently convert or erase their history. Start with
+[From first Archive to routine maintenance](docs/guides/archive-lifecycle.md) for
+the current SQLite workflow. The older [workflow](docs/workflows.md) and
+[annex](docs/guides/annex-workflows.md) guides still include legacy-only operations.
 
-For the initial git-annex workflow, follow [Seven git-annex workflows in Docker](docs/guides/annex-workflows.md):
-create an Archive and Collection, verify a Location, add new files from a subtree, register a
-clone, make verified copies, and list every File below a chosen copy count. The guide includes a
-repeatable Docker end-to-end test using a disposable copy of an existing annex repository.
+To convert an existing event-backed Archive, choose a new destination directory:
+
+```bash
+archive --archive /path/to/original migrate --to /path/to/sqlite-catalog
+archive --archive /path/to/sqlite-catalog status
+```
+
+Migration keeps the original untouched, authenticates its canonical history, and
+validates both the converted catalog and a backup/restore round trip before publishing.
+It refuses unfinished work, conflicting expectations, duplicate path identities,
+and storage mappings that cannot preserve mirror paths. Resolve reported conditions
+in the original catalog before retrying into an absent destination. The destination
+contains `archive.db` and `migration-backup.db`; it is not automatically activated.
+Use its directory with `--archive` or `ARCHIVE_LEDGER_ARCHIVE` to select it explicitly.
+The Archive ID is retained, so it cannot also be registered under that same ID at a
+second path with `archive use`; explicit path selection leaves the original registration intact.
+
+After files have been removed through your own filesystem workflow, record that
+fact without accessing the drive:
+
+```bash
+archive file removed --collection Files --location "Files on usb" --path "photos/example.jpg"
+```
+
+Preview every USB entry with a qualifying backup in the backup set, then record
+those copies as missing in the catalog by repeating the command without `--dry-run`:
+
+```bash
+archive file removed --collection Files \
+  --in "Files on usb" --and \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03" \
+  --verified-within 30d --dry-run
+```
+
+The first group must name exactly one target Location. Later groups use the same
+union, intersection, negation, and verification-age rules as `file find`. Dry-run
+prints one explanation followed by every affected path; it changes neither the
+catalog nor files. Actual removal marks only target copies missing, retains the
+expected paths/checksums and other Locations, and appends history atomically.
+Repeating it is harmless. Rediscovery restores presence but does not manufacture
+fresh checksum verification. This command is a catalog declaration, not a physical
+delete operation or a guarantee that deleting bytes is safe.
+
+Protect the authoritative catalog with consistent SQLite backups:
+
+```bash
+archive backup --to /backup/archive-2026-10-30.db
+archive restore catalog /backup/archive-2026-10-30.db --to /recovery/archive.db
+archive fsck --full
+```
+
+Backup and restore require a new destination file and preserve existing files.
+Restore validates the copied catalog but does not activate it or replace the
+current Archive. `fsck` checks catalog integrity; it does not hash archive contents.
+Keep catalog backups on independently protected storage. The old Git checkpoint,
+`db rebuild`, snapshot, and `restore check` workflows below are for legacy Archives.
 
 ## Concepts and relationships
 
@@ -41,34 +92,29 @@ describe many Collections spread across computers, removable disks, NAS devices,
 and services.
 
 ```text
-Archive
-├── Collection ──uses──> Policy
-│   └── File (logical path) ──refers to──> Object (exact bytes)
-│                                             │
-│                                             └── Copy claim at a Location
+Archive (authoritative SQLite catalog)
+├── Collection
+│   └── Object (relative path + expected checksum)
+│       └── File at each Location (presence + integrity + last check)
 ├── Filesystem Location ──under──> Archive Root ──on──> Device ──at──> Site
 ├── Service Location ────────────────────────────────────────────────at──> Site
-├── Risk domains ──attach to──> Locations, roots, Devices, or Sites
-└── Canonical events ──materialize into──> SQLite database
+└── History (audit entries, separate from current-state queries)
 ```
 
 ### Content
 
-- A **Collection** is a logical set of files, such as “Photos,” “Documents,” or “Emails.” It has
-  its own logical path namespace, home Site, and preservation Policy.
-- A **File** is a logical path within a Collection, such as `2026/trip/photo.jpg`. It is not the
-  bytes themselves.
-- An **Object** is one exact byte sequence identified by BLAKE3. Identical Files can refer to one
-  deduplicated Object.
-- An **external identity** is a source identifier known before bytes are readable, such as a
-  git-annex key. It keeps a dropped annex File reviewable but is not verified protection.
-- A **path observation** records where a File representation was seen.
-- A **copy claim** records current evidence that Object bytes exist at a Location. Its state may be
-  present, missing, corrupt, unknown, or superseded.
+- A **Collection** is a logical namespace, such as “Photos,” “Documents,” or “Files.”
+- An **Object** is one Collection-relative path and its expected BLAKE3 checksum,
+  identified by a stable ID. Different paths may have identical checksums.
+- A **File** is the current presence and integrity evidence for that Object at one
+  Location. Locations mirror the same relative path and may contain different subsets.
+- An unknown expected checksum remains visible but cannot count as verified protection.
+  A checksum mismatch records damage and preserves the expectation; only an explicit
+  accepted change replaces it and invalidates previous verification eligibility.
 
-The distinctions matter: a File answers “what does the user call this?”, an Object answers “which
-bytes are these?”, and a copy claim answers “where does the catalog currently believe those bytes
-exist?” A source reporting an annex key is a recovery lead, not automatically a verified copy.
+Expected paths remain in the catalog even when all copies are missing. Current
+queries read Objects and Files directly; they do not replay history. Legacy
+Archives retain their older logical File/content Object/copy-claim model until migrated.
 
 ### Storage
 
@@ -94,15 +140,16 @@ together form one complete backup set. Two paths on one disk do not provide two-
 - A complete **scan** reconciles an entire Location and may mark prior paths missing.
 - A **verification** re-reads one copy and compares it with the expected Object identity.
 
-Device, Site, and device-less service loss are simulated automatically. Custom risk domains add
-shared dependencies. A copy can remain visible while being too stale, unresolved, corrupt, or
+Legacy risk reports simulate Device, Site, and device-less service loss; custom risk
+domains add shared dependencies. Risk evaluation is not yet supported for authoritative catalogs. A copy can remain visible while being too stale, unresolved, corrupt, or
 uncertain to count as adequate protection.
 
 ### Catalog data
 
-Canonical events are the durable append-only history. SQLite is their indexed materialized view
-and serves normal `status`, `file`, `copy`, and `report` commands. SQLite can be rebuilt; canonical
-history must be checkpointed and independently protected.
+For new Archives, SQLite is authoritative: back it up rather than rebuilding it
+from events. Current state and History change in one transaction. Legacy Archives
+still use canonical events and a rebuildable SQLite projection; their event history
+must be protected independently.
 
 ## Install
 
@@ -677,7 +724,7 @@ archive c ls
 archive l ls
 archive d ls
 archive s ls
-archive file find --collection "Documents" --limit 100
+archive file find --collection "Documents"
 archive file show <file-id>
 archive file history <file-id> --limit 100
 archive object show <object-id> --limit 100
@@ -696,10 +743,19 @@ rolls those figures up across its Locations and, when the Device is currently mo
 filesystem identity still matches, reports live free space. Site status rolls them up by Device.
 Unavailable or unconfirmed facts are shown explicitly rather than guessed.
 
-File and copy lists use stable continuations, so directories with thousands of entries and
-Collections with hundreds of thousands of Files remain reviewable without running the equivalent
-of `ls` or loading the full result in memory. `file find` accepts a Collection name or stable ID
-and supports `--exact` and `--prefix` logical-path filters. `file show` reports the exact total
+`file find` prints **all matching logical paths**, one per line, without manual
+pagination or per-file metadata. It streams bounded database batches rather than
+loading the whole result into memory. `--limit` controls the batch size, not the
+total number of text results. Use `--json` for a detailed, bounded page with File
+IDs, copy counts, source paths, and a `next` continuation token. Copy lists also
+use stable continuations.
+
+`file find` accepts a Collection name or stable ID and supports `--exact` and
+`--prefix` logical-path filters. For a single known path, use
+`archive file find --collection "Documents" --exact "path/to/file"`; the lookup
+uses the Collection/path index. Add `--json` to obtain its File ID for `file show`.
+Copy summaries are calculated only for the selected identities, not the entire catalog.
+`file show` reports the exact total
 Copy count and returns at most 1,000 detailed Copy rows; JSON sets `copies_truncated` when more
 rows exist. `object show` similarly returns a bounded, continuable page of the logical Files that
 refer to one content Object, so heavily deduplicated content cannot produce an unbounded response.
@@ -709,12 +765,14 @@ refer to one content Object, so heavily deduplicated content cannot produce an u
 `file find` can combine Location groups. Repeated `--in` arguments within a group
 mean **any** of those Locations; `--and` separates groups that must all match.
 `--not` at the start of a group means **none** of its Locations may match.
-Location selectors accept names or stable IDs. The first positive group selects
-the source paths to list; later groups test whether matching content exists at
-other Locations. Comparison uses resolved content identity, so a backup can have
-a different filename. Unresolved identities are
-excluded from these comparisons; absence means no matching present copy in the
-catalog, not proof that a drive does not contain the bytes.
+Location selectors accept names or stable IDs. For authoritative SQLite catalogs,
+groups match the same Collection-relative path and expected checksum at each
+Location. Only present, verified copies with a successful latest check and the
+expected checksum qualify. Identical content under another filename does not
+protect that expected path. Unknown expected checksums are excluded from grouped
+comparisons; absence means no qualifying copy in the catalog, not proof that a
+drive does not contain the bytes. Legacy event-backed Archives retain their
+content-identity comparisons until migrated.
 
 List disk10 content absent from the entire backup set:
 
@@ -754,20 +812,41 @@ archive file find --collection "Files" \
   --and --not --in "Files on usb"
 ```
 
-Use `--json` for source-qualified paths when several primary Locations match.
-Normal human and JSON listings retain pagination. For a single source Location
-in the first positive group, `--print0` streams all matching source-relative
+Normal text output lists every matching path, one per line, without pagination
+footers. JSON returns a bounded page of Objects with stable path IDs, lossless
+paths, and expected checksums. Use its `next` token with `--continue` for another
+page. A text query with `--continue` prints all remaining matches.
+For a single source Location in the first positive group, `--print0` streams all matching source-relative
 paths separated by NUL bytes, without pagination messages on stdout. Check its
 exit status before using the output; a failed stream can be partial. Paths refer
 to cataloged entries, including annex symlinks, and are not a copy or deletion
 plan.
 
-`file history` and `object history` are explicit audit operations. They authenticate and stream
-canonical event records in bounded memory because full event payloads are deliberately not
-duplicated in SQLite. Use the printed `--continue` token for another page; the command rejects a
-token if canonical history has advanced, so a page sequence cannot silently mix snapshots.
+In authoritative SQLite catalogs, `file show <object-id>` and
+`object show <object-id>` show the same expected path and all its recorded Locations,
+including missing and damaged copies. IDs come from JSON `file find`; they identify
+paths, not content hashes. The identity filter accepts `resolved` for a known
+expected checksum and `unresolved` or `unknown` for no expected checksum;
+unsupported states are rejected. Plain output streams the selection in one read
+snapshot; structured pages freeze the verification time and reject continuation
+after the catalog revision changes. Current find/show queries read Objects and
+Files directly, independently of history size. They never access mounted files
+or run verification.
+The disposable performance fixture can be rerun with
+`cargo test --release --lib sqlite_queries::tests::benchmark_large_catalog -- --ignored --nocapture`.
+It creates 100,000 and 500,000 expected paths with one verified primary copy each,
+streams the primary-minus-backups selection, and removes both temporary catalogs.
+Reported time excludes fixture creation and terminal output; it measures a warm
+local database and is not a cold-drive latency guarantee.
 
-Risk reports automatically refresh missing or stale derived assessments from SQLite; they never
+`file history <object-id>` and `object history <object-id>` are explicit audit
+operations. Authoritative SQLite catalogs read their separate History table in
+bounded pages; legacy Archives read authenticated canonical records. Use the
+printed `--continue` token for another page. Continuation rejects catalog changes
+so a page sequence cannot silently mix snapshots.
+
+The following risk, repair, and background workflows are legacy-only. They are not
+available for authoritative SQLite catalogs. Legacy risk reports refresh derived assessments from SQLite; they never
 scan storage or replay canonical history. Review the starter Policy and simulated loss results:
 
 ```bash
@@ -919,7 +998,7 @@ duplicate durable facts. Recovery refuses unrelated canonical edits, unfinished 
 ambiguous history; preserve the files and inspect the reported problem before retrying. Operations
 are batched and do not require all paths in memory.
 
-## Protect and recover the catalog
+## Legacy event-backed catalog protection and recovery
 
 SQLite is the normal interactive materialized view, but it is replaceable. Canonical events are the
 durable rebuild source, so protecting only `archive.db` is insufficient. `archive init --json`
@@ -1071,7 +1150,7 @@ findings were found, and 2 means a requested check could not be completed.
 `restore check` verifies the chain and builds a new database; it does not overwrite the current
 catalog.
 
-## Use Archive Ledger from another app
+## Legacy app integration
 
 Higher-level applications can use a versioned, read-only CLI contract without opening the private
 SQLite schema or listing storage directories. Maintainers implementing a photo or album
@@ -1159,7 +1238,7 @@ fail closed if SQLite advances between pages.
 - Positive-only add and every partial scan are incapable of publishing missing facts.
 - Complete missing activation is atomic and follows only confirmed complete coverage.
 - Registry changes and renames append canonical events; history is not rewritten.
-- `repair` is the one explicit command that replaces existing archive content: only a copy whose
+- In legacy Archives, `repair` is the explicit command that replaces existing archive content: only a copy whose
   bytes no longer match the catalog, only from a verified copy re-read during the repair, never
   by overwriting (the corrupt file is moved into the Location's `.archive-ledger/quarantine`
   first), and never automatically. No command deletes, drops, or otherwise rewrites existing

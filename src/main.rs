@@ -13,13 +13,13 @@ use archive_ledger::{
     ArchiveRootSnapshot, CachedPolicyStatus, CatalogError, CatalogRegistry, CollectionSnapshot,
     CopyFilter, CopyPageRequest, DeviceCheckIn, DeviceMount, DeviceSnapshot, DiscoveryItem,
     EventReferences, EventRequest, EventStore, EventStoreConfig, EventStoreError, FileDiscovery,
-    FileFilter, FileLocationGroup, FilePage, FilePageRequest, LocationScanner, LocationSnapshot,
-    LocationStatus, MetadataDestinationSnapshot, MetadataError, MetadataProtector,
-    MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding, PolicyFindingFilter,
-    PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig, ProjectionDb,
-    ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError, RegistryPath,
-    ReviewError, RiskAssignment, RiskDomainSnapshot, SafeCopyError, ScanConfig, ScanError,
-    ScanMode, ScanStatus, SiteSnapshot, StageAuditOptions, StageError, StatusError,
+    FileFilter, FileLocationGroup, FilePage, FilePageRequest, FilePathPage, LocationScanner,
+    LocationSnapshot, LocationStatus, MetadataDestinationSnapshot, MetadataError,
+    MetadataProtector, MetadataRegistry, PolicyError, PolicyEvaluationResult, PolicyFinding,
+    PolicyFindingFilter, PolicyFindingPage, PolicyRequirements, PolicySnapshot, ProjectionConfig,
+    ProjectionDb, ProjectionError, Registry, RegistryAction, RegistryChange, RegistryError,
+    RegistryPath, ReviewError, RiskAssignment, RiskDomainSnapshot, SafeCopyError, ScanConfig,
+    ScanError, ScanMode, ScanStatus, SiteSnapshot, StageAuditOptions, StageError, StatusError,
     StorageDiscoveryError, V2FsckError, V2FsckOptions, V2OriginStore, V2ProjectionDb,
     V2ProjectionError, V2Registry, V2StoreError,
 };
@@ -30,6 +30,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
+
+mod sqlite_cli;
+mod sqlite_read_cli;
+mod sqlite_removed_cli;
+mod sqlite_setup_cli;
+mod sqlite_stage_cli;
+mod sqlite_status_cli;
 
 const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 2;
@@ -135,6 +142,14 @@ fn inspect_archive_root(selector: &str) -> Result<archive_ledger::KnownArchive, 
     })?;
     let database_path = root.join("archive.db");
     let events_path = root.join("canonical");
+    if let Ok(catalog) = archive_ledger::SqliteCatalog::open_read_only(&database_path) {
+        let metadata = catalog.metadata()?;
+        return Ok(archive_ledger::KnownArchive {
+            archive_id: metadata.archive_id,
+            display_name: metadata.display_name,
+            root,
+        });
+    }
     match V2ProjectionDb::open_existing(&database_path) {
         Ok(database) => {
             let status = database.status()?;
@@ -161,6 +176,16 @@ fn inspect_archive_root(selector: &str) -> Result<archive_ledger::KnownArchive, 
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Convert a legacy Archive into a new validated directory; keep the original intact.
+    Migrate {
+        #[arg(long)]
+        to: PathBuf,
+    },
+    /// Write a consistent, verified SQLite catalog backup to a new file.
+    Backup {
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Create a new named Archive catalog without inspecting the current directory.
     Init {
         /// Human-readable Archive name; prompted for on a terminal when omitted.
@@ -204,7 +229,7 @@ enum Command {
     Rename { new_name: String },
     /// Show fast cached preservation status from SQLite.
     Status,
-    /// Check Git, signed history, and SQLite health without repairing anything.
+    /// Check catalog health without repairing anything.
     Fsck(FsckArgs),
     /// Audit an external directory without changing ledger state, or import reviewed new files.
     Stage(StageArgs),
@@ -735,6 +760,12 @@ enum EventsCommand {
 
 #[derive(Debug, Subcommand)]
 enum RestoreCommand {
+    /// Restore a SQLite backup to a new database file without activating it.
+    Catalog {
+        backup: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+    },
     Check {
         /// Local clone of a canonical event repository.
         event_repository: PathBuf,
@@ -746,11 +777,13 @@ enum RestoreCommand {
 
 #[derive(Debug, Subcommand)]
 enum FileCommand {
-    /// Find active logical paths from SQLite without scanning storage.
-    Find(FileFindArgs),
+    /// Mark copies removed in the catalog; never delete archive contents.
+    Removed(Box<FileRemovedArgs>),
+    /// List all matching logical paths from SQLite; --json returns a detailed page.
+    Find(Box<FileFindArgs>),
     /// Show one logical file and all current copy evidence.
     Show { file_ref_id: String },
-    /// Stream authenticated canonical history for one logical File.
+    /// Show check and change history for one logical file.
     History {
         file_ref_id: String,
         #[arg(long, default_value_t = 100)]
@@ -762,7 +795,7 @@ enum FileCommand {
 
 #[derive(Debug, Subcommand)]
 enum ObjectCommand {
-    /// Show one Object and a bounded page of its logical Files from SQLite.
+    /// Show one expected path and its Location evidence from SQLite.
     Show {
         object_id: String,
         #[arg(long, default_value_t = 100)]
@@ -770,7 +803,7 @@ enum ObjectCommand {
         #[arg(long = "continue")]
         continuation: Option<String>,
     },
-    /// Stream authenticated canonical history for one Object.
+    /// Show check and change history for one Object.
     History {
         object_id: String,
         #[arg(long, default_value_t = 100)]
@@ -1376,10 +1409,35 @@ struct FileFindArgs {
     prefix: Option<String>,
     #[arg(long)]
     identity_state: Option<String>,
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
+    /// Batch size for all-results text/--print0 (default 1000); JSON page size (default 100).
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Resume after this cursor; text output lists all remaining matches.
     #[arg(long = "continue")]
     continuation: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct FileRemovedArgs {
+    #[arg(long)]
+    location: Option<String>,
+    #[arg(long)]
+    path: Option<String>,
+    #[arg(long)]
+    collection: Option<String>,
+    #[arg(long = "in", action = clap::ArgAction::Append)]
+    locations: Vec<String>,
+    #[arg(long = "and", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true")]
+    and_groups: Vec<bool>,
+    #[arg(long = "not", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true")]
+    not_groups: Vec<bool>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    verified_within: Vec<String>,
+    #[arg(skip)]
+    location_groups: Vec<FileLocationGroup>,
+    /// List every affected path without changing the catalog or files.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn parse_file_location_groups(
@@ -1612,6 +1670,13 @@ struct ReportSummaryArgs {
 
 #[derive(Debug)]
 enum AppError {
+    Migration(archive_ledger::sqlite_migrate::MigrationError),
+    CatalogBackup(archive_ledger::sqlite_backup::CatalogBackupError),
+    SqliteCatalog(archive_ledger::SqliteCatalogError),
+    CatalogWrite(archive_ledger::sqlite_writes::CatalogWriteError),
+    CatalogQuery(archive_ledger::sqlite_queries::CatalogQueryError),
+    CatalogRegistry(archive_ledger::sqlite_registry::SqliteRegistryError),
+    Sqlite(rusqlite::Error),
     Catalog(CatalogError),
     EventStore(EventStoreError),
     Projection(ProjectionError),
@@ -1657,6 +1722,12 @@ impl AppError {
 
     fn code(&self) -> &'static str {
         match self {
+            Self::Migration(error) => error.code(),
+            Self::CatalogBackup(error) => error.code(),
+            Self::SqliteCatalog(_) | Self::Sqlite(_) => "catalog_database",
+            Self::CatalogWrite(_) => "catalog_write",
+            Self::CatalogQuery(error) => error.code(),
+            Self::CatalogRegistry(error) => error.code(),
             Self::Catalog(error) => error.code(),
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
@@ -1687,6 +1758,13 @@ impl AppError {
 impl std::fmt::Display for AppError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Migration(error) => error.fmt(formatter),
+            Self::CatalogBackup(error) => error.fmt(formatter),
+            Self::SqliteCatalog(error) => error.fmt(formatter),
+            Self::CatalogWrite(error) => error.fmt(formatter),
+            Self::CatalogQuery(error) => error.fmt(formatter),
+            Self::CatalogRegistry(error) => error.fmt(formatter),
+            Self::Sqlite(error) => error.fmt(formatter),
             Self::Catalog(error) => error.fmt(formatter),
             Self::EventStore(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
@@ -1727,6 +1805,36 @@ impl std::fmt::Display for AppError {
                 Ok(())
             }
         }
+    }
+}
+
+impl From<archive_ledger::SqliteCatalogError> for AppError {
+    fn from(error: archive_ledger::SqliteCatalogError) -> Self {
+        Self::SqliteCatalog(error)
+    }
+}
+
+impl From<archive_ledger::sqlite_writes::CatalogWriteError> for AppError {
+    fn from(error: archive_ledger::sqlite_writes::CatalogWriteError) -> Self {
+        Self::CatalogWrite(error)
+    }
+}
+
+impl From<archive_ledger::sqlite_queries::CatalogQueryError> for AppError {
+    fn from(error: archive_ledger::sqlite_queries::CatalogQueryError) -> Self {
+        Self::CatalogQuery(error)
+    }
+}
+
+impl From<archive_ledger::sqlite_registry::SqliteRegistryError> for AppError {
+    fn from(error: archive_ledger::sqlite_registry::SqliteRegistryError) -> Self {
+        Self::CatalogRegistry(error)
+    }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
     }
 }
 
@@ -2135,6 +2243,19 @@ fn main() -> ExitCode {
     let parsed = Cli::command().try_get_matches().and_then(|matches| {
         let mut cli = Cli::from_arg_matches(&matches)?;
         if let Command::File {
+            command: FileCommand::Removed(args),
+        } = &mut cli.command
+        {
+            let removed = matches
+                .subcommand_matches("file")
+                .unwrap()
+                .subcommand_matches("removed")
+                .unwrap();
+            args.location_groups = parse_file_location_groups(removed).map_err(|message| {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, message)
+            })?;
+        }
+        if let Command::File {
             command: FileCommand::Find(args),
         } = &mut cli.command
         {
@@ -2188,6 +2309,15 @@ fn main() -> ExitCode {
 }
 
 fn execute(cli: &mut Cli) -> Result<u8, AppError> {
+    if let Command::Restore {
+        command: RestoreCommand::Catalog { backup, to },
+    } = &cli.command
+    {
+        let report = archive_ledger::sqlite_backup::restore_catalog(backup, to)
+            .map_err(AppError::CatalogBackup)?;
+        print_catalog_backup(&report, cli.json, true)?;
+        return Ok(EXIT_OK);
+    }
     if let Command::List = &cli.command {
         if cli.archive.is_some() || cli.database.is_some() || cli.events.is_some() {
             return Err(AppError::Input(
@@ -2240,7 +2370,7 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
     } = &cli.command
     {
         let name = name.as_deref().or(name_option.as_deref());
-        return execute_v2_init(
+        return execute_sqlite_init(
             cli,
             name,
             *make_default,
@@ -2300,6 +2430,83 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         return Ok(EXIT_OK);
     }
     resolve_catalog_paths(cli)?;
+    if matches!(
+        cli.command,
+        Command::Events {
+            command: EventsCommand::Verify
+        }
+    ) && cli.events_path().is_dir()
+    {
+        return execute_events_verify(cli);
+    }
+    if let Command::Migrate { to } = &cli.command {
+        let report = archive_ledger::sqlite_migrate::migrate_catalog(
+            cli.events_path(),
+            cli.database_path(),
+            to,
+        )
+        .map_err(AppError::Migration)?;
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({"version":3,"migration":report,"activated":false}))?
+            );
+        } else {
+            println!(
+                "Migrated {} expected paths and {} Location entries to {}.",
+                report.objects,
+                report.files,
+                report.destination.display()
+            );
+            println!("Original retained; backup and restore verified. The new catalog has not been activated.");
+            println!(
+                "Inspect it with: archive --archive {} status",
+                shell_quote(&report.destination.to_string_lossy())
+            );
+        }
+        return Ok(EXIT_OK);
+    }
+    match archive_ledger::SqliteCatalog::open_read_only(cli.database_path()) {
+        Ok(catalog) => {
+            if let Command::Backup { to } = &cli.command {
+                let report = archive_ledger::sqlite_backup::backup_catalog(&catalog, to)
+                    .map_err(AppError::CatalogBackup)?;
+                print_catalog_backup(&report, cli.json, false)?;
+                return Ok(EXIT_OK);
+            }
+            if let Some(result) = sqlite_read_cli::execute_read(cli, &catalog)? {
+                return Ok(result);
+            }
+            if let Some(result) = sqlite_status_cli::execute_status(cli, &catalog)? {
+                return Ok(result);
+            }
+            drop(catalog);
+            let mut catalog = archive_ledger::SqliteCatalog::open(cli.database_path())?;
+            if let Command::File {
+                command: FileCommand::Removed(args),
+            } = &cli.command
+            {
+                return sqlite_removed_cli::execute_removed(cli, &mut catalog, args);
+            }
+            if let Some(result) = sqlite_setup_cli::execute_setup(cli, &mut catalog)? {
+                return Ok(result);
+            }
+            if let Some(result) = sqlite_cli::execute_write(cli, &mut catalog)? {
+                return Ok(result);
+            }
+            if let Command::Stage(args) = &cli.command {
+                return sqlite_stage_cli::execute(cli, &mut catalog, args);
+            }
+            return Err(AppError::Input(
+                "this command is not available for authoritative SQLite catalogs".into(),
+            ));
+        }
+        Err(archive_ledger::SqliteCatalogError::UnsupportedFormat { application_id, .. })
+            if application_id != archive_ledger::sqlite_catalog::CATALOG_APPLICATION_ID => {}
+        Err(archive_ledger::SqliteCatalogError::Sqlite(_))
+            if archive_ledger::is_v2_event_tree(cli.events_path()) => {}
+        Err(error) => return Err(error.into()),
+    }
     if let Command::Events {
         command: EventsCommand::Verify,
     } = &cli.command
@@ -2488,8 +2695,41 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             }
             Command::Db { .. } => unreachable!("database command returned before opening SQLite"),
             Command::Restore { .. } => unreachable!("restore returned before opening SQLite"),
+            Command::Migrate { .. } => unreachable!("migration returned before opening SQLite"),
+            Command::Backup { .. } => Err(AppError::Input("backup requires an authoritative SQLite catalog; use snapshot for a legacy catalog".into())),
         }
     }
+}
+
+fn print_catalog_backup(
+    report: &archive_ledger::sqlite_backup::BackupReport,
+    as_json: bool,
+    restored: bool,
+) -> Result<(), AppError> {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string(
+                &json!({"version":3,"catalog_format":"sqlite","restored":restored,"backup":report})
+            )?
+        );
+    } else {
+        println!(
+            "{} catalog at {}.",
+            if restored { "Restored" } else { "Backed up" },
+            report.destination.display()
+        );
+        if restored {
+            println!("The restored catalog has not been activated.");
+        }
+        if report.pending_jobs > 0 {
+            println!(
+                "{} unfinished jobs retained; review before manually resuming.",
+                report.pending_jobs
+            );
+        }
+    }
+    Ok(())
 }
 
 fn execute_archive_list(json_output: bool) -> Result<u8, AppError> {
@@ -5090,6 +5330,16 @@ fn push_v2_risk_finding(
     });
 }
 
+// Resolve the Location once, then visit only its present compact Copy bindings.
+// Joining compatibility views here materializes every Object before filtering.
+const V2_LOCATION_METRICS_SQL: &str = "SELECT COUNT(*), COALESCE(SUM(o.size_bytes), 0),
+    COALESCE(SUM(CASE WHEN p.checked_at IS NULL OR p.checked_at < ?2 THEN 1 ELSE 0 END), 0)
+ FROM locations l
+ JOIN copy_bindings b ON b.location_id = l.id
+ LEFT JOIN content_objects o ON o.id = b.content_id
+ LEFT JOIN checks p ON p.id = b.latest_presence
+ WHERE l.location_id = ?1 AND b.state = 'present'";
+
 fn v2_location_metrics(
     database: &V2ProjectionDb,
     state: &archive_ledger::RegistryState,
@@ -5110,11 +5360,7 @@ fn v2_location_metrics(
     );
     let (files, bytes, stale): (i64, i64, i64) = v2_cli_connection(database)?
         .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(o.size_bytes), 0),
-                    COALESCE(SUM(CASE WHEN c.last_seen_time_utc_ms IS NULL OR c.last_seen_time_utc_ms < ?2 THEN 1 ELSE 0 END), 0)
-             FROM copy_claims c
-             LEFT JOIN objects o ON o.object_id = c.object_id
-             WHERE c.location_id = ?1 AND c.state = 'present'",
+            V2_LOCATION_METRICS_SQL,
             params![location_id, cutoff],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -7125,7 +7371,7 @@ fn execute_archive_rename(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_v2_init(
+fn execute_sqlite_init(
     cli: &Cli,
     name: Option<&str>,
     make_default: bool,
@@ -7191,21 +7437,19 @@ fn execute_v2_init(
         ulid::Ulid::new().to_string().to_ascii_lowercase()
     ));
     let result = (|| {
-        let initialized = archive_ledger::initialize_v2_archive(
-            &prepared,
+        std::fs::create_dir(&prepared)?;
+        let catalog = archive_ledger::SqliteCatalog::create(
+            prepared.join("archive.db"),
             &archive_id,
             &archive_name,
-            now_utc_ms()?,
         )?;
-        let store = V2OriginStore::open(prepared.join("canonical"))?;
-        V2ProjectionDb::create_from_store(&store, prepared.join("archive.db"))?;
-        V2ProjectionDb::open_existing(prepared.join("archive.db"))?
-            .validate_against_store(&store)?;
+        catalog.connection().execute_batch("PRAGMA optimize;")?;
+        drop(catalog);
         archive_ledger::place_directory_no_replace(&prepared, &known_archive.root)?;
-        Ok::<_, AppError>(initialized)
+        Ok::<_, AppError>(())
     })();
-    let initialized = match result {
-        Ok(initialized) => initialized,
+    match result {
+        Ok(()) => (),
         Err(error) => {
             if prepared.exists() {
                 let _ = std::fs::remove_dir_all(&prepared);
@@ -7217,19 +7461,14 @@ fn execute_v2_init(
     let mut registry = CatalogRegistry::load()?;
     let became_default = registry.archives().is_empty() || make_default;
     registry.register(known_archive.clone(), make_default)?;
-    let protection = v2_catalog_protection(&known_archive.root.join("canonical"));
     if cli.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "version": 2,
-                "catalog_protection": catalog_protection_json(&protection),
-                "archive_id": initialized.archive_id,
-                "archive_name": initialized.archive_name,
-                "origin_id": initialized.origin_id,
-                "genesis_hash": initialized.genesis_hash,
-                "accepted_frontier_hash": initialized.accepted_frontier_hash,
-                "canonical_git_commit": initialized.git_commit,
+                "version": 3,
+                "catalog_format": "sqlite",
+                "archive_id": archive_id,
+                "archive_name": archive_name,
                 "root": known_archive.root,
                 "default": became_default,
             }))?
@@ -7242,7 +7481,6 @@ fn execute_v2_init(
         println!();
         println!("Next: go to the directory containing your files and run:");
         println!("  archive collection init --name <name>");
-        print_catalog_protection_warning(&protection);
     }
     Ok(EXIT_OK)
 }
@@ -14881,6 +15119,37 @@ fn prepare_v2_filesystem_setup(
     existing_collection: Option<CollectionSnapshot>,
     reimport: bool,
 ) -> Result<V2FilesystemSetup, AppError> {
+    if args.import_annex {
+        refuse_v2_unfinished_annex_import(database, &std::fs::canonicalize(&args.path)?)?;
+    }
+    let state = database.registry_state(false)?;
+    let (setup, changes) = plan_filesystem_setup(&state, args, existing_collection)?;
+    if args.import_annex
+        && !reimport
+        && v2_location_has_completed_annex_import(
+            database,
+            &setup.collection.collection_id,
+            &setup.location.location_id,
+        )?
+    {
+        return Err(AppError::Input(format!(
+            "Location {:?} already has a completed annex import for Collection {:?}; use archive location scan for ordinary updates, or location import-annex --reimport for an intentional repeat",
+            setup.location.display_name, setup.collection.display_name
+        )));
+    }
+    let store = V2OriginStore::open(cli.events_path())?;
+    let registry = V2Registry::new(&store, database);
+    for change in changes {
+        registry.record(change, &cli.host)?;
+    }
+    Ok(setup)
+}
+
+fn plan_filesystem_setup(
+    state: &archive_ledger::RegistryState,
+    args: &CollectionInitArgs,
+    existing_collection: Option<CollectionSnapshot>,
+) -> Result<(V2FilesystemSetup, Vec<RegistryChange>), AppError> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     let collection_name = existing_collection
         .as_ref()
@@ -14889,9 +15158,6 @@ fn prepare_v2_filesystem_setup(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Input("Collection name must be non-empty".to_owned()))?;
     let mounted = archive_ledger::discover_mounted_filesystem(&args.path)?;
-    if args.import_annex {
-        refuse_v2_unfinished_annex_import(database, &mounted.path)?;
-    }
     if mounted.identity_state == "unavailable"
         && !args.allow_unidentified_root
         && (!interactive
@@ -14904,7 +15170,6 @@ fn prepare_v2_filesystem_setup(
                 .to_owned(),
         ));
     }
-    let state = database.registry_state(false)?;
     if existing_collection.is_none()
         && state
             .collections
@@ -15148,19 +15413,6 @@ fn prepare_v2_filesystem_setup(
         ));
         (collection, Some(policy))
     };
-    if args.import_annex
-        && !reimport
-        && v2_location_has_completed_annex_import(
-            database,
-            &collection.collection_id,
-            &location.location_id,
-        )?
-    {
-        return Err(AppError::Input(format!(
-            "Location {:?} already has a completed annex import for Collection {:?}; use archive location scan for ordinary updates, or location import-annex --reimport for an intentional repeat",
-            location.display_name, collection.display_name
-        )));
-    }
     changes.push(RegistryChange::DeviceMount(DeviceMount {
         mount_id: generated_id("mount"),
         device_id: device.device_id.clone(),
@@ -15175,23 +15427,20 @@ fn prepare_v2_filesystem_setup(
         .to_owned(),
     }));
 
-    let store = V2OriginStore::open(cli.events_path())?;
-    let registry = V2Registry::new(&store, database);
-    for change in changes {
-        registry.record(change, &cli.host)?;
-    }
-    Ok(V2FilesystemSetup {
-        collection,
-        location,
-        device,
-        site,
-        root,
-        policy,
-        mounted,
-        adding_location,
-    })
+    Ok((
+        V2FilesystemSetup {
+            collection,
+            location,
+            device,
+            site,
+            root,
+            policy,
+            mounted,
+            adding_location,
+        },
+        changes,
+    ))
 }
-
 fn print_v2_filesystem_setup(cli: &Cli, setup: &V2FilesystemSetup) -> Result<(), AppError> {
     let protection = v2_catalog_protection(cli.events_path());
     if cli.json {
@@ -17888,6 +18137,7 @@ fn print_found_files(
     as_json: bool,
     mut request: FilePageRequest,
     find: impl Fn(FilePageRequest) -> Result<FilePage, ReviewError>,
+    find_paths: impl Fn(FilePageRequest) -> Result<FilePathPage, ReviewError>,
 ) -> Result<(), AppError> {
     if args.print0 {
         if as_json {
@@ -17903,7 +18153,7 @@ fn print_found_files(
         if !source.is_some_and(|group| group.location_ids.len() == 1) {
             return Err(AppError::Input("--print0 requires exactly one Location in the first positive --in group; use --json for multiple sources".into()));
         }
-        eprintln!("Catalog evidence only; unresolved content identities are excluded. Archive content is not read or changed.");
+        eprintln!("Unresolved identities are excluded.");
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
         loop {
@@ -17947,44 +18197,48 @@ fn print_found_files(
         return Ok(());
     }
     let grouped = !request.filter.location_groups.is_empty();
-    let page = find(request)?;
     if as_json {
+        let page = find(request)?;
         let mut value = serde_json::to_value(&page)?;
         if grouped {
             value["selection_evidence"] = json!({"basis": "catalog", "unresolved_identities": "excluded", "fresh_verification": false});
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if page.items.is_empty() {
-        println!("No Files matched.");
-    } else {
-        for file in &page.items {
-            println!(
-                "{}  [{}]  {} present / {} known copies  {}",
-                file.logical_path.display,
-                file.collection_name,
-                file.present_copy_count,
-                file.current_copy_count,
-                file.identity_state
-            );
-            println!(
-                "  file: {}  object: {}",
-                file.file_ref_id,
-                file.object_id.as_deref().unwrap_or("unresolved")
-            );
-            for source in &file.matching_sources {
-                println!(
-                    "  source: {} — {}",
-                    source.location_name, source.relative_path.display
-                );
+        return Ok(());
+    }
+    if grouped {
+        eprintln!("Unresolved identities are excluded.");
+    }
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let page = find_paths(request.clone())?;
+        for path in page.paths {
+            // Preserve readable display paths but keep embedded newlines and
+            // terminal control characters from creating extra output lines.
+            let display = path.display;
+            if display.chars().any(char::is_control) {
+                let escaped: String = display
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() {
+                            character.escape_default().to_string()
+                        } else {
+                            character.to_string()
+                        }
+                    })
+                    .collect();
+                writeln!(output, "{escaped}")?;
+            } else {
+                writeln!(output, "{display}")?;
             }
         }
-        if let Some(next) = page.next {
-            println!("More results: rerun with --continue {next}");
+        match page.next {
+            Some(next) => request.continuation = Some(next),
+            None => break,
         }
     }
-    if grouped && !as_json {
-        eprintln!("Catalog evidence only; unresolved content identities are excluded. Archive content is not read or changed.");
-    }
+    output.flush()?;
     Ok(())
 }
 
@@ -17994,6 +18248,7 @@ fn execute_file(
     as_json: bool,
 ) -> Result<u8, AppError> {
     match command {
+        FileCommand::Removed(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
         FileCommand::Find(args) => {
             let state = database.registry_state(false)?;
             let collection_id = args
@@ -18016,12 +18271,16 @@ fn execute_file(
                     location_groups: groups,
                     ..FileFilter::default()
                 },
-                limit: args.limit,
+                limit: args.limit.unwrap_or(if as_json { 100 } else { 1000 }),
                 continuation: args.continuation.clone(),
             };
-            print_found_files(args, as_json, request, |request| {
-                database.find_files(request)
-            })?;
+            print_found_files(
+                args,
+                as_json,
+                request,
+                |request| database.find_files(request),
+                |request| database.find_file_paths(request),
+            )?;
         }
         FileCommand::Show { file_ref_id } => {
             let review = database.review_file(file_ref_id)?;
@@ -18261,6 +18520,7 @@ fn execute_v2_file(
     as_json: bool,
 ) -> Result<u8, AppError> {
     match command {
+        FileCommand::Removed(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
         FileCommand::Find(args) => {
             let state = database.registry_state(false)?;
             let collection_id = args
@@ -18283,12 +18543,16 @@ fn execute_v2_file(
                     location_groups: groups,
                     ..FileFilter::default()
                 },
-                limit: args.limit,
+                limit: args.limit.unwrap_or(if as_json { 100 } else { 1000 }),
                 continuation: args.continuation.clone(),
             };
-            print_found_files(args, as_json, request, |request| {
-                database.find_files(request)
-            })?;
+            print_found_files(
+                args,
+                as_json,
+                request,
+                |request| database.find_files(request),
+                |request| database.find_file_paths(request),
+            )?;
         }
         FileCommand::Show { file_ref_id } => {
             let review = database.review_file(file_ref_id)?;
@@ -18968,4 +19232,72 @@ fn now_utc_ms() -> Result<u64, AppError> {
         .map_err(|_| AppError::Clock)?
         .as_millis();
     u64::try_from(millis).map_err(|_| AppError::Clock)
+}
+
+#[cfg(test)]
+mod location_metrics_tests {
+    use super::V2_LOCATION_METRICS_SQL;
+    use rusqlite::{Connection, StatementStatus};
+
+    #[test]
+    fn location_metrics_preserve_unknown_and_stale_copies_without_scanning_other_content() {
+        // Minimal compact columns consumed by this query; CLI integration tests
+        // exercise these metrics against the full, canonically built schema.
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE locations(id INTEGER PRIMARY KEY, location_id TEXT UNIQUE);
+            CREATE TABLE content_objects(id INTEGER PRIMARY KEY, size_bytes INTEGER NOT NULL);
+            CREATE TABLE checks(id INTEGER PRIMARY KEY, checked_at INTEGER NOT NULL);
+            CREATE TABLE copy_bindings(id INTEGER PRIMARY KEY, location_id INTEGER NOT NULL,
+                content_id INTEGER, state TEXT NOT NULL, latest_presence INTEGER);
+            CREATE INDEX compact_copy_location ON copy_bindings(location_id,state);
+            INSERT INTO locations VALUES (1,'selected'),(2,'other'),(3,'empty');
+            INSERT INTO content_objects VALUES (1,8),(2,16);
+            INSERT INTO checks VALUES (1,500),(2,499);
+            INSERT INTO copy_bindings VALUES
+                (1,1,1,'present',1),(2,1,2,'present',2),(3,1,NULL,'present',NULL),
+                (4,1,1,'missing',1),(5,1,1,'corrupt',1),(6,1,1,'unknown',1),
+                (7,1,1,'superseded',1);",
+            )
+            .unwrap();
+        let measure = |location: &str| {
+            let mut statement = connection.prepare(V2_LOCATION_METRICS_SQL).unwrap();
+            let values: (i64, i64, i64) = statement
+                .query_row((location, 500), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            (values, statement.get_status(StatementStatus::VmStep))
+        };
+        let (expected, before) = measure("selected");
+        assert_eq!(expected, (3, 24, 2));
+        assert_eq!(measure("empty").0, (0, 0, 0));
+        connection.execute_batch("WITH RECURSIVE numbers(n) AS (
+                SELECT 100 UNION ALL SELECT n+1 FROM numbers WHERE n<10100)
+            INSERT INTO content_objects SELECT n,1000 FROM numbers;
+            INSERT INTO copy_bindings SELECT id,2,id,'present',1 FROM content_objects WHERE id>=100;").unwrap();
+        let (actual, after) = measure("selected");
+        assert_eq!(actual, expected);
+        assert!(
+            after <= before + 20,
+            "unrelated content increased SQL work: {before} -> {after}"
+        );
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {V2_LOCATION_METRICS_SQL}"))
+            .unwrap()
+            .query_map(("selected", 500), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("SEARCH b USING INDEX compact_copy_location"),
+            "{plan}"
+        );
+        assert!(
+            !plan.contains("SCAN") && !plan.contains("MATERIALIZE"),
+            "{plan}"
+        );
+    }
 }
