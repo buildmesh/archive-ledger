@@ -351,8 +351,9 @@ fn add(cli: &Cli, catalog: &mut SqliteCatalog, args: &CollectionAddArgs) -> Resu
         &args.path,
         args.collection.as_deref(),
     )?;
-    if !args.accept_changes.is_empty() && !args.dry_run && !args.yes {
-        if args.non_interactive || !std::io::stdin().is_terminal() || !prompt_confirmation("Accept these files as the new expected checksums and invalidate previous backup verification?")? {return Err(AppError::Input("accepting content changes requires --yes".into()));}
+    if !args.accept_changes.is_empty() && !args.dry_run && !args.yes
+        && (args.non_interactive || !std::io::stdin().is_terminal() || !prompt_confirmation("Accept these files as the new expected checksums and invalidate previous backup verification?")?) {
+        return Err(AppError::Input("accepting content changes requires --yes".into()));
     }
     run_inventory(
         cli,
@@ -1141,15 +1142,15 @@ fn copy(cli: &Cli, catalog: &mut SqliteCatalog, args: &CopyMutationArgs) -> Resu
             &args.paths,
         )?
     };
-    if !args.dry_run && !args.yes {
-        if args.non_interactive
+    if !args.dry_run
+        && !args.yes
+        && (args.non_interactive
             || !std::io::stdin().is_terminal()
             || !prompt_confirmation(
                 "Copy the selected files without replacing existing destinations?",
-            )?
-        {
-            return Err(AppError::Input("copy requires --yes or --dry-run".into()));
-        }
+            )?)
+    {
+        return Err(AppError::Input("copy requires --yes or --dry-run".into()));
     }
     run_copy(
         cli,
@@ -1462,6 +1463,7 @@ fn job(cli: &Cli, catalog: &mut SqliteCatalog, command: &JobCommand) -> Result<u
 
 /// Called by filesystem setup after registering an annex Location. Inventory-only
 /// mode is handled separately from ordinary metadata discovery.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn import_annex(
     cli: &Cli,
     catalog: &mut SqliteCatalog,

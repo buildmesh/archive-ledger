@@ -1281,7 +1281,7 @@ fn classify_manifest_catalog(
         manifest: manifest.to_path_buf(),
         manifest_is_source_local,
         audit_status: audit_status.to_owned(),
-        archive_id: archive_id,
+        archive_id,
         applied_event_seq: archive_sequence,
         catalog_revision: match database {
             StageCatalog::Authoritative(db) => Some(db.metadata()?.revision),

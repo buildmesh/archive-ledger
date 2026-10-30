@@ -1,5 +1,7 @@
+mod support;
 #[cfg(unix)]
 mod unix {
+    use super::support;
     use std::fs::{self, File};
     use std::io::{BufWriter, Write as _};
     use std::path::{Path, PathBuf};
@@ -50,13 +52,7 @@ mod unix {
         create_fixture(&fixture, file_count);
         let fixture_elapsed = fixture_started.elapsed();
 
-        success(archive(&temp).args([
-            "init",
-            "Scale",
-            "--archive-id",
-            "arc_scale",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Scale", "arc_scale", false);
         success(archive(&temp).args([
             "collection",
             "init",

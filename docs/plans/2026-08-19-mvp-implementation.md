@@ -1,6 +1,6 @@
 # Archive Ledger MVP Implementation Plan
 
-Status: active
+Status: legacy implementation reference; current SQLite transition tracked by al-wli
 
 Date: 2026-08-19
 

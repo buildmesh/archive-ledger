@@ -454,6 +454,72 @@ fn observe_in_transaction(
     })
 }
 
+/// Read a regular file through one descriptor and reject replacement or changes
+/// during hashing. Annex callers must first resolve their approved content path.
+pub fn hash_catalog_file(path: &std::path::Path) -> std::io::Result<([u8; 32], u64)> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let before_path = std::fs::symlink_metadata(path)?;
+    if !before_path.is_file() {
+        return Err(std::io::Error::other(
+            "checksum target is not a regular file",
+        ));
+    }
+    let mut file = options.open(path)?;
+    let before = file.metadata()?;
+    if !same_metadata(&before_path, &before) {
+        return Err(std::io::Error::other(
+            "checksum target changed before reading",
+        ));
+    }
+    let mut hash = blake3::Hasher::new();
+    let mut bytes = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        bytes += read as u64;
+    }
+    if !same_metadata(&before, &file.metadata()?)
+        || !same_metadata(&before, &std::fs::symlink_metadata(path)?)
+        || bytes != before.len()
+    {
+        return Err(std::io::Error::other(
+            "checksum target changed while reading",
+        ));
+    }
+    Ok((*hash.finalize().as_bytes(), bytes))
+}
+fn same_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || !after.is_file()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.ino() != after.ino()
+            || before.dev() != after.dev()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,70 +862,4 @@ mod tests {
             "verified"
         );
     }
-}
-
-/// Read a regular file through one descriptor and reject replacement or changes
-/// during hashing. Annex callers must first resolve their approved content path.
-pub fn hash_catalog_file(path: &std::path::Path) -> std::io::Result<([u8; 32], u64)> {
-    use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let before_path = std::fs::symlink_metadata(path)?;
-    if !before_path.is_file() {
-        return Err(std::io::Error::other(
-            "checksum target is not a regular file",
-        ));
-    }
-    let mut file = options.open(path)?;
-    let before = file.metadata()?;
-    if !same_metadata(&before_path, &before) {
-        return Err(std::io::Error::other(
-            "checksum target changed before reading",
-        ));
-    }
-    let mut hash = blake3::Hasher::new();
-    let mut bytes = 0u64;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-        bytes += read as u64;
-    }
-    if !same_metadata(&before, &file.metadata()?)
-        || !same_metadata(&before, &std::fs::symlink_metadata(path)?)
-        || bytes != before.len()
-    {
-        return Err(std::io::Error::other(
-            "checksum target changed while reading",
-        ));
-    }
-    Ok((*hash.finalize().as_bytes(), bytes))
-}
-fn same_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    if before.len() != after.len()
-        || before.modified().ok() != after.modified().ok()
-        || !after.is_file()
-    {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.ino() != after.ino()
-            || before.dev() != after.dev()
-            || before.ctime() != after.ctime()
-            || before.ctime_nsec() != after.ctime_nsec()
-        {
-            return false;
-        }
-    }
-    true
 }

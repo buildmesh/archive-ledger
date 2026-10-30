@@ -18,6 +18,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shlex
+import sqlite3
 import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
@@ -61,7 +63,7 @@ def main():
         script = [
             'set -euo pipefail',
             # Exit code 10 reports findings (for example at-risk Files) and is expected here.
-            f'archive() {{ local code=0; {binary} "$@" || code=$?; '
+            f'archive() {{ local code=0; {shlex.quote(str(binary))} "$@" || code=$?; '
             '[ "$code" -eq 0 ] || [ "$code" -eq 10 ] || return "$code"; }',
         ]
         for number, block in enumerate(blocks, 1):
@@ -80,9 +82,16 @@ def main():
             print(result.stdout)
         if result.returncode != 0:
             raise RuntimeError(f'guide failed ({result.returncode})\n{result.stdout}\n{result.stderr}')
-        final_status = result.stdout.rsplit('Archive:', 1)[-1]
-        if 'not yet on a sync remote' in final_status:
-            raise AssertionError(f'final status still warns about catalog protection:\n{final_status}')
+        # The removal example is preview-only, and restore never replaces the active catalog.
+        assert (home / 'Documents' / 'letter.txt').read_text() == 'Dear archive\n'
+        assert (Path(disk) / 'Documents' / 'letter.txt').read_text() == 'Dear archive\n'
+        restored = home / 'restored-personal-catalog.db'
+        backup = root / 'media' / 'offsite-disk' / 'personal-catalog.db'
+        for database in (backup, restored):
+            with sqlite3.connect(f'file:{database}?mode=ro', uri=True) as connection:
+                assert connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+                assert connection.execute('SELECT COUNT(*) FROM objects').fetchone()[0] == 3
+                assert connection.execute("SELECT COUNT(*) FROM files WHERE presence='missing'").fetchone()[0] == 0
         print(f'Ran {len(blocks)} bash blocks from {GUIDE.relative_to(REPO)} successfully.')
 
 

@@ -1,4 +1,5 @@
 #![cfg(unix)]
+mod support;
 use serde_json::Value;
 use std::{
     fs,
@@ -31,13 +32,7 @@ fn json(command: &mut Command) -> Value {
 fn file_find_groups_match_backup_content_and_stream_lossless_paths() {
     use std::os::unix::ffi::OsStringExt;
     let temp = TempDir::new().unwrap();
-    success(archive(&temp).args([
-        "init",
-        "Personal",
-        "--archive-id",
-        "arc_personal",
-        "--non-interactive",
-    ]));
+    support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
     let source = temp.path().join("source");
     let backup = temp.path().join("backup");
     fs::create_dir(&source).unwrap();

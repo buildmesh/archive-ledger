@@ -1,5 +1,7 @@
+mod support;
 #[cfg(unix)]
 mod unix {
+    use super::support;
     use std::fs;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
@@ -137,13 +139,7 @@ mod unix {
     #[test]
     fn lifecycle_guide_does_not_use_the_callers_selected_archive() {
         let caller = TempDir::new().unwrap();
-        success(archive(&caller).args([
-            "init",
-            "Caller archive",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(caller.path(), "Caller archive", "arc_personal", false);
         let caller_root = root(&caller);
         let database_before = fs::read(caller_root.join("archive.db")).unwrap();
         let head_before = git(&caller_root.join("canonical"), &["rev-parse", "HEAD"]).stdout;
@@ -179,13 +175,7 @@ mod unix {
     #[test]
     fn job_lookup_keeps_old_terminal_rows_authoritative() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let database = rusqlite::Connection::open(root(&temp).join("archive.db")).unwrap();
         database
             .execute_batch(
@@ -279,13 +269,7 @@ mod unix {
     #[test]
     fn sqlite_diagnostics_reach_human_and_json_errors() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         // A real SQLite failure against disposable bytes exercises the complete
         // projection-to-CLI error path without exhausting disks or changing mounts.
         let database = root(&temp).join("archive.db");
@@ -448,19 +432,10 @@ mod unix {
     }
 
     #[test]
-    fn init_status_verify_and_rebuild_use_one_verified_v2_state() {
+    fn legacy_fixture_status_verify_and_rebuild_use_one_verified_v2_state() {
         let temp = TempDir::new().unwrap();
-        let initialized = success(archive(&temp).args([
-            "--json",
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
-        let initialized = json(&initialized);
-        assert_eq!(initialized["version"], 2);
-        assert_eq!(initialized["archive_name"], "Personal");
+        let initialized = support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
+        assert_eq!(initialized.archive_name, "Personal");
 
         let before = json(&success(archive(&temp).args(["--json", "status"])));
         assert_eq!(before["schema_version"], 8);
@@ -529,21 +504,8 @@ mod unix {
         let empty_human = success(archive(&temp).args(["list"]));
         assert!(String::from_utf8_lossy(&empty_human.stdout).contains("No Archives configured"));
 
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
-        success(archive(&temp).args([
-            "init",
-            "Work",
-            "--archive-id",
-            "arc_work",
-            "--make-default",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
+        support::legacy_archive(temp.path(), "Work", "arc_work", true);
 
         let listed = json(&success(archive(&temp).args(["--json", "list"])));
         assert_eq!(listed["default_archive_id"], "arc_work");
@@ -572,13 +534,7 @@ mod unix {
     #[test]
     fn older_schema_projection_can_be_rebuilt_through_archive_path() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let archive_root = root(&temp);
         let database = archive_root.join("archive.db");
         // This tests dispatch around an unsupported projection header. Rebuild
@@ -620,13 +576,7 @@ mod unix {
     #[test]
     fn fsck_is_read_only_and_full_mode_compares_a_disposable_rebuild() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let archive_root = root(&temp);
         let canonical = archive_root.join("canonical");
         let database = archive_root.join("archive.db");
@@ -845,13 +795,7 @@ mod unix {
     #[test]
     fn fsck_full_compares_an_intentionally_behind_projection_at_its_frontier() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let archive_root = root(&temp);
         let canonical = archive_root.join("canonical");
         let database = archive_root.join("archive.db");
@@ -892,13 +836,7 @@ mod unix {
     #[test]
     fn sync_enrollment_approval_status_and_revocation_are_safe_cli_workflows() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let primary = root(&temp);
         let remote = temp.path().join("coordination.git");
         fs::create_dir(&remote).unwrap();
@@ -960,13 +898,7 @@ mod unix {
     #[test]
     fn managed_sync_remote_transfers_enrollment_and_incrementally_applies_projection() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let primary = root(&temp);
         let remote = temp.path().join("central.git");
         fs::create_dir(&remote).unwrap();
@@ -1124,13 +1056,7 @@ mod unix {
     #[test]
     fn sync_clone_uses_an_out_of_band_snapshot_and_applies_the_newer_tail() {
         let source_env = TempDir::new().unwrap();
-        success(archive(&source_env).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(source_env.path(), "Personal", "arc_personal", false);
         let remote = source_env.path().join("central.git");
         fs::create_dir(&remote).unwrap();
         git_success(&remote, &["init", "--bare", "--quiet"]);
@@ -1208,13 +1134,7 @@ mod unix {
     #[test]
     fn verification_rejects_corruption_and_pre_v2_trees_clearly() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let events = root(&temp).join("canonical/events/v2/origins");
         let origin = fs::read_dir(&events)
             .unwrap()
@@ -1254,10 +1174,10 @@ mod unix {
     #[test]
     fn failed_initialization_publishes_neither_archive_nor_registry_entry() {
         let temp = TempDir::new().unwrap();
-        let empty_path = temp.path().join("empty-path");
-        fs::create_dir(&empty_path).unwrap();
+        let blocked_data = temp.path().join("blocked-data");
+        fs::write(&blocked_data, b"not a directory").unwrap();
         let failed = archive(&temp)
-            .env("PATH", &empty_path)
+            .env("XDG_DATA_HOME", &blocked_data)
             .args([
                 "init",
                 "Personal",
@@ -1283,13 +1203,7 @@ mod unix {
     #[test]
     fn registry_commands_append_v2_batches_and_rebuild_the_same_topology() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         success(archive(&temp).args([
             "site",
             "add",
@@ -1375,13 +1289,7 @@ mod unix {
     #[test]
     fn collection_init_creates_starter_topology_and_policy_in_v2() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("content/photos");
         fs::create_dir_all(&content).unwrap();
         let initialized = json(&success(archive(&temp).args([
@@ -1427,13 +1335,7 @@ mod unix {
 
     fn immutable_files_fixture() -> (TempDir, PathBuf) {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("files");
         fs::create_dir(&content).unwrap();
         for (name, bytes) in [
@@ -3549,13 +3451,7 @@ mod unix {
         use std::os::unix::net::UnixListener;
 
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("content/files");
         fs::create_dir_all(content.join("excluded/nested")).unwrap();
         fs::write(content.join("excluded/nested/hidden.txt"), b"excluded").unwrap();
@@ -3965,13 +3861,7 @@ mod unix {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("content/files");
         fs::create_dir_all(content.join("nested")).unwrap();
         fs::create_dir(content.join(".git")).unwrap();
@@ -4590,13 +4480,7 @@ mod unix {
     #[test]
     fn list_new_annex_subtree_preserves_absence_and_reports_unreadable_links() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let repo = inventory_only_annex_fixture(&temp);
         success(archive(&temp).args([
             "collection",
@@ -4672,13 +4556,7 @@ mod unix {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let repo = inventory_only_annex_fixture(&temp);
         symlink(
             fs::read_link(repo.join("src/sha256")).unwrap(),
@@ -4854,13 +4732,7 @@ mod unix {
     #[test]
     fn interrupted_annex_import_of_a_changed_repository_is_cancelled_and_restarted() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let seed = temp.path().join("seed");
         fs::create_dir(&seed).unwrap();
         success(archive(&temp).args([
@@ -4985,13 +4857,7 @@ mod unix {
     #[test]
     fn annex_inventory_only_location_import_resumes_without_hashing() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let seed = temp.path().join("seed");
         fs::create_dir(&seed).unwrap();
         success(archive(&temp).args([
@@ -5098,13 +4964,7 @@ mod unix {
     #[test]
     fn annex_setup_guards_unfinished_and_completed_imports_before_writes() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let repo = inventory_only_annex_fixture(&temp);
         let alias = temp.path().join("annex-alias");
         std::os::unix::fs::symlink(&repo, &alias).unwrap();
@@ -5274,13 +5134,7 @@ mod unix {
     #[test]
     fn annex_inventory_only_unlocked_scan_defers_missing_and_resolves_retrieved_content() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let repo = temp.path().join("unlocked-annex");
         fs::create_dir(&repo).unwrap();
         git_success(&repo, &["init", "-b", "main"]);
@@ -5537,13 +5391,7 @@ mod unix {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let seed = temp.path().join("seed");
         fs::create_dir(&seed).unwrap();
         success(archive(&temp).args([
@@ -5812,13 +5660,7 @@ mod unix {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let seed = temp.path().join("seed");
         fs::create_dir(&seed).unwrap();
         success(archive(&temp).args([
@@ -6294,13 +6136,7 @@ mod unix {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
         fs::create_dir_all(source.join("nested")).unwrap();
@@ -6436,13 +6272,7 @@ mod unix {
     #[test]
     fn stage_audit_reuses_checksums_and_imports_only_archive_unknown_files() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let known = temp.path().join("known");
         let destination = temp.path().join("destination");
         let staged = temp.path().join("staged");
@@ -6592,13 +6422,7 @@ mod unix {
     fn verification_reads_due_copies_oldest_first_and_all_copies_on_request() {
         // A visible filesystem UUID lets the runner prove the Archive Root identity.
         let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("content/verify");
         fs::create_dir_all(&content).unwrap();
         for name in ["a.txt", "b.txt", "c.txt"] {
@@ -6735,13 +6559,7 @@ mod unix {
         // This fixture must live on a filesystem whose UUID is visible so the
         // fail-closed background reader can prove the Archive Root identity.
         let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("content/background");
         fs::create_dir_all(&content).unwrap();
         fs::write(content.join("one.txt"), b"one\n").unwrap();
@@ -6923,13 +6741,7 @@ mod unix {
     #[test]
     fn app_change_feed_and_access_planning_are_cursor_bound_and_set_oriented() {
         let temp = TempDir::new().unwrap();
-        success(archive(&temp).args([
-            "init",
-            "Personal",
-            "--archive-id",
-            "arc_personal",
-            "--non-interactive",
-        ]));
+        support::legacy_archive(temp.path(), "Personal", "arc_personal", false);
         let content = temp.path().join("content");
         fs::create_dir(&content).unwrap();
         success(archive(&temp).args([

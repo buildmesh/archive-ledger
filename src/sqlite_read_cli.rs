@@ -11,6 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 pub(super) fn execute_read(cli: &Cli, catalog: &SqliteCatalog) -> Result<Option<u8>, AppError> {
     match &cli.command {
         Command::File { command } => match command {
+            FileCommand::Removed(_) => return Ok(None),
             FileCommand::Find(args) => find(cli, catalog, args)?,
             FileCommand::Show { file_ref_id } => show(cli, catalog, file_ref_id)?,
             FileCommand::History {

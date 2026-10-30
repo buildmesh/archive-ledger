@@ -1,6 +1,6 @@
 # Archive Ledger Canonical Event Stream Specification
 
-Status: authoritative
+Status: authoritative for legacy event-tree catalogs only
 
 Date: 2026-08-19
 
@@ -8,6 +8,9 @@ This document defines the durable event log, its crash and checkpoint invariants
 and its relationship to SQLite. Product semantics are defined in the
 [product specification](2026-08-19-product.md); projection tables are defined in
 the [schema specification](2026-08-19-schema.md).
+
+New authoritative SQLite catalogs do not use this event stream. See the current
+[SQLite schema](2026-08-19-schema.md) and [product direction](2026-08-19-product.md).
 
 ## Authority and writer model
 
