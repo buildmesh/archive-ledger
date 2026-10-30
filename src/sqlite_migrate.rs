@@ -104,9 +104,17 @@ pub fn migrate_catalog(
     fs::create_dir(&stage_path)?;
     let stage = Staging(stage_path);
     let store = V2OriginStore::open(events)?;
-    let rebuilt = stage.0.join("legacy.db");
-    V2ProjectionDb::create_from_store(&store, &rebuilt)?;
-    let legacy = Connection::open(&rebuilt)?;
+    let snapshot = stage.0.join("legacy.db");
+    let mut legacy = Connection::open(&snapshot)?;
+    // SQLite backup includes committed WAL state without modifying the source.
+    // Keep all conversion scratch tables in this private snapshot, not the original.
+    rusqlite::backup::Backup::new(&original, &mut legacy)?.run_to_completion(
+        256,
+        std::time::Duration::from_millis(5),
+        None,
+    )?;
+    legacy.execute_batch("PRAGMA journal_mode=DELETE;")?;
+    let projection = V2ProjectionDb::open_existing(&snapshot)?;
     legacy.execute_batch("BEGIN IMMEDIATE")?;
     for (table, predicate) in [
         ("jobs", "status='running'"),
@@ -197,6 +205,15 @@ pub fn migrate_catalog(
         return Err(error);
     }
     let verified = verified?;
+    // Release any exclusive lock acquired by scratch-table cache spills before
+    // the validator opens its reader. This snapshot has no external writers.
+    legacy.execute_batch("COMMIT")?;
+    projection.validate_frontier(&verified).map_err(|error| {
+        MigrationError::Invalid(format!(
+            "existing SQLite projection is not current: {error}; run archive db apply on the original Archive and retry migration"
+        ))
+    })?;
+    legacy.execute_batch("BEGIN IMMEDIATE")?;
     let report = V2VerificationReport {
         version: 2,
         archive_id: archive_id.clone(),
@@ -230,7 +247,7 @@ pub fn migrate_catalog(
     drop(legacy);
     drop(original);
     fs::remove_file(restored)?;
-    fs::remove_file(rebuilt)?;
+    fs::remove_file(snapshot)?;
     File::open(&path)?.sync_all()?;
     crate::safe_copy::place_directory_no_replace(&stage.0, destination)?;
     Ok(MigrationReport {
@@ -737,6 +754,139 @@ mod tests {
         }
         files
     }
+    #[test]
+    fn migrates_after_snapshot_scratch_writes_spill_the_page_cache() {
+        let (temp, store, db) = fixture();
+        let items = (0..200)
+            .map(|i| {
+                let name = format!("file-{i}");
+                let mut item = content(&"11".repeat(32), &format!("copy-{i}"), 10, false);
+                item["file_ref_id"] = json!(name);
+                item["logical_path"] = json!(RegistryPath::utf8(&name));
+                item["copy_path"] = json!(RegistryPath::utf8(&name));
+                item
+            })
+            .collect();
+        store
+            .append_batch("migration_fixture", 1, json!({}), json!({}), items)
+            .unwrap();
+        db.apply(&store).unwrap();
+        let source = Connection::open(db.path()).unwrap();
+        // Persist a tiny cache limit in this fixture so the backed-up snapshot
+        // must spill its scratch writes before opening the validation reader.
+        source
+            .execute_batch("PRAGMA default_cache_size=10;")
+            .unwrap();
+        let before = original_bytes(store.root().parent().unwrap());
+        let destination = temp.path().join("converted");
+        let report = migrate_catalog(store.root(), db.path(), &destination).unwrap();
+        assert_eq!((report.objects, report.files), (200, 200));
+        assert_eq!(before, original_bytes(store.root().parent().unwrap()));
+    }
+
+    #[test]
+    fn reuses_projection_snapshot_including_committed_wal_without_replay() {
+        let (temp, store, db) = fixture();
+        append(&store, &db, content(&"11".repeat(32), "copy", 10, false));
+        let writer = Connection::open(db.path()).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        // A projection-only marker distinguishes snapshot reuse from history replay.
+        writer.execute("UPDATE collections SET description='snapshot marker' WHERE collection_id='collection'", []).unwrap();
+        let before_db = fs::read(db.path()).unwrap();
+        let wal = db.path().with_file_name("archive.db-wal");
+        let before_wal = fs::read(&wal).unwrap();
+        assert!(!before_wal.is_empty());
+        let destination = temp.path().join("converted");
+        migrate_catalog(store.root(), db.path(), &destination).unwrap();
+        let converted = SqliteCatalog::open_read_only(destination.join("archive.db")).unwrap();
+        assert_eq!(
+            converted
+                .connection()
+                .query_row(
+                    "SELECT description FROM collections WHERE collection_id='collection'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "snapshot marker"
+        );
+        assert_eq!(before_db, fs::read(db.path()).unwrap());
+        assert_eq!(before_wal, fs::read(&wal).unwrap());
+    }
+
+    #[test]
+    fn refuses_stale_projection_until_pending_history_is_applied() {
+        let (temp, store, db) = fixture();
+        store
+            .append_batch(
+                "migration_fixture",
+                1,
+                json!({}),
+                json!({}),
+                vec![content(&"11".repeat(32), "copy", 10, false)],
+            )
+            .unwrap();
+        let before = original_bytes(store.root().parent().unwrap());
+        let destination = temp.path().join("converted");
+        let error = migrate_catalog(store.root(), db.path(), &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("existing SQLite projection is not current"),
+            "{error}"
+        );
+        assert!(error.contains("archive db apply"));
+        assert!(!destination.exists());
+        assert_eq!(before, original_bytes(store.root().parent().unwrap()));
+        db.apply(&store).unwrap();
+        let report = migrate_catalog(store.root(), db.path(), &destination).unwrap();
+        assert_eq!((report.objects, report.files), (1, 1));
+    }
+
+    #[test]
+    fn refuses_inconsistent_projection_frontier_counts_and_origin_cursors() {
+        let (temp, store, db) = fixture();
+        let source = Connection::open(db.path()).unwrap();
+        let mutations = [
+            "UPDATE archive_meta SET value='different' WHERE key='genesis_hash'",
+            "UPDATE archive_meta SET value='different' WHERE key='applied_frontier_hash'",
+            "DELETE FROM records WHERE rowid=(SELECT MAX(rowid) FROM records)",
+            "UPDATE projection_origins SET applied_seq=applied_seq+1",
+            "UPDATE projection_origins SET applied_record_hash='different'",
+            "UPDATE projection_origins SET applied_segment_manifest_hash='different'",
+        ];
+        for (index, mutation) in mutations.iter().enumerate() {
+            let saved = temp.path().join(format!("saved-{index}.db"));
+            let mut copy = Connection::open(&saved).unwrap();
+            rusqlite::backup::Backup::new(&source, &mut copy)
+                .unwrap()
+                .run_to_completion(256, std::time::Duration::ZERO, None)
+                .unwrap();
+            drop(copy);
+            source.execute_batch(mutation).unwrap();
+            let before = original_bytes(store.root().parent().unwrap());
+            let destination = temp.path().join(format!("refused-{index}"));
+            let error = migrate_catalog(store.root(), db.path(), &destination)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("existing SQLite projection is not current"),
+                "{mutation}: {error}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(before, original_bytes(store.root().parent().unwrap()));
+            // Restore only this disposable fixture for the next independent mutation.
+            let saved = Connection::open(&saved).unwrap();
+            let mut restore = Connection::open(db.path()).unwrap();
+            rusqlite::backup::Backup::new(&saved, &mut restore)
+                .unwrap()
+                .run_to_completion(256, std::time::Duration::ZERO, None)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn migrates_expected_identity_damage_checks_and_restored_equivalence_without_source_changes() {
         let (temp, store, db) = fixture();

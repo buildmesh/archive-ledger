@@ -35,8 +35,13 @@ archive --archive /path/to/original migrate --to /path/to/sqlite-catalog
 archive --archive /path/to/sqlite-catalog status
 ```
 
-Migration keeps the original untouched, authenticates its canonical history, and
-validates both the converted catalog and a backup/restore round trip before publishing.
+Migration takes a consistent snapshot of the existing SQLite catalog, including committed
+WAL data, and checks its identity, frontier, record count, and origin cursors against
+authenticated canonical history. It does not rebuild the projection. If the catalog is
+behind, run `archive --archive /path/to/original db apply` and retry migration.
+History is still read to preserve audit records and checksum evidence. Migration keeps
+the original catalog intact and validates the converted catalog and a backup/restore
+round trip before publishing.
 It refuses unfinished work, conflicting expectations, duplicate path identities,
 and storage mappings that cannot preserve mirror paths. Resolve reported conditions
 in the original catalog before retrying into an absent destination. The destination
