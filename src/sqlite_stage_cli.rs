@@ -123,9 +123,6 @@ fn import(cli: &Cli, database: &mut SqliteCatalog, args: &StageImportArgs) -> Re
             "stage import in non-interactive mode requires --yes (or use --dry-run)".to_owned(),
         ));
     }
-    let reviewed = prepare_stage_import_sqlite(database, &args.source, args.manifest.as_deref())?;
-    let source = reviewed.source.clone();
-    let manifest = reviewed.manifest.clone();
     let requested_destination = args
         .destination_root
         .clone()
@@ -144,8 +141,16 @@ fn import(cli: &Cli, database: &mut SqliteCatalog, args: &StageImportArgs) -> Re
         args.collection.as_deref(),
     )?;
     let location = scope.location;
+    if !location.is_writable {
+        return Err(AppError::Input(
+            "stage destination Location is not writable".into(),
+        ));
+    }
     let location_root = scope.root;
     let collection_id = scope.collection_id;
+    let reviewed = prepare_stage_import_sqlite(database, &args.source, args.manifest.as_deref())?;
+    let source = reviewed.source.clone();
+    let manifest = reviewed.manifest.clone();
     if source.starts_with(&destination_cwd) || destination_cwd.starts_with(&source) {
         return Err(AppError::Input(
             "stage source and destination must not contain one another".to_owned(),
@@ -633,6 +638,56 @@ mod tests {
             stop_after_publish: true,
         };
         (temp, catalog, cli, args)
+    }
+
+    #[test]
+    fn stage_and_resume_reject_a_readonly_location_before_writes() {
+        let (_temp, mut catalog, cli, args) = fixture();
+        catalog
+            .connection()
+            .execute("UPDATE locations SET is_writable=0", [])
+            .unwrap();
+        let revision = catalog.metadata().unwrap().revision;
+        assert!(import(&cli, &mut catalog, &args)
+            .unwrap_err()
+            .to_string()
+            .contains("not writable"));
+        assert_eq!(catalog.metadata().unwrap().revision, revision);
+        assert!(!args
+            .destination_root
+            .as_ref()
+            .unwrap()
+            .join("imported")
+            .exists());
+        catalog
+            .connection()
+            .execute("UPDATE locations SET is_writable=1", [])
+            .unwrap();
+        import(&cli, &mut catalog, &args).unwrap();
+        let job: String = catalog
+            .connection()
+            .query_row("SELECT job_id FROM catalog_jobs", [], |r| r.get(0))
+            .unwrap();
+        catalog
+            .connection()
+            .execute("UPDATE locations SET is_writable=0", [])
+            .unwrap();
+        let revision = catalog.metadata().unwrap().revision;
+        assert!(resume(&cli, &mut catalog, &job)
+            .unwrap_err()
+            .to_string()
+            .contains("not writable"));
+        assert_eq!(catalog.metadata().unwrap().revision, revision);
+        assert_eq!(
+            std::fs::read(
+                args.destination_root
+                    .as_ref()
+                    .unwrap()
+                    .join("imported/file")
+            )
+            .unwrap(),
+            b"original"
+        );
     }
 
     #[test]

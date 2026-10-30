@@ -1980,12 +1980,17 @@ struct ContentHashes {
     modified_time_utc_ms: Option<u64>,
 }
 
+#[cfg(test)]
+thread_local! { static CONTENT_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 fn hash_file(
     path: &Path,
     initial_metadata: &Metadata,
     hash_sha512: bool,
     progress: Option<&Progress>,
 ) -> Result<ContentHashes> {
+    #[cfg(test)]
+    CONTENT_HASH_READS.with(|reads| reads.set(reads.get() + 1));
     let start = std::time::Instant::now();
     let mut file =
         File::open(path).map_err(|source| io_error("open annex content", path, source))?;
@@ -3525,6 +3530,33 @@ pub struct AnnexCatalogEntry {
     pub size_bytes: Option<u64>,
 }
 
+/// An indexed annex path whose local content has not been inspected yet.
+/// Select paths before calling `inspect` so excluded or capped work never hashes bytes.
+pub struct AnnexCatalogCandidate<'a> {
+    pub path: EncodedPath,
+    config: &'a AnnexImportConfig,
+    entry: &'a IndexEntry,
+    blob: &'a [u8],
+    key: AnnexKey,
+}
+impl AnnexCatalogCandidate<'_> {
+    pub fn inspect(self) -> Result<AnnexCatalogEntry> {
+        let outcome = inspect_entry_v2(self.config, self.entry, self.blob, &self.key, None)?;
+        let blake3 = outcome
+            .content
+            .as_ref()
+            .map(|content| blake3::Hash::from_hex(&content.blake3_hex).map(|hash| *hash.as_bytes()))
+            .transpose()
+            .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
+        Ok(AnnexCatalogEntry {
+            path: self.path,
+            category: outcome.category.as_str(),
+            blake3,
+            size_bytes: outcome.content.as_ref().map(|c| c.size),
+        })
+    }
+}
+
 /// Visit local annex references without publishing events or changing the repo.
 /// Returning false from the visitor stops checking content; remaining index output
 /// is drained so child processes terminate cleanly. Returns whether it exhausted
@@ -3532,7 +3564,7 @@ pub struct AnnexCatalogEntry {
 pub fn visit_annex_catalog_entries(
     repo: &Path,
     inventory_only: bool,
-    mut visitor: impl FnMut(AnnexCatalogEntry) -> bool,
+    mut visitor: impl FnMut(AnnexCatalogCandidate<'_>) -> bool,
 ) -> Result<bool> {
     let repo = validate_annex_repository(repo)?;
     let config = AnnexImportConfig {
@@ -3567,18 +3599,12 @@ pub fn visit_annex_catalog_entries(
         let Some(key) = annex_key_from_blob(&entry.mode, &blob) else {
             continue;
         };
-        let outcome = inspect_entry_v2(&config, &entry, &blob, &AnnexKey::parse(&key), None)?;
-        let blake3 = outcome
-            .content
-            .as_ref()
-            .map(|content| blake3::Hash::from_hex(&content.blake3_hex).map(|hash| *hash.as_bytes()))
-            .transpose()
-            .map_err(|error| AnnexImportError::InvalidConfig(error.to_string()))?;
-        complete = visitor(AnnexCatalogEntry {
+        complete = visitor(AnnexCatalogCandidate {
             path: encoded_worktree_path(&entry)?,
-            category: outcome.category.as_str(),
-            blake3,
-            size_bytes: outcome.content.as_ref().map(|c| c.size),
+            config: &config,
+            entry: &entry,
+            blob: &blob,
+            key: AnnexKey::parse(&key),
         });
     }
     index.finish()?;
@@ -3595,16 +3621,22 @@ pub fn validate_annex_restore_source(source: &Path, target: &Path) -> Result<Str
     })?;
     let key = AnnexKey::parse(&key_text);
     if key.expected_hash().is_none() {
-        return Err(AnnexImportError::InvalidConfig("annex restore requires a supported SHA256/SHA512 content key".into()));
+        return Err(AnnexImportError::InvalidConfig(
+            "annex restore requires a supported SHA256/SHA512 content key".into(),
+        ));
     }
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| io_error("inspect annex restore source", source, error))?;
     if !metadata.is_file() {
-        return Err(AnnexImportError::InvalidConfig("annex restore source is not a regular file".into()));
+        return Err(AnnexImportError::InvalidConfig(
+            "annex restore source is not a regular file".into(),
+        ));
     }
     let hashes = hash_file(source, &metadata, key.expected_sha512.is_some(), None)?;
     if !key.matches_content(&hashes) || key.expected_size.is_some_and(|size| size != hashes.size) {
-        return Err(AnnexImportError::InvalidConfig("source content does not match destination annex key".into()));
+        return Err(AnnexImportError::InvalidConfig(
+            "source content does not match destination annex key".into(),
+        ));
     }
     Ok(key_text)
 }
@@ -3620,9 +3652,59 @@ mod catalog_restore_tests {
         let digest = format!("{:x}", Sha256::digest(b"original"));
         let key = format!("SHA256E-s8--{digest}.txt");
         let target = PathBuf::from(format!(".git/annex/objects/a/b/{key}/{key}"));
-        assert_eq!(validate_annex_restore_source(&source, &target).unwrap(), key);
+        assert_eq!(
+            validate_annex_restore_source(&source, &target).unwrap(),
+            key
+        );
         fs::write(&source, b"modified").unwrap();
         assert!(validate_annex_restore_source(&source, &target).is_err());
         assert!(validate_annex_restore_source(&source, Path::new("ordinary-target")).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn catalog_selection_skips_content_reads_before_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [vec!["init", "-q"], vec!["config", "annex.uuid", "fixture"]] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let key = format!("SHA256E-s8--{:x}.txt", Sha256::digest(b"original"));
+        let target = PathBuf::from(format!(".git/annex/objects/a/b/{key}/{key}"));
+        fs::create_dir_all(repo.join(target.parent().unwrap())).unwrap();
+        fs::write(repo.join(&target), b"original").unwrap();
+        for name in ["a-selected", "b-excluded", "c-capped"] {
+            std::os::unix::fs::symlink(&target, repo.join(name)).unwrap();
+        }
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        CONTENT_HASH_READS.with(|reads| reads.set(0));
+        let complete = visit_annex_catalog_entries(repo, false, |candidate| {
+            match candidate.path.display.as_str() {
+                "a-selected" => {
+                    assert_eq!(candidate.inspect().unwrap().category, "present");
+                    true
+                }
+                "b-excluded" => true,
+                "c-capped" => false,
+                path => panic!("unexpected path {path}"),
+            }
+        })
+        .unwrap();
+        assert!(!complete);
+        assert_eq!(CONTENT_HASH_READS.with(|reads| reads.get()), 1);
+        // Completed verification work is skipped by the same pre-inspection boundary.
+        assert!(visit_annex_catalog_entries(repo, false, |_| true).unwrap());
+        assert_eq!(CONTENT_HASH_READS.with(|reads| reads.get()), 1);
     }
 }

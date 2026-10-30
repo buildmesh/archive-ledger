@@ -248,6 +248,12 @@ fn legacy_scope_identity(
     Ok(())
 }
 fn legacy_scan(cli: &Cli, catalog: &mut SqliteCatalog, args: &ScanArgs) -> Result<u8, AppError> {
+    if args.scan_id.is_some() {
+        return Err(AppError::Input(
+            "--scan-id is a legacy event identifier; use --job-id for SQLite scan jobs".into(),
+        ));
+    }
+
     if args
         .logical_prefix
         .as_ref()
@@ -332,6 +338,12 @@ fn legacy_annex(cli: &Cli, catalog: &mut SqliteCatalog, args: &AnnexArgs) -> Res
 }
 
 fn add(cli: &Cli, catalog: &mut SqliteCatalog, args: &CollectionAddArgs) -> Result<u8, AppError> {
+    if args.scan_id.is_some() {
+        return Err(AppError::Input(
+            "--scan-id is a legacy event identifier; use --job-id for SQLite scan jobs".into(),
+        ));
+    }
+
     let scope = resolve_scope(
         cli,
         catalog,
@@ -365,6 +377,12 @@ fn add(cli: &Cli, catalog: &mut SqliteCatalog, args: &CollectionAddArgs) -> Resu
     )
 }
 fn scan(cli: &Cli, catalog: &mut SqliteCatalog, args: &LocationScanArgs) -> Result<u8, AppError> {
+    if args.scan_id.is_some() {
+        return Err(AppError::Input(
+            "--scan-id is a legacy event identifier; use --job-id for SQLite scan jobs".into(),
+        ));
+    }
+
     let path = if let Some(path) = &args.path {
         path.clone()
     } else if let Some(selector) = args.location.as_deref() {
@@ -442,7 +460,46 @@ fn annex_content_root(path: &Path) -> Option<PathBuf> {
     let common = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
     Some(common.join("annex/objects"))
 }
-fn content_path(path: &Path, annex_root: Option<&Path>) -> Result<Option<PathBuf>, AppError> {
+// Reject indirection in Location-relative ancestors before reading any content.
+// Discovery applies the same device boundary to walks; direct verify/copy paths
+// must enforce it too, even when their leaf happens to be a regular file.
+fn validate_content_ancestors(root: &Path, path: &Path) -> Result<(), AppError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::Input("content path escapes its Location".into()))?;
+    ordinary_relative(relative)?;
+    let root_metadata = fs::symlink_metadata(root)?;
+    if !root_metadata.is_dir() {
+        return Err(AppError::Input("Location root is not a directory".into()));
+    }
+    let mut current = root.to_path_buf();
+    let count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)?;
+        if index + 1 < count && !metadata.is_dir() {
+            return Err(AppError::Input(
+                "content path has a symlink or non-directory ancestor".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.dev() != root_metadata.dev() {
+                return Err(AppError::Input(
+                    "content path crosses the Location filesystem boundary".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+fn content_path(
+    root: &Path,
+    path: &Path,
+    annex_root: Option<&Path>,
+) -> Result<Option<PathBuf>, AppError> {
+    validate_content_ancestors(root, path)?;
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_file() {
         return Ok(Some(path.to_path_buf()));
@@ -458,8 +515,12 @@ fn content_path(path: &Path, annex_root: Option<&Path>) -> Result<Option<PathBuf
     // Resolve existing targets, and reject arbitrary symlinks outside annex storage.
     match fs::canonicalize(&target) {
         Ok(target) => {
-            let root = fs::canonicalize(annex_root)?;
-            Ok(target.starts_with(root).then_some(target))
+            let annex = fs::canonicalize(annex_root)?;
+            if !target.starts_with(annex) {
+                return Ok(None);
+            }
+            validate_content_ancestors(root, &target)?;
+            Ok(Some(target))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // A dropped annex pointer is missing; an unrelated dangling link is ignored.
@@ -609,7 +670,7 @@ fn run_inventory(
                 }
             }
             if !selected.is_empty() {
-                let target = content_path(&physical, annex_root.as_deref())?
+                let target = content_path(&config.root, &physical, annex_root.as_deref())?
                     .ok_or_else(|| AppError::Input("accepted path is not a regular file".into()))?;
                 hash_catalog_file(&target)?;
             }
@@ -618,13 +679,19 @@ fn run_inventory(
         let result = if config.inventory_only {
             ObservationResult::MetadataUnknown
         } else {
-            match content_path(&physical, annex_root.as_deref()) {
+            match content_path(&config.root, &physical, annex_root.as_deref()) {
                 Ok(Some(target)) => match hash_catalog_file(&target) {
-                    Ok((blake3, size_bytes)) => {
+                    Ok((blake3, size_bytes))
+                        if content_path(&config.root, &physical, annex_root.as_deref())
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            == Some(&target) =>
+                    {
                         summary.bytes_observed += size_bytes;
                         ObservationResult::Checksum { blake3, size_bytes }
                     }
-                    Err(_) => {
+                    Ok(_) | Err(_) => {
                         summary.read_errors += 1;
                         ObservationResult::ReadError
                     }
@@ -755,8 +822,24 @@ struct VerifyConfig {
     all: bool,
     cutoff: u64,
     object_id: Option<String>,
+    #[serde(default = "default_verify_batch_entries")]
+    batch_entries: usize,
+}
+fn default_verify_batch_entries() -> usize {
+    500
 }
 fn verify(cli: &Cli, catalog: &mut SqliteCatalog, args: &VerifyArgs) -> Result<u8, AppError> {
+    if args.copy.is_some() {
+        return Err(AppError::Input("--copy selects legacy copy claims and is unsupported for SQLite catalogs; select a Location instead".into()));
+    }
+    if !matches!(args.fingerprint_status.as_str(), "match" | "unavailable") {
+        return Err(AppError::Input("verification requires a matching mount; --fingerprint-status must be match or unavailable".into()));
+    }
+    if args.batch_entries == 0 || i64::try_from(args.batch_entries).is_err() {
+        return Err(AppError::Input(
+            "--batch-entries must be positive and fit the SQLite integer range".into(),
+        ));
+    }
     let state = catalog.registry_state(false)?;
     let locations = if let Some(selector) = &args.location {
         vec![select_location(&state.locations, selector)?
@@ -764,6 +847,11 @@ fn verify(cli: &Cli, catalog: &mut SqliteCatalog, args: &VerifyArgs) -> Result<u
     } else {
         state.locations.clone()
     };
+    if args.job_id.is_some() && locations.len() != 1 {
+        return Err(AppError::Input(
+            "a fixed verification job ID requires one Location".into(),
+        ));
+    }
     if args.path.is_some() && locations.len() != 1 {
         return Err(AppError::Input(
             "--path requires one explicit Location".into(),
@@ -812,7 +900,8 @@ fn verify(cli: &Cli, catalog: &mut SqliteCatalog, args: &VerifyArgs) -> Result<u
                     root: root.clone(),
                     all: args.all,
                     cutoff,
-                    object_id: args.copy.clone(),
+                    object_id: None,
+                    batch_entries: args.batch_entries,
                 },
                 args.job_id.as_deref(),
                 args.max_items,
@@ -833,6 +922,9 @@ fn run_verify(
     max_items: Option<usize>,
     reports: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<u8, AppError> {
+    if config.batch_entries == 0 || i64::try_from(config.batch_entries).is_err() {
+        return Err(AppError::Input("invalid verification batch size".into()));
+    }
     validate_saved_root(cli, catalog, &config.location_id, &config.root)?;
     let job_id = job
         .map(str::to_owned)
@@ -873,7 +965,7 @@ fn run_verify(
             inventory_only: false,
             annex_import: false,
             import_id: None,
-            batch_entries: 500,
+            batch_entries: config.batch_entries,
         };
         paused = inventory_annex_entries(
             catalog,
@@ -893,7 +985,7 @@ fn run_verify(
             WHERE o.collection_id=?1 AND f.location_id=?2 AND o.object_id>?3 AND (?4 IS NULL OR o.object_id=?4)
             AND (?5 OR f.integrity!='verified' OR f.presence!='present' OR f.last_success_time_utc_ms IS NULL OR f.last_success_time_utc_ms<=?6)
             AND NOT EXISTS(SELECT 1 FROM catalog_job_items j WHERE j.job_id=?7 AND j.object_id=o.object_id)
-            ORDER BY o.object_id LIMIT 500")?.query_map(params![config.collection_id,config.location_id,cursor,config.object_id,config.all,config.cutoff as i64,job_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,String>(3)?)))?.collect::<Result<Vec<_>,_>>()?;
+            ORDER BY o.object_id LIMIT ?8")?.query_map(params![config.collection_id,config.location_id,cursor,config.object_id,config.all,config.cutoff as i64,job_id,config.batch_entries as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,String>(3)?)))?.collect::<Result<Vec<_>,_>>()?;
         if rows.is_empty() {
             break;
         }
@@ -906,13 +998,27 @@ fn run_verify(
             cursor = id;
             let relative = relative_path_from_bytes(&encoding, &bytes)?;
             ordinary_relative(&relative)?;
-            let result = match content_path(&config.root.join(relative), annex_root.as_deref()) {
+            let result = match content_path(
+                &config.root,
+                &config.root.join(&relative),
+                annex_root.as_deref(),
+            ) {
                 Ok(Some(path)) => match hash_catalog_file(&path) {
-                    Ok((blake3, size_bytes)) => {
+                    Ok((blake3, size_bytes))
+                        if content_path(
+                            &config.root,
+                            &config.root.join(&relative),
+                            annex_root.as_deref(),
+                        )
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                            == Some(&path) =>
+                    {
                         summary.bytes_observed += size_bytes;
                         ObservationResult::Checksum { blake3, size_bytes }
                     }
-                    Err(_) => {
+                    Ok(_) | Err(_) => {
                         summary.read_errors += 1;
                         ObservationResult::ReadError
                     }
@@ -1151,10 +1257,14 @@ fn run_copy(
                 count += 1;
                 continue;
             }
-            let source = content_path(&config.source_root.join(&relative), annex_root.as_deref())?
-                .ok_or_else(|| {
-                    AppError::Input("copy source is not a regular or annex content file".into())
-                })?;
+            let source = content_path(
+                &config.source_root,
+                &config.source_root.join(&relative),
+                annex_root.as_deref(),
+            )?
+            .ok_or_else(|| {
+                AppError::Input("copy source is not a regular or annex content file".into())
+            })?;
             let logical_destination = config.root.join(&relative);
             create_safe_destination_parents(&config.root, &relative)?;
             let saved_link = match fs::symlink_metadata(&logical_destination) {
@@ -1201,6 +1311,18 @@ fn run_copy(
                 }
                 Err(e) => return Err(e.into()),
             };
+            if content_path(
+                &config.source_root,
+                &config.source_root.join(&relative),
+                annex_root.as_deref(),
+            )?
+            .as_ref()
+                != Some(&source)
+            {
+                return Err(AppError::Input(
+                    "copy source changed its Location path during reading".into(),
+                ));
+            }
             if let Some(target) = saved_link {
                 if fs::read_link(&logical_destination)? != target {
                     return Err(AppError::Input(
@@ -1385,14 +1507,15 @@ fn inventory_annex_entries(
     summary: &mut InventorySummary,
     verification: Option<&VerifyConfig>,
 ) -> Result<bool, AppError> {
+    let annex_root = annex_content_root(&config.root);
     let mut error = None;
     let mut batch = Vec::new();
     let complete = archive_ledger::annex::visit_annex_catalog_entries(
         &config.path,
         config.inventory_only,
-        |entry| {
+        |candidate| {
             let action = (|| -> Result<bool, AppError> {
-                let relative = path_from_encoded(&entry.path)?;
+                let relative = path_from_encoded(&candidate.path)?;
                 if config
                     .exclusions
                     .iter()
@@ -1413,11 +1536,39 @@ fn inventory_annex_entries(
                     }
                 }
                 let processed:bool=catalog.connection().query_row("SELECT EXISTS(SELECT 1 FROM objects o JOIN catalog_job_items j ON j.object_id=o.object_id WHERE j.job_id=?1 AND o.collection_id=?2 AND o.relative_path_encoding=?3 AND o.relative_path_bytes=?4)",params![job_id,config.collection_id,path.encoding,bytes],|r|r.get(0))?;
+                // A resumed verification never rechecks completed work. Inventory
+                // scans recheck it so absence coverage remains valid for this pass.
+                if verification.is_some() && processed {
+                    return Ok(true);
+                }
                 if !processed && max_items.is_some_and(|max| *new_work >= max) {
                     return Ok(false);
                 }
                 if !processed {
                     *new_work += 1;
+                }
+                let content_before =
+                    match content_path(&config.root, &absolute, annex_root.as_deref()) {
+                        Ok(Some(path)) => Some(path),
+                        Err(AppError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            None
+                        }
+                        Ok(None) => return Err(AppError::Input(
+                            "annex reference does not resolve within its Location content storage"
+                                .into(),
+                        )),
+                        Err(error) => return Err(error),
+                    };
+                let entry = candidate.inspect()?;
+                if matches!(entry.category, "present" | "mismatched")
+                    && content_path(&config.root, &absolute, annex_root.as_deref())?
+                        != content_before
+                {
+                    return Err(AppError::Input(
+                        "annex content path changed during inspection".into(),
+                    ));
                 }
                 let result = match entry.category {
                     "present" => ObservationResult::Checksum {
@@ -1799,5 +1950,122 @@ mod tests {
                 .unwrap(),
             "damaged"
         );
+    }
+    #[test]
+    fn unsupported_scope_options_fail_before_creating_jobs() {
+        let (_temp, mut catalog, _cli, primary, _backup) = fixture();
+        for args in [
+            vec!["archive", "verify", "primary", "--copy", "copy_legacy"],
+            vec![
+                "archive",
+                "verify",
+                "primary",
+                "--fingerprint-status",
+                "mismatch",
+            ],
+            vec!["archive", "verify", "primary", "--batch-entries", "0"],
+            vec!["archive", "verify", "--job-id", "ambiguous"],
+            vec![
+                "archive",
+                "collection",
+                "add",
+                primary.to_str().unwrap(),
+                "--collection",
+                "collection",
+                "--scan-id",
+                "legacy",
+            ],
+            vec![
+                "archive",
+                "location",
+                "scan",
+                "primary",
+                "--scan-id",
+                "legacy",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(execute_write(&cli, &mut catalog).is_err());
+        }
+        assert_eq!(
+            catalog
+                .connection()
+                .query_row("SELECT COUNT(*) FROM catalog_jobs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ancestor_cannot_verify_or_supply_a_location_copy() {
+        let (temp, mut catalog, cli, primary, backup) = fixture();
+        fs::create_dir(primary.join("sub")).unwrap();
+        fs::write(primary.join("sub/file"), b"original").unwrap();
+        run_inventory(
+            &cli,
+            &mut catalog,
+            inventory(&primary),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        run_copy(
+            &cli,
+            &mut catalog,
+            copying(&primary, &backup),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("file"), b"original").unwrap();
+        fs::remove_file(backup.join("sub/file")).unwrap();
+        fs::remove_dir(backup.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&external, backup.join("sub")).unwrap();
+        fs::remove_file(primary.join("sub/file")).unwrap();
+        catalog
+            .observe(&CatalogObservation {
+                collection_id: "collection".into(),
+                location_id: "primary".into(),
+                path: RegistryPath::utf8("sub/file"),
+                time_utc_ms: now_utc_ms().unwrap(),
+                result: ObservationResult::Missing,
+                accept_change: false,
+                operation_key: None,
+                job_id: None,
+            })
+            .unwrap();
+        let mut reverse = copying(&backup, &primary);
+        reverse.location_id = "primary".into();
+        reverse.source_location_id = "backup".into();
+        assert!(run_copy(&cli, &mut catalog, reverse, None, None, false).is_err());
+        assert!(!primary.join("sub/file").exists());
+        assert_eq!(
+            run_verify(
+                &cli,
+                &mut catalog,
+                VerifyConfig {
+                    collection_id: "collection".into(),
+                    location_id: "backup".into(),
+                    root: backup.clone(),
+                    all: true,
+                    cutoff: 0,
+                    object_id: None,
+                    batch_entries: 1
+                },
+                None,
+                None,
+                None
+            )
+            .unwrap(),
+            EXIT_FINDINGS
+        );
+        assert_eq!(catalog.connection().query_row("SELECT COUNT(*) FROM files WHERE location_id='backup' AND integrity='verified'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(fs::read(external.join("file")).unwrap(), b"original");
     }
 }
