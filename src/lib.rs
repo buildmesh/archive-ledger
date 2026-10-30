@@ -17,6 +17,7 @@ pub mod registry;
 pub mod review;
 pub mod safe_copy;
 pub mod scan;
+pub mod sqlite_backup;
 pub mod sqlite_catalog;
 pub mod sqlite_queries;
 pub mod sqlite_registry;
