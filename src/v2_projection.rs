@@ -1172,6 +1172,13 @@ impl V2ProjectionDb {
 
     pub fn validate_against_store(&self, store: &V2OriginStore) -> Result<V2ProjectionStatus> {
         let verified = store.verify_compact()?;
+        self.validate_frontier(&verified)
+    }
+
+    pub(crate) fn validate_frontier(
+        &self,
+        verified: &VerifiedV2Archive,
+    ) -> Result<V2ProjectionStatus> {
         let status = self.status()?;
         if status.archive_id != verified.genesis.body.archive_id
             || status.genesis_hash != verified.genesis_hash

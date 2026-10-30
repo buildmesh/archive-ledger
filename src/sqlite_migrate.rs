@@ -104,9 +104,17 @@ pub fn migrate_catalog(
     fs::create_dir(&stage_path)?;
     let stage = Staging(stage_path);
     let store = V2OriginStore::open(events)?;
-    let rebuilt = stage.0.join("legacy.db");
-    V2ProjectionDb::create_from_store(&store, &rebuilt)?;
-    let legacy = Connection::open(&rebuilt)?;
+    let snapshot = stage.0.join("legacy.db");
+    let mut legacy = Connection::open(&snapshot)?;
+    // SQLite backup includes committed WAL state without modifying the source.
+    // Keep all conversion scratch tables in this private snapshot, not the original.
+    rusqlite::backup::Backup::new(&original, &mut legacy)?.run_to_completion(
+        256,
+        std::time::Duration::from_millis(5),
+        None,
+    )?;
+    legacy.execute_batch("PRAGMA journal_mode=DELETE;")?;
+    let projection = V2ProjectionDb::open_existing(&snapshot)?;
     legacy.execute_batch("BEGIN IMMEDIATE")?;
     for (table, predicate) in [
         ("jobs", "status='running'"),
@@ -197,6 +205,15 @@ pub fn migrate_catalog(
         return Err(error);
     }
     let verified = verified?;
+    // Release any exclusive lock acquired by scratch-table cache spills before
+    // the validator opens its reader. This snapshot has no external writers.
+    legacy.execute_batch("COMMIT")?;
+    projection.validate_frontier(&verified).map_err(|error| {
+        MigrationError::Invalid(format!(
+            "existing SQLite projection is not current: {error}; run archive db apply on the original Archive and retry migration"
+        ))
+    })?;
+    legacy.execute_batch("BEGIN IMMEDIATE")?;
     let report = V2VerificationReport {
         version: 2,
         archive_id: archive_id.clone(),
@@ -230,7 +247,7 @@ pub fn migrate_catalog(
     drop(legacy);
     drop(original);
     fs::remove_file(restored)?;
-    fs::remove_file(rebuilt)?;
+    fs::remove_file(snapshot)?;
     File::open(&path)?.sync_all()?;
     crate::safe_copy::place_directory_no_replace(&stage.0, destination)?;
     Ok(MigrationReport {
