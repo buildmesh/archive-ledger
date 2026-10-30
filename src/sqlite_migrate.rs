@@ -318,8 +318,12 @@ fn precedes(a: &Expectation, b: &Expectation, v: &VerifiedV2Archive) -> bool {
 fn expected_for(
     source: &Connection,
     file: &str,
+    projected: Option<&Vec<u8>>,
     v: &VerifiedV2Archive,
 ) -> Result<Option<Expectation>> {
+    let Some(projected) = projected else {
+        return Ok(None);
+    };
     let mut stmt=source.prepare("SELECT hash,size,accepted,origin,seq,item,frontier,time FROM migration_expectations WHERE file=?1 ORDER BY origin,seq,item")?;
     let mut pending = stmt
         .query_map([file], |r| {
@@ -335,6 +339,9 @@ fn expected_for(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Migration adopts the current projection's expected identity. Historical
+    // versions remain in the audit trail; they need no retroactive acceptance.
+    pending.retain(|e| &e.hash == projected);
     if pending.is_empty() {
         // Annex metadata aliases may inherit an already authenticated source
         // identity without reading the same physical content once per alias.
@@ -353,11 +360,7 @@ fn expected_for(
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if pending.iter().any(|e| e.accepted) {
-            return Err(MigrationError::Invalid(format!(
-                "cannot infer accepted change through another annex alias for {file}"
-            )));
-        }
+        pending.retain(|e| &e.hash == projected);
     }
     let mut applied: Vec<Expectation> = Vec::new();
     while !pending.is_empty() {
@@ -372,22 +375,6 @@ fn expected_for(
                 MigrationError::Invalid(format!("cyclic expectation history for {file}"))
             })?;
         let next = pending.remove(index);
-        for previous in &applied {
-            if previous.hash != next.hash
-                && (!precedes(previous, &next, v)
-                    || !applied.iter().chain(std::iter::once(&next)).any(|accept| {
-                        accept.accepted
-                            && accept.hash == next.hash
-                            && precedes(previous, accept, v)
-                            && (precedes(accept, &next, v)
-                                || (accept.origin == next.origin
-                                    && accept.seq == next.seq
-                                    && accept.item == next.item))
-                    }))
-            {
-                return Err(MigrationError::Invalid(format!("conflicting checksums for {file}; changed identity lacks an explicit causal accepted_change")));
-            }
-        }
         // A same-hash observation after an accepted change must not invalidate the
         // accept marker used to reject older copy evidence.
         applied.push(next);
@@ -416,7 +403,7 @@ fn copy_objects(source: &Connection, target: &Connection, v: &VerifiedV2Archive)
                 "unresolved identity conflict for {file}"
             )));
         }
-        let expected = expected_for(source, &file, v)?;
+        let expected = expected_for(source, &file, projected.as_ref(), v)?;
         if expected.as_ref().map(|e| &e.hash) != projected.as_ref() {
             return Err(MigrationError::Invalid(format!(
                 "cannot authenticate expected checksum for {file}"
@@ -943,7 +930,7 @@ mod tests {
         );
     }
     #[test]
-    fn refuses_unaccepted_change_but_accepts_explicit_change_then_normal_verification() {
+    fn preserves_explicit_change_checks_and_migrates_a_later_historical_reversion() {
         let (temp, store, db) = fixture();
         let old = "11".repeat(32);
         let new = "22".repeat(32);
@@ -962,18 +949,94 @@ mod tests {
         );
         append(&store, &db, content(&old, "copy_reverted", 101, false));
         let before = original_bytes(store.root().parent().unwrap());
-        let refused = temp.path().join("refused");
-        assert!(migrate_catalog(store.root(), db.path(), &refused)
-            .unwrap_err()
-            .to_string()
-            .contains("explicit causal accepted_change"));
-        assert!(!refused.exists());
+        let reverted = temp.path().join("reverted");
+        migrate_catalog(store.root(), db.path(), &reverted).unwrap();
+        let catalog = SqliteCatalog::open_read_only(reverted.join("archive.db")).unwrap();
+        assert_eq!(
+            catalog
+                .connection()
+                .query_row("SELECT lower(hex(expected_blake3)) FROM objects", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            old
+        );
+        assert_eq!(
+            catalog
+                .connection()
+                .query_row("SELECT integrity FROM files", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "verified"
+        );
         assert_eq!(before, original_bytes(store.root().parent().unwrap()));
     }
     fn annex(file: &str, present: bool) -> Value {
         let hash = "33".repeat(32);
         json!({"kind":"annex_entry_observed","collection_id":"collection","file_ref_id":file,"logical_path":RegistryPath::utf8(file),"external_identity_id":"external","external_key":"SHA256-key","expected_hash_algo":"sha256","expected_hash_hex":hash,"expected_size_bytes":4,"observed_size_bytes":4,"resolution_state":if present{"resolved"}else{"unresolved"},"worktree_location_id":"location","cas_location_id":"location","source_repo_id":"repo","representation":"annex_locked_symlink","path_state":"present","local_availability":if present{"present"}else{"unknown"},"object_id":present.then(||format!("blake3:{hash}")),"blake3_hex":present.then_some(&hash),"sha256_hex":present.then_some(&hash),"claim_basis":if present{"observed_bytes"}else{"source_metadata"},"copy_claim_id":"annex_copy","copy_location_id":"location","copy_path":RegistryPath::utf8(".git/annex/objects/key"),"copy_state":if present{"present"}else{"unknown"},"verification_result":present.then_some("ok")})
     }
+    #[test]
+    fn annex_history_with_different_versions_uses_current_identity_and_keeps_other_copy_unverified()
+    {
+        let (temp, store, db) = fixture();
+        let original = annex("README.txt", true);
+        append(&store, &db, original.clone());
+        let different_hash = "44".repeat(32);
+        let mut different = original.clone();
+        different["external_identity_id"] = json!("different_external");
+        different["external_key"] = json!("different-key");
+        different["expected_hash_hex"] = json!(different_hash);
+        different["sha256_hex"] = json!(different_hash);
+        different["blake3_hex"] = json!(different_hash);
+        different["object_id"] = json!(format!("blake3:{different_hash}"));
+        different["observed_size_bytes"] = json!(5);
+        different["expected_size_bytes"] = json!(5);
+        different["copy_claim_id"] = json!("different_copy");
+        different["copy_path"] = json!(RegistryPath::utf8(".git/annex/objects/different"));
+        for key in [
+            "worktree_location_id",
+            "cas_location_id",
+            "copy_location_id",
+        ] {
+            different[key] = json!("other");
+        }
+        append(&store, &db, different);
+        append(&store, &db, original);
+        let before = original_bytes(store.root().parent().unwrap());
+        let destination = temp.path().join("versions");
+        let report = migrate_catalog(store.root(), db.path(), &destination).unwrap();
+        let catalog = SqliteCatalog::open_read_only(destination.join("archive.db")).unwrap();
+        assert_eq!(
+            catalog
+                .connection()
+                .query_row(
+                    "SELECT lower(hex(expected_blake3)),expected_size_bytes FROM objects",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            ("33".repeat(32), 4)
+        );
+        let copies:Vec<(String,String,String)> = catalog.connection().prepare("SELECT location_id,integrity,lower(hex(observed_blake3)) FROM files ORDER BY location_id").unwrap().query_map([], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+        assert_eq!(
+            copies,
+            vec![
+                ("location".into(), "verified".into(), "33".repeat(32)),
+                ("other".into(), "unverified".into(), different_hash)
+            ]
+        );
+        assert_eq!(
+            catalog
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM history WHERE kind='legacy_record'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            report.legacy_records as i64
+        );
+        assert_eq!(before, original_bytes(store.root().parent().unwrap()));
+    }
+
     #[test]
     fn preserves_annex_aliases_and_unresolved_paths_but_rejects_cas_only_locations() {
         let (temp, store, db) = fixture();

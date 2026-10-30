@@ -42,7 +42,11 @@ behind, run `archive --archive /path/to/original db apply` and retry migration.
 History is still read to preserve audit records and checksum evidence. Migration keeps
 the original catalog intact and validates the converted catalog and a backup/restore
 round trip before publishing.
-It refuses unfinished work, conflicting expectations, duplicate path identities,
+For this one-time conversion, the current SQLite expected checksum wins over older
+historical versions; no retroactive `accepted_change` record is required. Historical
+versions remain in the audit trail, and copies with a different checksum do not count
+as verified backups. Normal post-migration immutable-file rules are unchanged.
+It refuses unfinished work, unresolved identities marked as conflicting, duplicate path identities,
 and storage mappings that cannot preserve mirror paths. Resolve reported conditions
 in the original catalog before retrying into an absent destination. The destination
 contains `archive.db` and `migration-backup.db`; it is not automatically activated.
