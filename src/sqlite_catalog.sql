@@ -177,3 +177,30 @@ CREATE TRIGGER history_no_update BEFORE UPDATE ON history
 BEGIN SELECT RAISE(ABORT, 'catalog history is append-only'); END;
 CREATE TRIGGER history_no_delete BEFORE DELETE ON history
 BEGIN SELECT RAISE(ABORT, 'catalog history is append-only'); END;
+
+-- Resumable local work and its coverage, committed with the observations it produced.
+CREATE TABLE catalog_jobs (
+    job_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running','complete','partial','cancelled')),
+    started_time_utc_ms INTEGER NOT NULL,
+    finished_time_utc_ms INTEGER,
+    progress_json TEXT NOT NULL DEFAULT '{}'
+) STRICT;
+CREATE TABLE catalog_scan_seen (
+    job_id TEXT NOT NULL REFERENCES catalog_jobs(job_id),
+    object_id TEXT NOT NULL REFERENCES objects(object_id),
+    PRIMARY KEY(job_id,object_id)
+) STRICT;
+CREATE TABLE catalog_write_operations (
+    operation_key TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    outcome_json TEXT NOT NULL
+) STRICT;
+-- Completed work survives a restarted enumeration; seen coverage is per pass.
+CREATE TABLE catalog_job_items (
+    job_id TEXT NOT NULL REFERENCES catalog_jobs(job_id),
+    object_id TEXT NOT NULL REFERENCES objects(object_id),
+    PRIMARY KEY(job_id,object_id)
+) STRICT;

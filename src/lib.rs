@@ -18,6 +18,8 @@ pub mod review;
 pub mod safe_copy;
 pub mod scan;
 pub mod sqlite_catalog;
+pub mod sqlite_queries;
+pub mod sqlite_registry;
 pub mod stage;
 pub mod status;
 pub mod storage;
@@ -142,3 +144,5 @@ pub use sqlite_catalog::{
     CatalogMetadata, SqliteCatalog, SqliteCatalogError, CATALOG_APPLICATION_ID,
     CATALOG_SCHEMA_VERSION,
 };
+
+pub mod sqlite_writes;

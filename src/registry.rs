@@ -397,56 +397,88 @@ impl V2ProjectionDb {
         let applied_event_seq = self.status()?.records;
         let connection =
             Connection::open(self.path()).map_err(|source| sqlite_error(self.path(), source))?;
-        let status = (!include_retired).then_some("active");
-        let sites = query_rows(
-            &connection,
-            "SELECT site_id, display_name, site_kind, description, status FROM sites
+        let entities = load_registry_entities(&connection, self.path(), include_retired)?;
+        Ok(RegistryState {
+            version: 2,
+            applied_event_seq,
+            sites: entities.sites,
+            policies: entities.policies,
+            collections: entities.collections,
+            devices: entities.devices,
+            archive_roots: entities.archive_roots,
+            locations: entities.locations,
+            risk_domains: entities.risk_domains,
+            risk_assignments: entities.risk_assignments,
+        })
+    }
+}
+
+pub(crate) struct RegistryEntities {
+    pub sites: Vec<SiteSnapshot>,
+    pub policies: Vec<PolicySnapshot>,
+    pub collections: Vec<CollectionSnapshot>,
+    pub devices: Vec<DeviceSnapshot>,
+    pub archive_roots: Vec<ArchiveRootSnapshot>,
+    pub locations: Vec<LocationSnapshot>,
+    pub risk_domains: Vec<RiskDomainSnapshot>,
+    pub risk_assignments: Vec<RiskAssignment>,
+}
+
+pub(crate) fn load_registry_entities(
+    connection: &Connection,
+    path: &Path,
+    include_retired: bool,
+) -> Result<RegistryEntities> {
+    let status = (!include_retired).then_some("active");
+    let sites = query_rows(
+        connection,
+        "SELECT site_id, display_name, site_kind, description, status FROM sites
              WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, site_id",
-            status,
-            |row| {
-                Ok(SiteSnapshot {
-                    site_id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    site_kind: row.get(2)?,
-                    description: row.get(3)?,
-                    status: row.get(4)?,
-                })
-            },
-            self.path(),
-        )?;
-        let policies = query_rows(
-            &connection,
-            "SELECT policy_id, display_name, policy_version, requirements_json, enabled, status
+        status,
+        |row| {
+            Ok(SiteSnapshot {
+                site_id: row.get(0)?,
+                display_name: row.get(1)?,
+                site_kind: row.get(2)?,
+                description: row.get(3)?,
+                status: row.get(4)?,
+            })
+        },
+        path,
+    )?;
+    let policies = query_rows(
+        connection,
+        "SELECT policy_id, display_name, policy_version, requirements_json, enabled, status
              FROM policies WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, policy_id",
-            status,
-            |row| {
-                let requirements: String = row.get(3)?;
-                let requirements = serde_json::from_str(&requirements).map_err(|error| {
+        status,
+        |row| {
+            let requirements: String = row.get(3)?;
+            let requirements = serde_json::from_str(&requirements).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(PolicySnapshot {
+                policy_id: row.get(0)?,
+                display_name: row.get(1)?,
+                policy_version: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
+                        2,
+                        rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
-                })?;
-                Ok(PolicySnapshot {
-                    policy_id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    policy_version: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Integer,
-                            Box::new(error),
-                        )
-                    })?,
-                    requirements,
-                    enabled: row.get(4)?,
-                    status: row.get(5)?,
-                })
-            },
-            self.path(),
-        )?;
-        let collections = query_rows(
-            &connection,
+                })?,
+                requirements,
+                enabled: row.get(4)?,
+                status: row.get(5)?,
+            })
+        },
+        path,
+    )?;
+    let collections = query_rows(
+            connection,
             "SELECT collection_id, display_name, description, home_site_id, policy_id, status
              FROM collections WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, collection_id",
             status,
@@ -460,130 +492,125 @@ impl V2ProjectionDb {
                     status: row.get(5)?,
                 })
             },
-            self.path(),
+            path,
         )?;
-        let devices = query_rows(
-            &connection,
-            "SELECT device_id, display_name, device_kind, serial_hint, hardware_fingerprint,
+    let devices = query_rows(
+        connection,
+        "SELECT device_id, display_name, device_kind, serial_hint, hardware_fingerprint,
                     fingerprint_kind, identity_state, owner, status, current_site_id,
                     expected_availability
              FROM devices WHERE (?1 IS NULL OR status = ?1) ORDER BY display_name, device_id",
-            status,
-            |row| {
-                Ok(DeviceSnapshot {
-                    device_id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    device_kind: row.get(2)?,
-                    serial_hint: row.get(3)?,
-                    hardware_fingerprint: row.get(4)?,
-                    fingerprint_kind: row.get(5)?,
-                    identity_state: row.get(6)?,
-                    owner: row.get(7)?,
-                    status: row.get(8)?,
-                    current_site_id: row.get(9)?,
-                    expected_availability: row.get(10)?,
-                })
-            },
-            self.path(),
-        )?;
-        let archive_roots = query_rows(
-            &connection,
-            "SELECT archive_root_id, device_id, display_name, root_path_encoding,
+        status,
+        |row| {
+            Ok(DeviceSnapshot {
+                device_id: row.get(0)?,
+                display_name: row.get(1)?,
+                device_kind: row.get(2)?,
+                serial_hint: row.get(3)?,
+                hardware_fingerprint: row.get(4)?,
+                fingerprint_kind: row.get(5)?,
+                identity_state: row.get(6)?,
+                owner: row.get(7)?,
+                status: row.get(8)?,
+                current_site_id: row.get(9)?,
+                expected_availability: row.get(10)?,
+            })
+        },
+        path,
+    )?;
+    let archive_roots = query_rows(
+        connection,
+        "SELECT archive_root_id, device_id, display_name, root_path_encoding,
                     root_path_on_device_bytes, root_path_display, status,
                     filesystem_fingerprint, fingerprint_kind, identity_state
              FROM archive_roots WHERE (?1 IS NULL OR status = ?1)
              ORDER BY display_name, archive_root_id",
-            status,
-            |row| {
-                Ok(ArchiveRootSnapshot {
-                    archive_root_id: row.get(0)?,
-                    device_id: row.get(1)?,
-                    display_name: row.get(2)?,
-                    root_path_on_device: registry_path_from_row(row, 3, 4, 5)?,
-                    status: row.get(6)?,
-                    filesystem_fingerprint: row.get(7)?,
-                    fingerprint_kind: row.get(8)?,
-                    identity_state: row.get(9)?,
-                })
-            },
-            self.path(),
-        )?;
-        let locations = query_rows(
-            &connection,
-            "SELECT location_id, display_name, kind, archive_root_id,
+        status,
+        |row| {
+            Ok(ArchiveRootSnapshot {
+                archive_root_id: row.get(0)?,
+                device_id: row.get(1)?,
+                display_name: row.get(2)?,
+                root_path_on_device: registry_path_from_row(row, 3, 4, 5)?,
+                status: row.get(6)?,
+                filesystem_fingerprint: row.get(7)?,
+                fingerprint_kind: row.get(8)?,
+                identity_state: row.get(9)?,
+            })
+        },
+        path,
+    )?;
+    let locations = query_rows(
+        connection,
+        "SELECT location_id, display_name, kind, archive_root_id,
                     relative_path_encoding, relative_path_bytes, relative_path_display,
                     device_id, site_id, encryption_state, trust_level,
                     expected_availability, is_writable, status
              FROM locations WHERE (?1 IS NULL OR status = ?1)
              ORDER BY display_name, location_id",
-            status,
-            |row| {
-                let encoding: Option<String> = row.get(4)?;
-                Ok(LocationSnapshot {
-                    location_id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    kind: row.get(2)?,
-                    archive_root_id: row.get(3)?,
-                    relative_path: encoding
-                        .map(|encoding| {
-                            registry_path_from_parts(encoding, row.get(5)?, row.get(6)?)
-                        })
-                        .transpose()?,
-                    device_id: row.get(7)?,
-                    site_id: row.get(8)?,
-                    encryption_state: row.get(9)?,
-                    trust_level: row.get(10)?,
-                    expected_availability: row.get(11)?,
-                    is_writable: row.get(12)?,
-                    status: row.get(13)?,
-                })
-            },
-            self.path(),
-        )?;
-        let risk_domains = query_rows(
-            &connection,
-            "SELECT risk_domain_id, display_name, risk_kind, description, status
+        status,
+        |row| {
+            let encoding: Option<String> = row.get(4)?;
+            Ok(LocationSnapshot {
+                location_id: row.get(0)?,
+                display_name: row.get(1)?,
+                kind: row.get(2)?,
+                archive_root_id: row.get(3)?,
+                relative_path: encoding
+                    .map(|encoding| registry_path_from_parts(encoding, row.get(5)?, row.get(6)?))
+                    .transpose()?,
+                device_id: row.get(7)?,
+                site_id: row.get(8)?,
+                encryption_state: row.get(9)?,
+                trust_level: row.get(10)?,
+                expected_availability: row.get(11)?,
+                is_writable: row.get(12)?,
+                status: row.get(13)?,
+            })
+        },
+        path,
+    )?;
+    let risk_domains = query_rows(
+        connection,
+        "SELECT risk_domain_id, display_name, risk_kind, description, status
              FROM risk_domains WHERE (?1 IS NULL OR status = ?1)
              ORDER BY display_name, risk_domain_id",
-            status,
-            |row| {
-                Ok(RiskDomainSnapshot {
-                    risk_domain_id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    risk_kind: row.get(2)?,
-                    description: row.get(3)?,
-                    status: row.get(4)?,
-                })
-            },
-            self.path(),
-        )?;
-        let risk_assignments = query_rows(
-            &connection,
-            "SELECT entity_type, entity_id, risk_domain_id FROM entity_risk_domains
+        status,
+        |row| {
+            Ok(RiskDomainSnapshot {
+                risk_domain_id: row.get(0)?,
+                display_name: row.get(1)?,
+                risk_kind: row.get(2)?,
+                description: row.get(3)?,
+                status: row.get(4)?,
+            })
+        },
+        path,
+    )?;
+    let risk_assignments = query_rows(
+        connection,
+        "SELECT entity_type, entity_id, risk_domain_id FROM entity_risk_domains
              WHERE ?1 IS NULL ORDER BY entity_type, entity_id, risk_domain_id",
-            None,
-            |row| {
-                Ok(RiskAssignment {
-                    entity_type: row.get(0)?,
-                    entity_id: row.get(1)?,
-                    risk_domain_id: row.get(2)?,
-                })
-            },
-            self.path(),
-        )?;
-        Ok(RegistryState {
-            version: 2,
-            applied_event_seq,
-            sites,
-            policies,
-            collections,
-            devices,
-            archive_roots,
-            locations,
-            risk_domains,
-            risk_assignments,
-        })
-    }
+        None,
+        |row| {
+            Ok(RiskAssignment {
+                entity_type: row.get(0)?,
+                entity_id: row.get(1)?,
+                risk_domain_id: row.get(2)?,
+            })
+        },
+        path,
+    )?;
+    Ok(RegistryEntities {
+        sites,
+        policies,
+        collections,
+        devices,
+        archive_roots,
+        locations,
+        risk_domains,
+        risk_assignments,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1023,10 +1050,18 @@ fn lifecycle_event(kind: &str, action: RegistryAction) -> &'static str {
 
 pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()> {
     let connection = Connection::open(path).map_err(|source| sqlite_error(path, source))?;
+    validate_change_on(&connection, path, change)
+}
+
+pub(crate) fn validate_change_on(
+    connection: &Connection,
+    path: &Path,
+    change: &RegistryChange,
+) -> Result<()> {
     match change {
         RegistryChange::Site(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "sites",
                 "site_id",
                 "site",
@@ -1039,7 +1074,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
         RegistryChange::Policy(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "policies",
                 "policy_id",
                 "policy",
@@ -1077,7 +1112,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
         RegistryChange::Collection(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "collections",
                 "collection_id",
                 "collection",
@@ -1087,13 +1122,13 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
                 *action,
             )?;
             require_optional_entity(
-                &connection,
+                connection,
                 "sites",
                 "site_id",
                 value.home_site_id.as_deref(),
             )?;
             require_optional_entity(
-                &connection,
+                connection,
                 "policies",
                 "policy_id",
                 value.policy_id.as_deref(),
@@ -1101,7 +1136,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
         RegistryChange::Device(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "devices",
                 "device_id",
                 "device",
@@ -1111,7 +1146,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
                 *action,
             )?;
             require_optional_entity(
-                &connection,
+                connection,
                 "sites",
                 "site_id",
                 value.current_site_id.as_deref(),
@@ -1209,7 +1244,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
         RegistryChange::ArchiveRoot(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "archive_roots",
                 "archive_root_id",
                 "archive root",
@@ -1218,7 +1253,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
                 &value.status,
                 *action,
             )?;
-            require_entity(&connection, "devices", "device_id", &value.device_id)?;
+            require_entity(connection, "devices", "device_id", &value.device_id)?;
             if !matches!(
                 value.identity_state.as_str(),
                 "confirmed" | "unavailable" | "conflict"
@@ -1325,7 +1360,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
         RegistryChange::Location(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "locations",
                 "location_id",
                 "location",
@@ -1334,11 +1369,11 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
                 &value.status,
                 *action,
             )?;
-            validate_location(&connection, value)?;
+            validate_location(connection, value)?;
         }
         RegistryChange::RiskDomain(action, value) => {
             validate_lifecycle(
-                &connection,
+                connection,
                 "risk_domains",
                 "risk_domain_id",
                 "risk domain",
@@ -1351,13 +1386,13 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
         }
         RegistryChange::AssignRisk(value) | RegistryChange::UnassignRisk(value) => {
             require_entity(
-                &connection,
+                connection,
                 "risk_domains",
                 "risk_domain_id",
                 &value.risk_domain_id,
             )?;
             let (table, column) = entity_table(&value.entity_type)?;
-            require_entity(&connection, table, column, &value.entity_id)?;
+            require_entity(connection, table, column, &value.entity_id)?;
             let assigned: bool = connection
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM entity_risk_domains
@@ -1380,7 +1415,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
             }
         }
         RegistryChange::DeviceCheckIn(value) => {
-            require_entity(&connection, "devices", "device_id", &value.device_id)?;
+            require_entity(connection, "devices", "device_id", &value.device_id)?;
             if !matches!(
                 value.fingerprint_status.as_str(),
                 "match" | "unavailable" | "mismatch"
@@ -1391,7 +1426,7 @@ pub(crate) fn validate_change(path: &Path, change: &RegistryChange) -> Result<()
             }
         }
         RegistryChange::DeviceMount(value) => {
-            require_entity(&connection, "devices", "device_id", &value.device_id)?;
+            require_entity(connection, "devices", "device_id", &value.device_id)?;
             if let Some(archive_root_id) = &value.archive_root_id {
                 let root_device: String = connection
                     .query_row(
