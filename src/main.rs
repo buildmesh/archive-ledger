@@ -31,6 +31,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
+mod sqlite_cli;
+mod sqlite_read_cli;
+mod sqlite_setup_cli;
+mod sqlite_stage_cli;
+mod sqlite_status_cli;
+
 const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 2;
 const EXIT_FINDINGS: u8 = 10;
@@ -135,6 +141,14 @@ fn inspect_archive_root(selector: &str) -> Result<archive_ledger::KnownArchive, 
     })?;
     let database_path = root.join("archive.db");
     let events_path = root.join("canonical");
+    if let Ok(catalog) = archive_ledger::SqliteCatalog::open_read_only(&database_path) {
+        let metadata = catalog.metadata()?;
+        return Ok(archive_ledger::KnownArchive {
+            archive_id: metadata.archive_id,
+            display_name: metadata.display_name,
+            root,
+        });
+    }
     match V2ProjectionDb::open_existing(&database_path) {
         Ok(database) => {
             let status = database.status()?;
@@ -1614,6 +1628,11 @@ struct ReportSummaryArgs {
 
 #[derive(Debug)]
 enum AppError {
+    SqliteCatalog(archive_ledger::SqliteCatalogError),
+    CatalogWrite(archive_ledger::sqlite_writes::CatalogWriteError),
+    CatalogQuery(archive_ledger::sqlite_queries::CatalogQueryError),
+    CatalogRegistry(archive_ledger::sqlite_registry::SqliteRegistryError),
+    Sqlite(rusqlite::Error),
     Catalog(CatalogError),
     EventStore(EventStoreError),
     Projection(ProjectionError),
@@ -1659,6 +1678,10 @@ impl AppError {
 
     fn code(&self) -> &'static str {
         match self {
+            Self::SqliteCatalog(_) | Self::Sqlite(_) => "catalog_database",
+            Self::CatalogWrite(_) => "catalog_write",
+            Self::CatalogQuery(error) => error.code(),
+            Self::CatalogRegistry(error) => error.code(),
             Self::Catalog(error) => error.code(),
             Self::EventStore(error) => error.code(),
             Self::Projection(error) => error.code(),
@@ -1689,6 +1712,11 @@ impl AppError {
 impl std::fmt::Display for AppError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SqliteCatalog(error) => error.fmt(formatter),
+            Self::CatalogWrite(error) => error.fmt(formatter),
+            Self::CatalogQuery(error) => error.fmt(formatter),
+            Self::CatalogRegistry(error) => error.fmt(formatter),
+            Self::Sqlite(error) => error.fmt(formatter),
             Self::Catalog(error) => error.fmt(formatter),
             Self::EventStore(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
@@ -1730,6 +1758,26 @@ impl std::fmt::Display for AppError {
             }
         }
     }
+}
+
+impl From<archive_ledger::SqliteCatalogError> for AppError {
+    fn from(error: archive_ledger::SqliteCatalogError) -> Self { Self::SqliteCatalog(error) }
+}
+
+impl From<archive_ledger::sqlite_writes::CatalogWriteError> for AppError {
+    fn from(error: archive_ledger::sqlite_writes::CatalogWriteError) -> Self { Self::CatalogWrite(error) }
+}
+
+impl From<archive_ledger::sqlite_queries::CatalogQueryError> for AppError {
+    fn from(error: archive_ledger::sqlite_queries::CatalogQueryError) -> Self { Self::CatalogQuery(error) }
+}
+
+impl From<archive_ledger::sqlite_registry::SqliteRegistryError> for AppError {
+    fn from(error: archive_ledger::sqlite_registry::SqliteRegistryError) -> Self { Self::CatalogRegistry(error) }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(error: rusqlite::Error) -> Self { Self::Sqlite(error) }
 }
 
 impl From<CatalogError> for AppError {
@@ -2302,6 +2350,31 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         return Ok(EXIT_OK);
     }
     resolve_catalog_paths(cli)?;
+    match archive_ledger::SqliteCatalog::open_read_only(cli.database_path()) {
+        Ok(catalog) => {
+            if let Some(result) = sqlite_read_cli::execute_read(cli, &catalog)? {
+                return Ok(result);
+            }
+            if let Some(result) = sqlite_status_cli::execute_status(cli, &catalog)? {
+                return Ok(result);
+            }
+            drop(catalog);
+            let mut catalog = archive_ledger::SqliteCatalog::open(cli.database_path())?;
+            if let Some(result) = sqlite_setup_cli::execute_setup(cli, &mut catalog)? {
+                return Ok(result);
+            }
+            if let Some(result) = sqlite_cli::execute_write(cli, &mut catalog)? {
+                return Ok(result);
+            }
+            if let Command::Stage(args) = &cli.command {
+                return sqlite_stage_cli::execute(cli, &mut catalog, args);
+            }
+            return Err(AppError::Input("this command is not available for authoritative SQLite catalogs".into()));
+        }
+        Err(archive_ledger::SqliteCatalogError::UnsupportedFormat { application_id, .. })
+            if application_id != archive_ledger::sqlite_catalog::CATALOG_APPLICATION_ID => {}
+        Err(error) => return Err(error.into()),
+    }
     if let Command::Events {
         command: EventsCommand::Verify,
     } = &cli.command
@@ -7133,6 +7206,118 @@ fn execute_archive_rename(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn execute_sqlite_init(
+    cli: &Cli,
+    name: Option<&str>,
+    make_default: bool,
+    archive_id: Option<&str>,
+    guided: bool,
+    non_interactive: bool,
+    root_path: Option<&Path>,
+    _site_name: &str,
+    _device_name: &str,
+    _collection_name: &str,
+    fingerprint: Option<&str>,
+    fingerprint_kind: Option<&str>,
+) -> Result<u8, AppError> {
+    if cli.archive.is_some() {
+        return Err(AppError::Input(
+            "--archive selects an existing catalog and cannot be used with init".to_owned(),
+        ));
+    }
+    if cli.database.is_some() || cli.events.is_some() {
+        return Err(AppError::Input(
+            "archive init creates one self-contained named Archive; --database/--events are only for inspecting unsupported development catalogs"
+                .to_owned(),
+        ));
+    }
+    if guided || root_path.is_some() || fingerprint.is_some() || fingerprint_kind.is_some() {
+        return Err(AppError::Input(
+            "archive init no longer creates file topology; run archive collection init from the content directory after initialization"
+                .to_owned(),
+        ));
+    }
+    let archive_id = archive_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("arc_{}", ulid::Ulid::new().to_string().to_ascii_lowercase()));
+    let archive_name = match name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.to_owned(),
+        None if !non_interactive && std::io::stdin().is_terminal() => {
+            prompt_default("Archive name", "Personal Archive")?
+        }
+        None => {
+            return Err(AppError::Input(
+                "archive init requires NAME or --name when input is non-interactive".to_owned(),
+            ))
+        }
+    };
+    let known_archive = central_archive(&archive_id, &archive_name)?;
+    if known_archive.root.exists() {
+        return Err(AppError::Input(format!(
+            "Archive initialization target already exists: {}",
+            known_archive.root.display()
+        )));
+    }
+    let parent = known_archive.root.parent().ok_or_else(|| {
+        AppError::Input(format!(
+            "Archive path {} has no parent directory",
+            known_archive.root.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let prepared = parent.join(format!(
+        ".archive-ledger-init-{}",
+        ulid::Ulid::new().to_string().to_ascii_lowercase()
+    ));
+    let result = (|| {
+        std::fs::create_dir(&prepared)?;
+        let catalog = archive_ledger::SqliteCatalog::create(
+            prepared.join("archive.db"), &archive_id, &archive_name,
+        )?;
+        catalog.connection().execute_batch("PRAGMA optimize;")?;
+        drop(catalog);
+        archive_ledger::place_directory_no_replace(&prepared, &known_archive.root)?;
+        Ok::<_, AppError>(())
+    })();
+    match result {
+        Ok(()) => (),
+        Err(error) => {
+            if prepared.exists() {
+                let _ = std::fs::remove_dir_all(&prepared);
+            }
+            return Err(error);
+        }
+    };
+
+    let mut registry = CatalogRegistry::load()?;
+    let became_default = registry.archives().is_empty() || make_default;
+    registry.register(known_archive.clone(), make_default)?;
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 3,
+                "catalog_format": "sqlite",
+                "archive_id": archive_id,
+                "archive_name": archive_name,
+                "root": known_archive.root,
+                "default": became_default,
+            }))?
+        );
+    } else {
+        println!("Created Archive \"{archive_name}\".");
+        if became_default {
+            println!("It is now the default Archive.");
+        }
+        println!();
+        println!("Next: go to the directory containing your files and run:");
+        println!("  archive collection init --name <name>");
+    }
+    Ok(EXIT_OK)
+}
+
 fn execute_v2_init(
     cli: &Cli,
     name: Option<&str>,
@@ -14889,6 +15074,30 @@ fn prepare_v2_filesystem_setup(
     existing_collection: Option<CollectionSnapshot>,
     reimport: bool,
 ) -> Result<V2FilesystemSetup, AppError> {
+    let state = database.registry_state(false)?;
+    let (setup, changes) = plan_filesystem_setup(&state, args, existing_collection)?;
+    if args.import_annex {
+        refuse_v2_unfinished_annex_import(database, &setup.mounted.path)?;
+    }
+    if args.import_annex && !reimport && v2_location_has_completed_annex_import(
+        database, &setup.collection.collection_id, &setup.location.location_id,
+    )? {
+        return Err(AppError::Input(format!(
+            "Location {:?} already has a completed annex import for Collection {:?}; use archive location scan for ordinary updates, or location import-annex --reimport for an intentional repeat",
+            setup.location.display_name, setup.collection.display_name
+        )));
+    }
+    let store = V2OriginStore::open(cli.events_path())?;
+    let registry = V2Registry::new(&store, database);
+    for change in changes { registry.record(change, &cli.host)?; }
+    Ok(setup)
+}
+
+fn plan_filesystem_setup(
+    state: &archive_ledger::RegistryState,
+    args: &CollectionInitArgs,
+    existing_collection: Option<CollectionSnapshot>,
+) -> Result<(V2FilesystemSetup, Vec<RegistryChange>), AppError> {
     let interactive = !args.non_interactive && std::io::stdin().is_terminal();
     let collection_name = existing_collection
         .as_ref()
@@ -14897,9 +15106,6 @@ fn prepare_v2_filesystem_setup(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AppError::Input("Collection name must be non-empty".to_owned()))?;
     let mounted = archive_ledger::discover_mounted_filesystem(&args.path)?;
-    if args.import_annex {
-        refuse_v2_unfinished_annex_import(database, &mounted.path)?;
-    }
     if mounted.identity_state == "unavailable"
         && !args.allow_unidentified_root
         && (!interactive
@@ -14912,7 +15118,6 @@ fn prepare_v2_filesystem_setup(
                 .to_owned(),
         ));
     }
-    let state = database.registry_state(false)?;
     if existing_collection.is_none()
         && state
             .collections
@@ -15156,19 +15361,6 @@ fn prepare_v2_filesystem_setup(
         ));
         (collection, Some(policy))
     };
-    if args.import_annex
-        && !reimport
-        && v2_location_has_completed_annex_import(
-            database,
-            &collection.collection_id,
-            &location.location_id,
-        )?
-    {
-        return Err(AppError::Input(format!(
-            "Location {:?} already has a completed annex import for Collection {:?}; use archive location scan for ordinary updates, or location import-annex --reimport for an intentional repeat",
-            location.display_name, collection.display_name
-        )));
-    }
     changes.push(RegistryChange::DeviceMount(DeviceMount {
         mount_id: generated_id("mount"),
         device_id: device.device_id.clone(),
@@ -15183,12 +15375,7 @@ fn prepare_v2_filesystem_setup(
         .to_owned(),
     }));
 
-    let store = V2OriginStore::open(cli.events_path())?;
-    let registry = V2Registry::new(&store, database);
-    for change in changes {
-        registry.record(change, &cli.host)?;
-    }
-    Ok(V2FilesystemSetup {
+    Ok((V2FilesystemSetup {
         collection,
         location,
         device,
@@ -15197,9 +15384,8 @@ fn prepare_v2_filesystem_setup(
         policy,
         mounted,
         adding_location,
-    })
+    }, changes))
 }
-
 fn print_v2_filesystem_setup(cli: &Cli, setup: &V2FilesystemSetup) -> Result<(), AppError> {
     let protection = v2_catalog_protection(cli.events_path());
     if cli.json {

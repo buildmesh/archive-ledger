@@ -718,12 +718,14 @@ refer to one content Object, so heavily deduplicated content cannot produce an u
 `file find` can combine Location groups. Repeated `--in` arguments within a group
 mean **any** of those Locations; `--and` separates groups that must all match.
 `--not` at the start of a group means **none** of its Locations may match.
-Location selectors accept names or stable IDs. The first positive group selects
-the source paths to list; later groups test whether matching content exists at
-other Locations. Comparison uses resolved content identity, so a backup can have
-a different filename. Unresolved identities are
-excluded from these comparisons; absence means no matching present copy in the
-catalog, not proof that a drive does not contain the bytes.
+Location selectors accept names or stable IDs. For authoritative SQLite catalogs,
+groups match the same Collection-relative path and expected checksum at each
+Location. Only present, verified copies with a successful latest check and the
+expected checksum qualify. Identical content under another filename does not
+protect that expected path. Unknown expected checksums are excluded from grouped
+comparisons; absence means no qualifying copy in the catalog, not proof that a
+drive does not contain the bytes. Legacy event-backed Archives retain their
+content-identity comparisons until migrated.
 
 List disk10 content absent from the entire backup set:
 
@@ -763,18 +765,38 @@ archive file find --collection "Files" \
   --and --not --in "Files on usb"
 ```
 
-Use `--json` for source-qualified paths when several primary Locations match.
-Normal text output lists all logical paths; JSON returns a bounded detailed page.
+Normal text output lists every matching path, one per line, without pagination
+footers. JSON returns a bounded page of Objects with stable path IDs, lossless
+paths, and expected checksums. Use its `next` token with `--continue` for another
+page. A text query with `--continue` prints all remaining matches.
 For a single source Location in the first positive group, `--print0` streams all matching source-relative
 paths separated by NUL bytes, without pagination messages on stdout. Check its
 exit status before using the output; a failed stream can be partial. Paths refer
 to cataloged entries, including annex symlinks, and are not a copy or deletion
 plan.
 
-`file history` and `object history` are explicit audit operations. They authenticate and stream
-canonical event records in bounded memory because full event payloads are deliberately not
-duplicated in SQLite. Use the printed `--continue` token for another page; the command rejects a
-token if canonical history has advanced, so a page sequence cannot silently mix snapshots.
+In authoritative SQLite catalogs, `file show <object-id>` and
+`object show <object-id>` show the same expected path and all its recorded Locations,
+including missing and damaged copies. IDs come from JSON `file find`; they identify
+paths, not content hashes. The identity filter accepts `resolved` for a known
+expected checksum and `unresolved` or `unknown` for no expected checksum;
+unsupported states are rejected. Plain output streams the selection in one read
+snapshot; structured pages freeze the verification time and reject continuation
+after the catalog revision changes. Current find/show queries read Objects and
+Files directly, independently of history size. They never access mounted files
+or run verification.
+The disposable performance fixture can be rerun with
+`cargo test --release --lib sqlite_queries::tests::benchmark_large_catalog -- --ignored --nocapture`.
+It creates 100,000 and 500,000 expected paths with one verified primary copy each,
+streams the primary-minus-backups selection, and removes both temporary catalogs.
+Reported time excludes fixture creation and terminal output; it measures a warm
+local database and is not a cold-drive latency guarantee.
+
+`file history <object-id>` and `object history <object-id>` are explicit audit
+operations. Authoritative SQLite catalogs read their separate History table in
+bounded pages; legacy Archives read authenticated canonical records. Use the
+printed `--continue` token for another page. Continuation rejects catalog changes
+so a page sequence cannot silently mix snapshots.
 
 Risk reports automatically refresh missing or stale derived assessments from SQLite; they never
 scan storage or replay canonical history. Review the starter Policy and simulated loss results:
