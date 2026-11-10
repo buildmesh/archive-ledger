@@ -111,20 +111,32 @@ pub(super) fn execute_status(cli: &Cli, catalog: &SqliteCatalog) -> Result<Optio
             )?
         );
     } else {
-        println!("{}", entity["display_name"].as_str().unwrap_or("Archive"));
         println!(
-            "Expected paths: {} ({} without an expected checksum)",
-            summary["objects"], summary["unresolved_objects"]
+            "Name: {}",
+            entity["display_name"].as_str().unwrap_or("Archive")
         );
-        println!(
-            "File locations: {} present; {} missing; {} unknown",
-            summary["present_files"], summary["missing_files"], summary["unknown_files"]
-        );
-        println!(
-            "Checks: {} verified present; {} damaged",
-            summary["verified_present_files"], summary["damaged_files"]
-        );
-        println!("Cached catalog evidence; preservation policy has not been evaluated.");
+        if let Some(id) = entity["archive_id"].as_str() {
+            println!("Archive ID: {id}");
+        }
+        println!("\nFiles");
+        for (label, key) in [
+            ("Total expected paths", "objects"),
+            ("Without expected checksum", "unresolved_objects"),
+        ] {
+            println!("  {label:<28} {}", summary[key]);
+        }
+        println!("\nCopies across Locations");
+        for (label, key) in [
+            ("Present", "present_files"),
+            ("Missing", "missing_files"),
+            ("Unknown presence", "unknown_files"),
+            ("Verified present (any age)", "verified_present_files"),
+            ("Damaged", "damaged_files"),
+        ] {
+            println!("  {label:<28} {}", summary[key]);
+        }
+        println!("\nEvidence: Cached catalog; drives have not been checked.");
+        println!("Backup policy: Not evaluated.");
     }
     Ok(Some(EXIT_OK))
 }
@@ -179,49 +191,86 @@ fn show_location(
             }))?
         );
     } else {
-        println!("{}", location.display_name);
-        println!("Location: {} ({})", location.location_id, location.status);
+        println!("Name: {}", location.display_name);
+        let collections = summary["collections"].as_array().unwrap();
+        match collections.as_slice() {
+            [] => println!("Collection: None tracked yet"),
+            [collection] => println!(
+                "Collection: {}",
+                collection["collection_name"].as_str().unwrap()
+            ),
+            _ => {
+                println!("Collections:");
+                for collection in collections {
+                    println!("  {}", collection["collection_name"].as_str().unwrap());
+                }
+            }
+        }
+        println!(
+            "Device: {}",
+            device.map_or("unknown", |d| d.display_name.as_str())
+        );
+        println!(
+            "Site: {}",
+            site.map_or("unknown", |s| s.display_name.as_str())
+        );
         if let Some(path) = recorded_path {
             println!("Recorded path: {path}");
         } else if let Some(path) = &location.relative_path {
             println!("Path relative to archive root: {}", path.display);
         }
-        println!(
-            "Device / Site: {} / {}",
-            device.map_or("unknown", |d| d.display_name.as_str()),
-            site.map_or("unknown", |s| s.display_name.as_str())
-        );
-        println!(
-            "Files: {} tracked; {} present; {} missing; {} unknown",
-            summary["tracked_files"],
-            summary["present_files"],
-            summary["missing_files"],
-            summary["unknown_files"]
-        );
-        println!(
-            "Present copies: {} verified ({} within {}, {} stale); {} unverified; {} damaged",
-            summary["verified_present_files"],
-            summary["recent_verified_present_files"],
-            stale_after,
-            summary["stale_verified_present_files"],
-            summary["unverified_present_files"],
-            summary["damaged_present_files"]
-        );
-        println!(
-            "Never verified: {} present files. Without an expected checksum: {} tracked files.",
-            summary["never_verified_present_files"], summary["unresolved_files"]
-        );
-        println!(
-            "Without another verified copy within {}: {} of {} present files",
-            stale_after, summary["present_without_recent_other_copy"], summary["present_files"]
-        );
-        println!("Collections:");
-        for collection in summary["collections"].as_array().unwrap() {
-            let counts = &collection["summary"];
-            println!("  {}: {} tracked; {} present; {} recently verified; {} stale; {} without another recent verified copy", collection["collection_name"].as_str().unwrap(), counts["tracked_files"], counts["present_files"], counts["recent_verified_present_files"], counts["stale_verified_present_files"], counts["present_without_recent_other_copy"]);
+        println!("Status: {}", location.status);
+        println!("Location ID: {}", location.location_id);
+        println!("\nFiles");
+        for (label, key) in [
+            ("Total tracked", "tracked_files"),
+            ("Present", "present_files"),
+            ("Missing", "missing_files"),
+            ("Unknown presence", "unknown_files"),
+            ("Without expected checksum", "unresolved_files"),
+        ] {
+            println!("  {label:<28} {}", summary[key]);
         }
-        println!("Stale means a currently verified present copy last checked more than {stale_after} ago. Future-dated verification is counted as unverified. Never-verified counts can overlap damaged/unverified counts.");
-        println!("Other copies may share the same Device or Site. Cached catalog evidence; backup policy has not been evaluated.");
+        println!("\nVerification of present files");
+        println!("  Verification window: {stale_after}");
+        for (label, key) in [
+            ("Verified (any age)", "verified_present_files"),
+            ("  Recent", "recent_verified_present_files"),
+            ("  Stale", "stale_verified_present_files"),
+            ("Unverified", "unverified_present_files"),
+            ("Damaged", "damaged_present_files"),
+            ("Never verified*", "never_verified_present_files"),
+        ] {
+            println!("  {label:<28} {}", summary[key]);
+        }
+        println!("\nBackup coverage");
+        println!(
+            "  Without another copy verified within {stale_after}: {}",
+            summary["present_without_recent_other_copy"]
+        );
+        println!("  Counts present files; other Locations may share this Device or Site.");
+        if collections.len() > 1 {
+            println!("\nFiles by Collection");
+            for collection in collections {
+                println!("  {}", collection["collection_name"].as_str().unwrap());
+                for (label, key) in [
+                    ("Total tracked", "tracked_files"),
+                    ("Present", "present_files"),
+                    ("Recently verified", "recent_verified_present_files"),
+                    ("Stale", "stale_verified_present_files"),
+                    (
+                        "Without another recent copy",
+                        "present_without_recent_other_copy",
+                    ),
+                ] {
+                    println!("    {label:<28} {}", collection["summary"][key]);
+                }
+            }
+        }
+        println!("\nStale: Verified more than {stale_after} ago. Future-dated checks count as unverified.");
+        println!("* Never verified overlaps the unverified and damaged counts.");
+        println!("Evidence: Cached catalog; drives have not been checked.");
+        println!("Backup policy: Not evaluated.");
     }
     transaction.commit()?;
     Ok(EXIT_OK)

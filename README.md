@@ -118,6 +118,20 @@ to its Location group. Copies are Location records, not necessarily independent 
 Use `--print0` with `--collection` for lossless path lists, or `--json` for paginated records.
 These queries read only the catalog and do not check the drives.
 
+### Read catalog summaries
+
+`archive status`, `archive collection show NAME`, and `archive location show NAME`
+show labeled metadata followed by separate sections for file counts and protection evidence.
+Archive status distinguishes logical file paths from copies across Locations; its verification
+counts include checks of any age. Location and Collection views show a verification window
+(default `30d`, adjustable with `--stale-after`). These are catalog lookups, without drive scans
+or backup-policy evaluation. Use `--json` for structured output.
+
+An empty Location shows `Collection: None tracked yet`: Collection membership in this view
+comes from tracked files. Locations containing several Collections list each one and show
+separate file counts. The verification breakdown distinguishes recent, stale, unverified and
+damaged files; the separate never-verified count can overlap unverified or damaged counts.
+
 ### See a Collection's copy and Site coverage
 
 ```bash

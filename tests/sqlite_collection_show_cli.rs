@@ -54,7 +54,18 @@ fn collection_show_preserves_metadata_and_reports_protection_without_writes() {
     assert!(text.contains("50.0%"));
     assert!(text.contains("Verification window: 30d"));
     assert!(text.contains("Known Sites"));
-    assert!(text.contains("1 files have no present copy"));
+    assert!(text.starts_with(
+        "Name: Files\nStatus: active\nCollection ID: c\nDescription: Test collection\n"
+    ));
+    assert!(text.contains("\n\nFiles\n  Total tracked: 2\n"));
+    assert!(text.contains("\n\nProtection gaps\n  No present copy: 1\n"));
+    assert!(text.contains("\n\nSite information\n"));
+    let empty_text = run(&["collection", "show", "Empty"]);
+    assert!(empty_text.status.success());
+    let empty_text = String::from_utf8(empty_text.stdout).unwrap();
+    assert!(empty_text.contains("Total tracked: 0"));
+    assert!(empty_text.contains("0 (0.0%)"));
+    assert!(!empty_text.contains("NaN"));
     let empty = run(&["--json", "collection", "show", "Empty"]);
     assert!(empty.status.success());
     let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();

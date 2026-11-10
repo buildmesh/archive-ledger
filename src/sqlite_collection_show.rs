@@ -40,13 +40,11 @@ pub(super) fn execute(
             }))?
         );
     } else {
-        println!("{}", collection.display_name);
-        println!(
-            "Collection: {} ({})",
-            collection.collection_id, collection.status
-        );
+        println!("Name: {}", collection.display_name);
+        println!("Status: {}", collection.status);
+        println!("Collection ID: {}", collection.collection_id);
         if let Some(description) = &collection.description {
-            println!("{description}");
+            println!("Description: {description}");
         }
         if let Some(site) = collection.home_site_id.as_ref() {
             let name = state
@@ -62,16 +60,29 @@ pub(super) fn execute(
                 .iter()
                 .find(|p| &p.policy_id == policy)
                 .map_or(policy.as_str(), |p| p.display_name.as_str());
-            println!("Policy: {name} (not evaluated)");
+            println!("Backup policy: {name} (not evaluated)");
         }
+        println!("\nFiles");
+        println!("  Total tracked: {}", summary.total_files);
         println!(
-            "Files: {} expected paths; {} without an expected checksum",
-            summary.total_files, summary.without_expected_checksum
+            "  Without expected checksum: {}",
+            summary.without_expected_checksum
+        );
+        println!("\nProtection gaps");
+        println!("  No present copy: {}", bucket(&summary.present_copies, 0));
+        println!(
+            "  Only one present copy: {}",
+            bucket(&summary.present_copies, 1)
         );
         println!(
-            "Verification window: {stale_after}. Percentages use all {} expected paths.",
-            summary.total_files
+            "  No recently verified copy: {}",
+            bucket(&summary.recent_verified_copies, 0)
         );
+        println!(
+            "  Recently verified at only one known Site: {}",
+            bucket(&summary.recent_verified_known_sites, 1)
+        );
+        println!("\nVerification window: {stale_after}");
         print_distribution(
             "Copies",
             &summary.present_copies,
@@ -84,15 +95,20 @@ pub(super) fn execute(
             &summary.recent_verified_known_sites,
             summary.total_files,
         );
+        println!("\nSite information");
         println!(
-            "Exposure: {} files have no present copy; {} have only one present copy.",
-            bucket(&summary.present_copies, 0),
-            bucket(&summary.present_copies, 1)
+            "  Files with copies at an unknown Site: {}",
+            summary.present_files_with_unknown_site
         );
-        println!("Verification gaps: {} files have no recently verified copy; {} have recent verified copies at only one known Site.", bucket(&summary.recent_verified_copies, 0), bucket(&summary.recent_verified_known_sites, 1));
-        println!("Unknown Site: {} files have present copies with no known Site ({} with recent verification). Site counts are a lower bound.", summary.present_files_with_unknown_site, summary.recent_verified_files_with_unknown_site);
-        println!("Copies count Locations, which may share a Device. Recent verification requires present bytes matching the expected checksum; damaged, unverified, stale and future-dated checks do not qualify.");
-        println!("Cached catalog evidence; backup policy has not been evaluated.");
+        println!(
+            "  Of those, with recent verification at an unknown Site: {}",
+            summary.recent_verified_files_with_unknown_site
+        );
+        println!("  Unknown Sites are excluded from Site counts.");
+        println!("\nPercentages: Share of all tracked files. Copies count Locations, which may share a Device.");
+        println!("Recently verified: Present, matching checksum, checked within {stale_after}.");
+        println!("Evidence: Cached catalog; drives have not been checked.");
+        println!("Backup policy: Not evaluated.");
     }
     transaction.commit()?;
     Ok(EXIT_OK)
@@ -132,7 +148,6 @@ fn print_distribution(
             format_count(bucket(verified, count))
         );
     }
-    println!();
 }
 
 fn protection_summary(
