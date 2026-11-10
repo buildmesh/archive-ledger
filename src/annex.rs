@@ -2126,6 +2126,12 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Whether a symlink target has the same annex object/key layout accepted by import.
+/// This classification reads no content and does not follow the target.
+pub fn is_annex_link_target(target: &Path) -> Result<bool> {
+    Ok(annex_key_from_blob("120000", &path_bytes(target)?).is_some())
+}
+
 fn annex_key_from_blob(mode: &str, blob: &[u8]) -> Option<String> {
     if mode == "120000" {
         annex_object_relative(blob)?;
@@ -3540,6 +3546,39 @@ pub struct AnnexCatalogCandidate<'a> {
     key: AnnexKey,
 }
 impl AnnexCatalogCandidate<'_> {
+    /// Identify an unavailable regular pointer without hashing content. Indexed
+    /// symlinks are left to the caller's normal link/target availability checks.
+    pub fn is_pointer_file(&self) -> Result<bool> {
+        if self.entry.mode == "120000" {
+            return Ok(false);
+        }
+        let path = self.config.repo_path.join(raw_path(&self.entry.path)?);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_error("inspect annex pointer", &path, error)),
+        };
+        if !metadata.is_file() || metadata.len() > MAX_POINTER_BYTES {
+            return Ok(false);
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|error| io_error("open annex pointer", &path, error))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_POINTER_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("read annex pointer", &path, error))?;
+        Ok(bytes.len() as u64 <= MAX_POINTER_BYTES
+            && annex_key_from_blob("100644", &bytes).as_deref() == Some(&self.key.raw))
+    }
+
     pub fn inspect(self) -> Result<AnnexCatalogEntry> {
         let outcome = inspect_entry_v2(self.config, self.entry, self.blob, &self.key, None)?;
         let blake3 = outcome

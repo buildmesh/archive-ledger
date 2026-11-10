@@ -135,6 +135,22 @@ The summary also counts present files without another verified copy within that 
 Another Location can share the same Device or Site, so this is not a policy or disaster-resilience
 assessment. Counts use recorded Location evidence, including retired Locations; no drives are read.
 
+### Preview new files at a Location
+
+```bash
+archive collection add /locations/disk10/annex/media \
+  --collection Media --location "Media on disk10" --dry-run
+```
+
+For SQLite catalogs, a normal add preview lists only available files not already tracked at
+that Location. Files tracked only elsewhere still appear. Already-tracked paths (even those
+marked missing), dropped annex symlinks, indexed regular annex pointer files, and ordinary
+symlinks are omitted. `--list-new` remains a compatibility spelling for this default behavior.
+The preview reads filesystem/Git metadata and bounded pointer-file payloads, but does not
+checksum content or update the catalog. Availability is not proof of integrity; the actual add
+still checksums content and records mismatches. Explicit `--accept-changes --dry-run` continues
+to inspect the selected files, including already-tracked paths.
+
 ## Concepts and relationships
 
 An **Archive** is one complete catalog. It is not a directory or storage device: one Archive can

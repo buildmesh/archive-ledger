@@ -1110,11 +1110,11 @@ struct CollectionAddArgs {
     #[arg(long, value_name = "FILE")]
     accept_changes: Vec<PathBuf>,
     /// Preview without recording anything: with --accept-changes, hash the selected files and
-    /// show the acceptance; otherwise show how disk and catalog differ from metadata only.
+    /// show the acceptance; otherwise list new available files at this Location (SQLite).
     #[arg(long)]
     dry_run: bool,
-    /// List every new-to-Collection or new-to-Location path without hashing content.
-    /// Requires --dry-run; streams results and skips verification-due summaries.
+    /// List new available paths without hashing; already the default SQLite dry-run behavior.
+    /// Requires --dry-run; retained for compatibility with legacy catalogs.
     #[arg(long, requires = "dry_run", conflicts_with = "accept_changes")]
     list_new: bool,
     /// Confirm acceptance of the explicitly selected files.
