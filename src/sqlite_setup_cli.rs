@@ -421,7 +421,7 @@ pub(super) fn execute_setup(
                 RegistryKind::Location,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            LocationCommand::Show { id } => entity(
+            LocationCommand::Show { id, .. } => entity(
                 cli,
                 database,
                 RegistryKind::Location,

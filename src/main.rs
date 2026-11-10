@@ -1072,8 +1072,13 @@ enum LocationCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Show one Location by name or stable ID.
-    Show { id: String },
+    /// Show Location metadata, file counts, and verification freshness from the catalog.
+    Show {
+        id: String,
+        /// Verification age threshold for the SQLite summary (e.g. 30d).
+        #[arg(long, default_value = "30d")]
+        stale_after: String,
+    },
     /// Low-level compatibility command for registering a Location snapshot.
     #[command(hide = true)]
     Register(Box<RegistryAddArgs>),
@@ -8118,7 +8123,7 @@ fn execute_v2_registry_command(
                 RegistryKind::Location,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            LocationCommand::Show { id } => execute_v2_registry_entity(
+            LocationCommand::Show { id, .. } => execute_v2_registry_entity(
                 cli,
                 database,
                 RegistryKind::Location,
@@ -16279,7 +16284,7 @@ fn execute_location(
             RegistryKind::Location,
             &RegistryEntityCommand::List { all: *all },
         ),
-        LocationCommand::Show { id } => execute_registry(
+        LocationCommand::Show { id, .. } => execute_registry(
             cli,
             database,
             RegistryKind::Location,

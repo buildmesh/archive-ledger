@@ -118,6 +118,23 @@ to its Location group. Copies are Location records, not necessarily independent 
 Use `--print0` with `--collection` for lossless path lists, or `--json` for paginated records.
 These queries read only the catalog and do not check the drives.
 
+### Inspect a Location's protection evidence
+
+```bash
+archive location show "Files on disk10"
+archive location show "Files on disk10" --stale-after 7d --json
+```
+
+The SQLite summary shows recorded path, Device/Site, total tracked files, presence counts,
+verified/recent/stale copies, unverified and damaged copies, and a Collection breakdown.
+Stale means a currently verified present copy whose successful check is older than the shown
+threshold (default `30d`). Never-verified files are reported separately; that count can overlap
+unverified or damaged counts. Future-dated evidence is treated as unverified in this summary.
+
+The summary also counts present files without another verified copy within that threshold.
+Another Location can share the same Device or Site, so this is not a policy or disaster-resilience
+assessment. Counts use recorded Location evidence, including retired Locations; no drives are read.
+
 ## Concepts and relationships
 
 An **Archive** is one complete catalog. It is not a directory or storage device: one Archive can
