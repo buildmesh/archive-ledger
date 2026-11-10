@@ -147,6 +147,8 @@ archive collection show Files --stale-after 7d --json
 ```
 
 Human `collection status` and `collection show` share the same protection view.
+Copy and Site distributions use stacked blocks, with present and recently verified file counts
+on separate lines, so the output reads naturally on narrow screens.
 `collection status` uses a 30-day verification window and can omit the name when there is
 only one active Collection. Use `collection show --stale-after` to customize the window.
 `collection status --json` retains its compact summary; use `collection show --json` for

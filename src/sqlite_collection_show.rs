@@ -87,13 +87,15 @@ pub(super) fn execute(
         );
         println!("\nVerification window: {stale_after}");
         print_distribution(
-            "Copies",
+            "Files by copy count",
+            ("copy", "copies"),
             &summary.present_copies,
             &summary.recent_verified_copies,
             summary.total_files,
         );
         print_distribution(
-            "Known Sites",
+            "Files by known Site count",
+            ("Site", "Sites"),
             &summary.present_known_sites,
             &summary.recent_verified_known_sites,
             summary.total_files,
@@ -123,14 +125,12 @@ fn bucket(distribution: &BTreeMap<u64, u64>, count: u64) -> u64 {
 
 fn print_distribution(
     label: &str,
+    units: (&str, &str),
     present: &BTreeMap<u64, u64>,
     verified: &BTreeMap<u64, u64>,
     total: u64,
 ) {
-    println!(
-        "\n{label:<12} {:>22} {:>22}",
-        "Present files", "Recently verified"
-    );
+    println!("\n{label}");
     let counts = present
         .keys()
         .chain(verified.keys())
@@ -145,9 +145,11 @@ fn print_distribution(
             };
             format!("{files} ({percent:.1}%)")
         };
+        let unit = if count == 1 { units.0 } else { units.1 };
+        println!("  {count} {unit}");
+        println!("    Present: {}", format_count(bucket(present, count)));
         println!(
-            "{count:<12} {:>22} {:>22}",
-            format_count(bucket(present, count)),
+            "    Recently verified: {}",
             format_count(bucket(verified, count))
         );
     }

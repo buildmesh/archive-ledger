@@ -53,7 +53,7 @@ fn collection_show_preserves_metadata_and_reports_protection_without_writes() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("50.0%"));
     assert!(text.contains("Verification window: 30d"));
-    assert!(text.contains("Known Sites"));
+    assert!(text.contains("Files by known Site count"));
     assert!(!text.contains("Collection ID:"));
     assert!(text.starts_with("Name: Files\nStatus: active\nDescription: Test collection\n"));
     assert!(text.contains("\n\nFiles\n  Total tracked: 2\n"));
@@ -124,11 +124,25 @@ fn collection_status_reuses_copy_distributions_and_preserves_json_status() {
         assert_eq!(status.stdout, show.stdout);
     }
     let text = String::from_utf8(show.stdout).unwrap();
-    for copies in [0, 1, 2] {
-        assert!(text
-            .lines()
-            .any(|line| line.starts_with(&format!("{copies} ")) && line.contains("1 (33.3%)")));
+    let distribution = text
+        .split("Files by copy count\n")
+        .nth(1)
+        .unwrap()
+        .split("\nSite information")
+        .next()
+        .unwrap();
+    for (copies, unit, verified) in [
+        (0, "copies", "3 (100.0%)"),
+        (1, "copy", "0 (0.0%)"),
+        (2, "copies", "0 (0.0%)"),
+    ] {
+        assert!(distribution.contains(&format!(
+            "  {copies} {unit}\n    Present: 1 (33.3%)\n    Recently verified: {verified}"
+        )));
     }
+    assert!(distribution.contains("Files by known Site count\n  0 Sites\n"));
+    assert!(distribution.contains("  1 Site\n    Present: 2 (66.7%)"));
+    assert!(distribution.lines().all(|line| line.len() <= 40));
     let json = run(&["--json", "collection", "status", "Files"]);
     assert!(json.status.success());
     let json: Value = serde_json::from_slice(&json.stdout).unwrap();
