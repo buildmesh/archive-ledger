@@ -20,6 +20,12 @@ pub(super) fn execute_status(cli: &Cli, catalog: &SqliteCatalog) -> Result<Optio
     {
         return show_location(cli, catalog, id, stale_after).map(Some);
     }
+    if let Command::Collection {
+        command: CollectionCommand::Show { id, stale_after },
+    } = &cli.command
+    {
+        return super::sqlite_collection_show::execute(cli, catalog, id, stale_after).map(Some);
+    }
     let mut scope = Scope::default();
     let entity = match &cli.command {
         Command::Status => {

@@ -372,7 +372,7 @@ pub(super) fn execute_setup(
                 RegistryKind::Collection,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            CollectionCommand::Show { id } => entity(
+            CollectionCommand::Show { id, .. } => entity(
                 cli,
                 database,
                 RegistryKind::Collection,

@@ -32,6 +32,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 mod sqlite_cli;
+mod sqlite_collection_show;
 mod sqlite_read_cli;
 mod sqlite_removed_cli;
 mod sqlite_setup_cli;
@@ -994,8 +995,13 @@ enum CollectionCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Show one Collection by name or stable ID.
-    Show { id: String },
+    /// Show file protection by copy count and distinct Sites from the SQLite catalog.
+    Show {
+        id: String,
+        /// Verification age threshold for protection counts (e.g. 30d).
+        #[arg(long, default_value = "30d")]
+        stale_after: String,
+    },
     /// Add present files to this Collection without marking unseen files missing.
     Add(CollectionAddArgs),
     /// Replace user-controlled fields with a complete JSON snapshot.
@@ -8070,7 +8076,7 @@ fn execute_v2_registry_command(
                 RegistryKind::Collection,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            CollectionCommand::Show { id } => execute_v2_registry_entity(
+            CollectionCommand::Show { id, .. } => execute_v2_registry_entity(
                 cli,
                 database,
                 RegistryKind::Collection,
@@ -16146,7 +16152,7 @@ fn execute_collection(
             RegistryKind::Collection,
             &RegistryEntityCommand::List { all: *all },
         ),
-        CollectionCommand::Show { id } => execute_registry(
+        CollectionCommand::Show { id, .. } => execute_registry(
             cli,
             database,
             RegistryKind::Collection,

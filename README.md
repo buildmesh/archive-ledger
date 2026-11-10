@@ -118,6 +118,24 @@ to its Location group. Copies are Location records, not necessarily independent 
 Use `--print0` with `--collection` for lossless path lists, or `--json` for paginated records.
 These queries read only the catalog and do not check the drives.
 
+### See a Collection's copy and Site coverage
+
+```bash
+archive collection show Files
+archive collection show Files --stale-after 7d --json
+```
+
+The SQLite summary shows total expected files and distributions by number of copies and distinct
+known Sites. Each distribution includes files with zero copies or zero known Sites. Counts and
+percentages compare recorded present copies with copies verified within the shown age threshold
+(default `30d`). Missing, damaged, unverified, stale, and future-dated evidence cannot count as
+recent verified protection. Files without expected checksums remain in the totals.
+
+Several Locations at the same Site count as one Site. Files with copies whose Site is unknown
+are reported separately: unknown Sites do not imply geographic diversity. Site resolution uses
+the Location's recorded Site or its Device's current Site. All counts use catalog evidence,
+including retired Locations, without checking drives or evaluating backup policy.
+
 ### Inspect a Location's protection evidence
 
 ```bash
