@@ -63,6 +63,9 @@ fn find(cli: &Cli, catalog: &SqliteCatalog, args: &FileFindArgs) -> Result<(), A
         .transpose()?;
     let filter = CatalogFileFilter {
         collection_id,
+        copies_below: args.copies_below,
+        verified_copies: args.verified_copies || args.copies_verified_within.is_some(),
+        copies_verified_within_ms: args.copies_verified_within,
         exact_path: args.exact.clone().map(utf8_path),
         path_prefix: args.prefix.clone().map(utf8_path),
         identity_state: args.identity_state.clone(),
@@ -77,13 +80,14 @@ fn find(cli: &Cli, catalog: &SqliteCatalog, args: &FileFindArgs) -> Result<(), A
                 "--print0 cannot be combined with --json or --continue".into(),
             ));
         }
-        if !filter
-            .location_groups
-            .iter()
-            .find(|group| !group.negated)
-            .is_some_and(|group| group.location_ids.len() == 1)
+        if !(filter.copies_below.is_some() && filter.collection_id.is_some())
+            && !filter
+                .location_groups
+                .iter()
+                .find(|group| !group.negated)
+                .is_some_and(|group| group.location_ids.len() == 1)
         {
-            return Err(AppError::Input("--print0 requires exactly one Location in the first positive --in group; use --json for multiple sources".into()));
+            return Err(AppError::Input("--print0 requires one source Location, or --collection with --copies-below; use --json for multiple sources".into()));
         }
     }
     let request = CatalogObjectRequest {

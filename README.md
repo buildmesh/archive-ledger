@@ -94,6 +94,30 @@ current Archive. `fsck` checks catalog integrity; it does not hash archive conte
 Keep catalog backups on independently protected storage. The old Git checkpoint,
 `db rebuild`, snapshot, and `restore check` workflows below are for legacy Archives.
 
+### Find files with too few copies
+
+For authoritative SQLite catalogs, list every path with fewer than two recorded present
+copies (including zero copies):
+
+```bash
+archive file find --collection Files --copies-below 2
+```
+
+Counts cover all Locations for the same Collection-relative path. Missing and unknown copies
+are excluded; present copies can still be unverified or damaged. For protection checks, count
+only copies with matching checksum evidence, optionally with a verification-age limit:
+
+```bash
+archive file find --collection Files --copies-below 2 --verified-copies
+archive file find --collection Files --copies-below 2 --copies-verified-within 30d
+```
+
+`--copies-verified-within` implies verified-copy counting. Existing `--in` groups filter which
+paths are listed; they do not restrict the Locations counted. `--verified-within` still applies
+to its Location group. Copies are Location records, not necessarily independent Devices or Sites.
+Use `--print0` with `--collection` for lossless path lists, or `--json` for paginated records.
+These queries read only the catalog and do not check the drives.
+
 ## Concepts and relationships
 
 An **Archive** is one complete catalog. It is not a directory or storage device: one Archive can

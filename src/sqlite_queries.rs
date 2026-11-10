@@ -53,6 +53,9 @@ pub struct CatalogFileFilter {
     pub path_prefix: Option<EncodedPath>,
     pub location_groups: Vec<FileLocationGroup>,
     pub as_of_utc_ms: Option<u64>,
+    pub copies_below: Option<u32>,
+    pub verified_copies: bool,
+    pub copies_verified_within_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +119,12 @@ fn bind(values: &mut Vec<Value>, value: impl Into<Value>) -> String {
     format!("?{}", values.len())
 }
 
+/// SQL health expression for internal, fixed table aliases. A recorded success
+/// qualifies only while it still matches this path's expected checksum.
+pub fn verified_copy_predicate(file: &str, object: &str) -> String {
+    format!("{file}.presence='present' AND {file}.integrity='verified' AND {file}.last_check_result='ok' AND {file}.observed_blake3={object}.expected_blake3 AND {file}.last_success_time_utc_ms IS NOT NULL")
+}
+
 /// Shared identity/health rule for listings and catalog-only selection in a
 /// caller's transaction. A healthy copy belongs to this exact expected path;
 /// equal content at a different path does not protect it.
@@ -140,6 +149,13 @@ pub fn selection_predicate(
     {
         return Err(CatalogQueryError::InvalidFilter(
             "too many Location selectors".into(),
+        ));
+    }
+    if filter.copies_below.is_none()
+        && (filter.verified_copies || filter.copies_verified_within_ms.is_some())
+    {
+        return Err(CatalogQueryError::InvalidFilter(
+            "verified copy counting requires copies-below".into(),
         ));
     }
     let mut values = Vec::new();
@@ -187,6 +203,25 @@ pub fn selection_predicate(
             }
         }
     }
+    if let Some(threshold) = filter.copies_below {
+        let mut health = if filter.verified_copies || filter.copies_verified_within_ms.is_some() {
+            verified_copy_predicate("f", "o")
+        } else {
+            "f.presence='present'".into()
+        };
+        if let Some(age) = filter.copies_verified_within_ms {
+            let cutoff = as_of_utc_ms.saturating_sub(age) as i64;
+            health.push_str(&format!(
+                " AND f.last_success_time_utc_ms BETWEEN {} AND {}",
+                bind(&mut values, cutoff),
+                bind(&mut values, as_of)
+            ));
+        }
+        clauses.push(format!(
+            "(SELECT COUNT(*) FROM files f WHERE f.object_id=o.object_id AND {health}) < {}",
+            bind(&mut values, i64::from(threshold))
+        ));
+    }
     if !filter.location_groups.is_empty() {
         clauses.push("o.expected_blake3 IS NOT NULL".into());
     }
@@ -203,9 +238,8 @@ pub fn selection_predicate(
             .collect::<Vec<_>>()
             .join(",");
         let mut predicate = format!(
-            "EXISTS (SELECT 1 FROM files f WHERE f.object_id=o.object_id AND f.location_id IN ({locations}) \
-             AND f.presence='present' AND f.integrity='verified' AND f.last_check_result='ok' \
-             AND f.observed_blake3=o.expected_blake3 AND f.last_success_time_utc_ms IS NOT NULL"
+            "EXISTS (SELECT 1 FROM files f WHERE f.object_id=o.object_id AND f.location_id IN ({locations}) AND {}",
+            verified_copy_predicate("f", "o")
         );
         if let Some(age) = group.verified_within_ms {
             let cutoff = as_of_utc_ms.saturating_sub(age) as i64;
@@ -270,6 +304,9 @@ fn filter_hash(filter: &CatalogFileFilter) -> String {
         path(&filter.exact_path),
         path(&filter.path_prefix),
         &filter.location_groups,
+        filter.copies_below,
+        filter.verified_copies,
+        filter.copies_verified_within_ms,
     ))
     .expect("serializable query fields");
     blake3::hash(&bytes).to_hex().to_string()
@@ -572,6 +609,70 @@ mod tests {
         })
         .unwrap();
         ids
+    }
+
+    #[test]
+    fn copy_threshold_counts_presence_or_verified_evidence_and_keeps_zeroes() {
+        let (_directory, catalog) = fixture(7);
+        let c = catalog.connection();
+        c.execute_batch("INSERT INTO files SELECT object_id,'backup',presence,integrity,last_check_time_utc_ms,last_check_result,observed_blake3,last_success_time_utc_ms FROM files WHERE object_id!='object_00000001';
+            DELETE FROM files WHERE object_id='object_00000001';
+            UPDATE files SET integrity='damaged',last_check_result='mismatch' WHERE object_id='object_00000003' AND location_id='backup';
+            UPDATE files SET presence='missing',last_check_result='missing' WHERE object_id='object_00000004' AND location_id='backup';
+            UPDATE files SET integrity='unverified',last_success_time_utc_ms=NULL WHERE object_id='object_00000005' AND location_id='backup';
+            UPDATE files SET last_success_time_utc_ms=90 WHERE object_id='object_00000006' AND location_id='backup';
+            UPDATE objects SET expected_blake3=NULL WHERE object_id='object_00000007';").unwrap();
+        let mut filter = CatalogFileFilter {
+            collection_id: Some("collection".into()),
+            copies_below: Some(2),
+            as_of_utc_ms: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(ids(c, &filter), [1, 4].map(|n| format!("object_{n:08}")));
+        filter.verified_copies = true;
+        assert_eq!(
+            ids(c, &filter),
+            [1, 3, 4, 5, 7].map(|n| format!("object_{n:08}"))
+        );
+        filter.copies_verified_within_ms = Some(20);
+        assert_eq!(
+            ids(c, &filter),
+            [1, 3, 4, 5, 6, 7].map(|n| format!("object_{n:08}"))
+        );
+        filter.location_groups = vec![group(&["disk"], false, None)];
+        assert_eq!(
+            ids(c, &filter),
+            [3, 4, 5, 6].map(|n| format!("object_{n:08}"))
+        );
+        filter.location_groups.clear();
+        filter.copies_below = Some(0);
+        assert!(ids(c, &filter).is_empty());
+        filter.copies_below = Some(2);
+        filter.collection_id = Some("absent".into());
+        assert!(ids(c, &filter).is_empty());
+    }
+
+    #[test]
+    fn copy_threshold_is_bound_to_continuation() {
+        let (_directory, catalog) = fixture(3);
+        let filter = CatalogFileFilter {
+            copies_below: Some(2),
+            ..Default::default()
+        };
+        let mut request = CatalogObjectRequest {
+            filter,
+            limit: 1,
+            continuation: None,
+        };
+        request.continuation = find_objects(catalog.connection(), request.clone())
+            .unwrap()
+            .next;
+        assert!(request.continuation.is_some());
+        request.filter.copies_below = Some(3);
+        assert!(matches!(
+            find_objects(catalog.connection(), request),
+            Err(CatalogQueryError::InvalidContinuation)
+        ));
     }
 
     #[test]

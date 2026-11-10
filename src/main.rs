@@ -1384,6 +1384,16 @@ enum RegistryKind {
 
 #[derive(Debug, Args)]
 struct FileFindArgs {
+    /// List files with fewer than N present copies across all Locations, including zero.
+    #[arg(long, value_name = "N")]
+    copies_below: Option<u32>,
+    /// Count only copies with current matching checksum evidence; requires --copies-below.
+    #[arg(long, requires = "copies_below")]
+    verified_copies: bool,
+    /// Count only verified copies checked within this age (e.g. 30d); implies --verified-copies.
+    #[arg(long, requires = "copies_below", value_parser = parse_copy_evidence_age)]
+    copies_verified_within: Option<u64>,
+
     /// Match any Location in this group (name or stable ID); repeat for alternatives.
     #[arg(long = "in", action = clap::ArgAction::Append)]
     locations: Vec<String>,
@@ -1396,7 +1406,7 @@ struct FileFindArgs {
     /// Require checksum evidence this recent in the current group (e.g. 30d, 12h).
     #[arg(long, action = clap::ArgAction::Append)]
     verified_within: Vec<String>,
-    /// Emit all source-relative paths separated by NUL; requires one source Location.
+    /// Emit NUL-separated paths; requires one source Location, or --collection with --copies-below.
     #[arg(long, conflicts_with_all = ["continuation", "json"])]
     print0: bool,
     #[arg(skip)]
@@ -1506,6 +1516,11 @@ fn parse_file_location_groups(
     }
     groups.push(group);
     Ok(groups)
+}
+
+fn parse_copy_evidence_age(value: &str) -> Result<u64, String> {
+    parse_file_evidence_age(value)
+        .map_err(|message| message.replace("--verified-within", "--copies-verified-within"))
 }
 
 fn parse_file_evidence_age(value: &str) -> Result<u64, String> {
@@ -2506,6 +2521,16 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         Err(archive_ledger::SqliteCatalogError::Sqlite(_))
             if archive_ledger::is_v2_event_tree(cli.events_path()) => {}
         Err(error) => return Err(error.into()),
+    }
+    if let Command::File {
+        command: FileCommand::Find(args),
+    } = &cli.command
+    {
+        if args.copies_below.is_some() {
+            return Err(AppError::Input(
+                "--copies-below requires an authoritative SQLite catalog".into(),
+            ));
+        }
     }
     if let Command::Events {
         command: EventsCommand::Verify,
