@@ -24,7 +24,23 @@ pub(super) fn execute_status(cli: &Cli, catalog: &SqliteCatalog) -> Result<Optio
         command: CollectionCommand::Show { id, stale_after },
     } = &cli.command
     {
-        return super::sqlite_collection_show::execute(cli, catalog, id, stale_after).map(Some);
+        return super::sqlite_collection_show::execute(cli, catalog, Some(id), stale_after)
+            .map(Some);
+    }
+    if let Command::Collection {
+        command: CollectionCommand::Status { collection },
+    } = &cli.command
+    {
+        // Reuse the detailed human view; retain the existing compact JSON status contract.
+        if !cli.json {
+            return super::sqlite_collection_show::execute(
+                cli,
+                catalog,
+                collection.as_deref(),
+                "30d",
+            )
+            .map(Some);
+        }
     }
     let mut scope = Scope::default();
     let entity = match &cli.command {
@@ -115,9 +131,6 @@ pub(super) fn execute_status(cli: &Cli, catalog: &SqliteCatalog) -> Result<Optio
             "Name: {}",
             entity["display_name"].as_str().unwrap_or("Archive")
         );
-        if let Some(id) = entity["archive_id"].as_str() {
-            println!("Archive ID: {id}");
-        }
         println!("\nFiles");
         for (label, key) in [
             ("Total expected paths", "objects"),
@@ -220,7 +233,6 @@ fn show_location(
             println!("Path relative to archive root: {}", path.display);
         }
         println!("Status: {}", location.status);
-        println!("Location ID: {}", location.location_id);
         println!("\nFiles");
         for (label, key) in [
             ("Total tracked", "tracked_files"),

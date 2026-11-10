@@ -987,7 +987,7 @@ enum CollectionCommand {
         collection: String,
         new_name: String,
     },
-    /// Show a fast SQLite-only Collection summary; infer from cwd when omitted.
+    /// Show copy and Site coverage (30-day verification); omit the name if only one Collection is active.
     Status { collection: Option<String> },
     /// List active Collections.
     #[command(visible_alias = "ls")]
@@ -15438,7 +15438,7 @@ fn plan_filesystem_setup(
         let collection = CollectionSnapshot {
             collection_id: generated_id("collection"),
             display_name: collection_name,
-            description: Some(format!("Files under {}", mounted.path.display())),
+            description: None,
             home_site_id: Some(site.site_id.clone()),
             policy_id: Some(policy.policy_id.clone()),
             status: "active".to_owned(),

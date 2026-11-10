@@ -120,12 +120,19 @@ These queries read only the catalog and do not check the drives.
 
 ### Read catalog summaries
 
-`archive status`, `archive collection show NAME`, and `archive location show NAME`
+`archive status`, `archive collection status NAME`, `archive collection show NAME`,
+and `archive location show NAME`
 show labeled metadata followed by separate sections for file counts and protection evidence.
 Archive status distinguishes logical file paths from copies across Locations; its verification
 counts include checks of any age. Location and Collection views show a verification window
 (default `30d`, adjustable with `--stale-after`). These are catalog lookups, without drive scans
-or backup-policy evaluation. Use `--json` for structured output.
+or backup-policy evaluation. Internal IDs are omitted from human summaries and retained in
+`--json` output for scripting and disambiguating names.
+
+Collections have no filesystem root: they group logical paths and expected checksums.
+Locations provide the actual filesystem roots. `collection init PATH` registers an initial
+Location; the path belongs to that Location. Older Collections may have a generated
+"Files under ..." description; that is descriptive text, not a path binding.
 
 An empty Location shows `Collection: None tracked yet`: Collection membership in this view
 comes from tracked files. Locations containing several Collections list each one and show
@@ -135,9 +142,15 @@ damaged files; the separate never-verified count can overlap unverified or damag
 ### See a Collection's copy and Site coverage
 
 ```bash
-archive collection show Files
+archive collection status Files
 archive collection show Files --stale-after 7d --json
 ```
+
+Human `collection status` and `collection show` share the same protection view.
+`collection status` uses a 30-day verification window and can omit the name when there is
+only one active Collection. Use `collection show --stale-after` to customize the window.
+`collection status --json` retains its compact summary; use `collection show --json` for
+structured copy and Site distributions.
 
 The SQLite summary shows total expected files and distributions by number of copies and distinct
 known Sites. Each distribution includes files with zero copies or zero known Sites. Counts and

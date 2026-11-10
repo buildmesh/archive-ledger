@@ -17,7 +17,7 @@ struct ProtectionSummary {
 pub(super) fn execute(
     cli: &Cli,
     catalog: &SqliteCatalog,
-    selector: &str,
+    selector: Option<&str>,
     stale_after: &str,
 ) -> Result<u8, AppError> {
     let age = parse_file_evidence_age(stale_after).map_err(|message| {
@@ -25,9 +25,13 @@ pub(super) fn execute(
     })?;
     let as_of = now_utc_ms()?;
     let transaction = catalog.connection().unchecked_transaction()?;
-    let state = catalog.registry_state(true)?;
-    let collection = select_collection(&state.collections, selector)?
-        .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?;
+    let state = catalog.registry_state(selector.is_some())?;
+    let collection = match selector {
+        Some(selector) => select_collection(&state.collections, selector)?
+            .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?,
+        None if state.collections.len() == 1 => state.collections[0].clone(),
+        None => return Err(AppError::Input("specify a Collection name or ID".into())),
+    };
     let summary = protection_summary(catalog, &collection.collection_id, as_of, age)?;
     if cli.json {
         println!(
@@ -42,7 +46,6 @@ pub(super) fn execute(
     } else {
         println!("Name: {}", collection.display_name);
         println!("Status: {}", collection.status);
-        println!("Collection ID: {}", collection.collection_id);
         if let Some(description) = &collection.description {
             println!("Description: {description}");
         }

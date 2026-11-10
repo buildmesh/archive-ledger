@@ -49,6 +49,7 @@ fn location_show_works_read_only_without_mounts_and_preserves_metadata() {
     assert!(text.contains("\n\nVerification of present files\n"));
     assert!(text.contains("\n\nBackup coverage\n"));
     assert!(!text.contains("Files by Collection"));
+    assert!(!text.contains("Location ID:"));
     assert!(text.contains("within 7d"));
     // Archive status uses the same grouped presentation without changing evidence.
     let status = Command::new(env!("CARGO_BIN_EXE_archive"))
@@ -59,9 +60,10 @@ fn location_show_works_read_only_without_mounts_and_preserves_metadata() {
         .unwrap();
     assert!(status.status.success());
     let text = String::from_utf8(status.stdout).unwrap();
-    assert!(text.starts_with("Name: Test\nArchive ID: arc\n\nFiles\n"));
+    assert!(text.starts_with("Name: Test\n\nFiles\n"));
     assert!(text.contains("\n\nCopies across Locations\n"));
     assert!(text.contains("Verified present (any age)"));
+    assert!(!text.contains("Archive ID:"));
     assert_eq!(
         catalog
             .connection()
