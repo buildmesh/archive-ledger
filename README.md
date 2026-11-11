@@ -1058,9 +1058,25 @@ exit status before using the output; a failed stream can be partial. Paths refer
 to cataloged entries, including annex symlinks, and are not a copy or deletion
 plan.
 
-In authoritative SQLite catalogs, `file show <object-id>` and
-`object show <object-id>` show the same expected path and all its recorded Locations,
-including missing and damaged copies. IDs come from JSON `file find`; they identify
+In authoritative SQLite catalogs, `file show` accepts a Collection-relative path,
+an absolute filesystem path, or an existing catalog ID:
+
+```bash
+archive file show 'documents/notes.txt' --collection Files
+archive file show /locations/disk10/annex/files/documents/notes.txt
+```
+
+An exact Collection-relative match takes precedence. The Collection is inferred
+when the match is unique; ambiguous matches list the choices and require
+`--collection` with the relative path or a catalog ID. Absolute paths use the latest
+recorded Location mount paths for the selected `--host`, even while drives are
+offline. They do not resolve filesystem symlinks; paths containing `..` must be
+rewritten using the recorded path. In Docker, use the container's recorded paths.
+
+`file show` and `object show <object-id>` report the expected checksum/size and all
+recorded Locations, including missing and damaged copies, with Device, Site, and
+UTC check times. The evidence is cached, not a fresh verification. JSON retains
+catalog IDs and numeric timestamps. IDs come from JSON `file find`; they identify
 paths, not content hashes. The identity filter accepts `resolved` for a known
 expected checksum and `unresolved` or `unknown` for no expected checksum;
 unsupported states are rejected. Plain output streams the selection in one read

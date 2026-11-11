@@ -95,6 +95,10 @@ pub struct CatalogObjectPage {
 pub struct CatalogFile {
     pub location_id: String,
     pub location_name: String,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub site_id: Option<String>,
+    pub site_name: Option<String>,
     pub presence: String,
     pub integrity: String,
     pub last_check_time_utc_ms: Option<i64>,
@@ -542,13 +546,17 @@ pub fn show_object(
         .optional()?
         .ok_or_else(|| CatalogQueryError::NotFound(object_id.into()))?
         .0;
-    let mut statement=connection.prepare("SELECT f.location_id,l.display_name,f.presence,f.integrity,f.last_check_time_utc_ms,f.last_check_result,lower(hex(f.observed_blake3)),f.last_success_time_utc_ms FROM files f JOIN locations l ON l.location_id=f.location_id WHERE f.object_id=?1 ORDER BY f.location_id")?;
+    let mut statement=connection.prepare("SELECT f.location_id,l.display_name,f.presence,f.integrity,f.last_check_time_utc_ms,f.last_check_result,lower(hex(f.observed_blake3)),f.last_success_time_utc_ms,d.device_id,d.display_name,s.site_id,s.display_name FROM files f JOIN locations l ON l.location_id=f.location_id LEFT JOIN devices d ON d.device_id=l.device_id LEFT JOIN sites s ON s.site_id=COALESCE(l.site_id,d.current_site_id) WHERE f.object_id=?1 ORDER BY l.display_name,f.location_id")?;
     let files = statement
         .query_map([object_id], |row| {
             let hash: String = row.get(6)?;
             Ok(CatalogFile {
                 location_id: row.get(0)?,
                 location_name: row.get(1)?,
+                device_id: row.get(8)?,
+                device_name: row.get(9)?,
+                site_id: row.get(10)?,
+                site_name: row.get(11)?,
                 presence: row.get(2)?,
                 integrity: row.get(3)?,
                 last_check_time_utc_ms: row.get(4)?,

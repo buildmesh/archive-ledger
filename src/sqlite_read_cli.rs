@@ -13,7 +13,15 @@ pub(super) fn execute_read(cli: &Cli, catalog: &SqliteCatalog) -> Result<Option<
         Command::File { command } => match command {
             FileCommand::Removed(_) | FileCommand::Remove(_) => return Ok(None),
             FileCommand::Find(args) => find(cli, catalog, args)?,
-            FileCommand::Show { file_ref_id } => show(cli, catalog, file_ref_id)?,
+            FileCommand::Show {
+                file_ref_id,
+                collection,
+            } => {
+                let snapshot = catalog.connection().unchecked_transaction()?;
+                let id = resolve_file(catalog, &cli.host, file_ref_id, collection.as_deref())?;
+                show(cli, catalog, &id)?;
+                snapshot.commit()?;
+            }
             FileCommand::History {
                 file_ref_id,
                 limit,
@@ -132,7 +140,7 @@ fn find(cli: &Cli, catalog: &SqliteCatalog, args: &FileFindArgs) -> Result<(), A
     Ok(())
 }
 
-fn escaped_display(value: &str) -> std::borrow::Cow<'_, str> {
+pub(super) fn escaped_display(value: &str) -> std::borrow::Cow<'_, str> {
     if !value.chars().any(char::is_control) {
         return std::borrow::Cow::Borrowed(value);
     }
@@ -184,6 +192,134 @@ pub(super) fn write_path(
     Ok(())
 }
 
+// Probe the existing unique (Collection, encoding, path) index once per
+// Collection. Never scan Objects to resolve a path without --collection.
+fn resolve_file(
+    catalog: &SqliteCatalog,
+    host: &str,
+    selector: &str,
+    collection_selector: Option<&str>,
+) -> Result<String, AppError> {
+    let connection = catalog.connection();
+    let state = catalog.registry_state(false)?;
+    let collections = if let Some(selector) = collection_selector {
+        vec![select_collection(&state.collections, selector)?
+            .ok_or_else(|| AppError::Input(format!("Collection not found: {selector:?}")))?]
+    } else {
+        state.collections
+    };
+    let mut matches = std::collections::BTreeMap::<String, String>::new();
+    let mut exact = connection.prepare(
+        "SELECT object_id FROM objects WHERE collection_id=?1 AND relative_path_encoding='utf8' AND relative_path_bytes=?2"
+    )?;
+    for collection in &collections {
+        let id: Option<String> = exact
+            .query_row(
+                params![collection.collection_id, selector.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = id {
+            matches.insert(id, format!("{}: {selector}", collection.display_name));
+        }
+    }
+    if !matches.is_empty() {
+        return unique_file(matches);
+    }
+    // IDs remain available, including IDs belonging to retired Collections.
+    let id_collection: Option<String> = connection
+        .query_row(
+            "SELECT collection_id FROM objects WHERE object_id=?1",
+            [selector],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id_collection) = id_collection {
+        if collection_selector.is_none()
+            || collections.iter().any(|c| c.collection_id == id_collection)
+        {
+            return Ok(selector.to_owned());
+        }
+    }
+    let path = Path::new(selector);
+    if path.is_absolute() {
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(AppError::Input("absolute file paths must not contain '..'; use the recorded path without resolving symlinks".into()));
+        }
+        let mut roots = connection.prepare(
+            "SELECT l.location_id,l.relative_path_encoding,l.relative_path_bytes,m.mount_root_uri
+             FROM locations l JOIN device_mounts m ON m.mount_id=(
+               SELECT mount_id FROM device_mounts WHERE archive_root_id=l.archive_root_id AND host_id=?1
+               ORDER BY observed_time_utc_ms DESC,mount_id DESC LIMIT 1)
+             WHERE l.status='active' AND l.kind='filesystem'"
+        )?;
+        let rows = roots.query_map([host], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut at_location = connection.prepare(
+            "SELECT o.object_id FROM objects o WHERE o.collection_id=?1 AND o.relative_path_encoding='utf8' AND o.relative_path_bytes=?2
+             AND EXISTS(SELECT 1 FROM files f WHERE f.object_id=o.object_id AND f.location_id=?3)"
+        )?;
+        for row in rows {
+            let (location_id, encoding, bytes, mount) = row?;
+            let relative = relative_path_from_bytes(&encoding, &bytes)?;
+            if !Path::new(&mount).is_absolute()
+                || relative.is_absolute()
+                || Path::new(&mount)
+                    .components()
+                    .chain(relative.components())
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let root = Path::new(&mount).join(relative);
+            // strip_prefix compares components, not string prefixes; no stat or canonicalize.
+            let Ok(relative) = path.strip_prefix(&root) else {
+                continue;
+            };
+            let relative: PathBuf = relative.components().collect();
+            let Some(relative) = relative.to_str() else {
+                continue;
+            };
+            for collection in &collections {
+                let id: Option<String> = at_location
+                    .query_row(
+                        params![collection.collection_id, relative.as_bytes(), location_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = id {
+                    matches.insert(id, format!("{}: {relative}", collection.display_name));
+                }
+            }
+        }
+    }
+    if matches.is_empty() {
+        return Err(CatalogQueryError::NotFound(format!("{selector:?}. Use a Collection-relative path with --collection, an existing catalog ID, or an absolute path under a recorded Location for this host.")).into());
+    }
+    unique_file(matches)
+}
+
+fn unique_file(matches: std::collections::BTreeMap<String, String>) -> Result<String, AppError> {
+    if matches.len() == 1 {
+        return Ok(matches.into_keys().next().expect("one match"));
+    }
+    let choices = matches
+        .iter()
+        .map(|(id, path)| format!("  {path:?} ({id})"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(AppError::Input(format!("File path is ambiguous. Use --collection with the exact Collection-relative path, or a catalog ID:\n{choices}")))
+}
+
 fn show(cli: &Cli, catalog: &SqliteCatalog, object_id: &str) -> Result<(), AppError> {
     let review = show_object(catalog.connection(), object_id)?;
     if cli.json {
@@ -201,52 +337,66 @@ fn show(cli: &Cli, catalog: &SqliteCatalog, object_id: &str) -> Result<(), AppEr
         |row| row.get(0),
     )?;
     println!(
-        "{}  [{}]",
-        escaped_display(&review.object.relative_path.display),
-        escaped_display(&collection_name)
+        "Path: {}",
+        escaped_display(&review.object.relative_path.display)
     );
-    println!("  Object: {}", review.object.object_id);
+    println!("Collection: {}", escaped_display(&collection_name));
     println!(
-        "  Expected BLAKE3: {}",
+        "Expected BLAKE3: {}",
         review
             .object
             .expected_blake3
             .as_deref()
             .unwrap_or("unknown")
     );
-    if let Some(size) = review.object.expected_size_bytes {
-        println!("  Expected size: {size} bytes");
+    match review.object.expected_size_bytes {
+        Some(size) => println!("Expected size: {size} bytes"),
+        None => println!("Expected size: unknown"),
     }
+    println!("\nLocations: {}", review.files.len());
     if review.files.is_empty() {
-        println!("  Locations: no recorded copies");
-    } else {
-        println!("  Locations:");
-        for file in review.files {
-            println!(
-                "    {} — {}, {}",
-                escaped_display(&file.location_name),
-                file.presence,
-                file.integrity
-            );
-            println!(
-                "      Last check: {} ({})",
-                display_time(file.last_check_time_utc_ms),
-                file.last_check_result.as_deref().unwrap_or("never")
-            );
-            println!(
-                "      Last successful verification: {}",
-                display_time(file.last_success_time_utc_ms)
-            );
-            if let Some(observed) = file.observed_blake3 {
-                println!("      Observed BLAKE3: {observed}");
+        println!("  No recorded copies.");
+    }
+    for file in review.files {
+        println!("\n  {}", escaped_display(&file.location_name));
+        println!(
+            "    Device: {}",
+            escaped_display(file.device_name.as_deref().unwrap_or("unknown"))
+        );
+        println!(
+            "    Site: {}",
+            escaped_display(file.site_name.as_deref().unwrap_or("unknown"))
+        );
+        println!("    Presence: {}", file.presence);
+        println!("    Integrity: {}", file.integrity);
+        println!(
+            "    Last check: {} ({})",
+            display_time(catalog, file.last_check_time_utc_ms)?,
+            file.last_check_result.as_deref().unwrap_or("never")
+        );
+        println!(
+            "    Last successful verification: {}",
+            display_time(catalog, file.last_success_time_utc_ms)?
+        );
+        if let Some(observed) = file.observed_blake3 {
+            if Some(&observed) != review.object.expected_blake3.as_ref() {
+                println!("    Observed BLAKE3: {observed}");
             }
         }
     }
+    println!("\nEvidence: Cached catalog; drives have not been checked.");
     Ok(())
 }
-fn display_time(time: Option<i64>) -> String {
-    time.map(|value| value.to_string())
-        .unwrap_or_else(|| "never".into())
+fn display_time(catalog: &SqliteCatalog, time: Option<i64>) -> Result<String, AppError> {
+    let Some(time) = time else {
+        return Ok("never".into());
+    };
+    let formatted: Option<String> = catalog.connection().query_row(
+        "SELECT strftime('%Y-%m-%d %H:%M:%S UTC', ?1 / 1000.0, 'unixepoch')",
+        [time],
+        |row| row.get(0),
+    )?;
+    Ok(formatted.unwrap_or_else(|| format!("{time} ms since Unix epoch")))
 }
 
 #[derive(Debug, Serialize)]

@@ -788,7 +788,13 @@ enum FileCommand {
     /// List all matching logical paths from SQLite; --json returns a detailed page.
     Find(Box<FileFindArgs>),
     /// Show one logical file and all current copy evidence.
-    Show { file_ref_id: String },
+    Show {
+        /// Collection-relative path, absolute filesystem path, or catalog ID.
+        file_ref_id: String,
+        /// Disambiguate a path shared by multiple Collections (SQLite catalogs).
+        #[arg(long)]
+        collection: Option<String>,
+    },
     /// Show check and change history for one logical file.
     History {
         file_ref_id: String,
@@ -18422,7 +18428,10 @@ fn execute_file(
                 |request| database.find_file_paths(request),
             )?;
         }
-        FileCommand::Show { file_ref_id } => {
+        FileCommand::Show { file_ref_id, collection } => {
+            if collection.is_some() {
+                return Err(AppError::Input("file show --collection requires an authoritative SQLite catalog".into()));
+            }
             let review = database.review_file(file_ref_id)?;
             let policy = database.review_file_policy(file_ref_id, now_utc_ms()?)?;
             if as_json {
@@ -18694,7 +18703,10 @@ fn execute_v2_file(
                 |request| database.find_file_paths(request),
             )?;
         }
-        FileCommand::Show { file_ref_id } => {
+        FileCommand::Show { file_ref_id, collection } => {
+            if collection.is_some() {
+                return Err(AppError::Input("file show --collection requires an authoritative SQLite catalog".into()));
+            }
             let review = database.review_file(file_ref_id)?;
             if as_json {
                 println!(
