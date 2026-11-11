@@ -252,6 +252,12 @@ counts include checks of any age. Location and Collection views show a verificat
 or backup-policy evaluation. Internal IDs are omitted from human summaries and retained in
 `--json` output for scripting and disambiguating names.
 
+Use `archive site show Offsite` (or `Home`, `Sam`, or another Site name) to see
+the Devices currently assigned there. Devices appear in a vertical list with kind,
+status, and expected availability; assigned retired Devices are explicitly labeled.
+`device move` is reflected immediately. This reads recorded assignments without
+probing drives. JSON keeps the Site in `items` and adds `devices` and `device_count`.
+
 Collections have no filesystem root: they group logical paths and expected checksums.
 Locations provide the actual filesystem roots. `collection init PATH` registers an initial
 Location; the path belongs to that Location. Older Collections may have a generated

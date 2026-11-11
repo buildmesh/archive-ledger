@@ -212,12 +212,6 @@ pub(super) fn execute_setup(
                 RegistryKind::Site,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            SiteCommand::Show { id } => entity(
-                cli,
-                database,
-                RegistryKind::Site,
-                &RegistryEntityCommand::Show { id: id.clone() },
-            )?,
             SiteCommand::Add(args) => entity(
                 cli,
                 database,
@@ -246,7 +240,7 @@ pub(super) fn execute_setup(
                 record(cli, database, change)?;
                 EXIT_OK
             }
-            SiteCommand::Status { .. } => return Ok(None),
+            SiteCommand::Show { .. } | SiteCommand::Status { .. } => return Ok(None),
         },
         Command::Device { command } => match command {
             DeviceCommand::Discover { path } => entity(

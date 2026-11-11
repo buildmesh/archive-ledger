@@ -14,6 +14,12 @@ pub(super) fn execute_status(cli: &Cli, catalog: &SqliteCatalog) -> Result<Optio
     if let Command::Fsck(args) = &cli.command {
         return fsck(cli, catalog, args).map(Some);
     }
+    if let Command::Site {
+        command: SiteCommand::Show { id },
+    } = &cli.command
+    {
+        return show_site(cli, catalog, id).map(Some);
+    }
     if let Command::Location {
         command: LocationCommand::Show { id, stale_after },
     } = &cli.command
@@ -152,6 +158,48 @@ pub(super) fn execute_status(cli: &Cli, catalog: &SqliteCatalog) -> Result<Optio
         println!("Backup policy: Not evaluated.");
     }
     Ok(Some(EXIT_OK))
+}
+
+fn show_site(cli: &Cli, catalog: &SqliteCatalog, selector: &str) -> Result<u8, AppError> {
+    let state = catalog.registry_state(true)?;
+    let site = select_site(&state.sites, selector)?
+        .ok_or_else(|| AppError::Input(format!("Site not found: {selector:?}")))?;
+    let mut devices = state
+        .devices
+        .iter()
+        .filter(|device| device.current_site_id.as_deref() == Some(site.site_id.as_str()))
+        .collect::<Vec<_>>();
+    devices.sort_by(|a, b| (&a.display_name, &a.device_id).cmp(&(&b.display_name, &b.device_id)));
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "version": 3, "items": [site], "devices": devices, "device_count": devices.len()
+            }))?
+        );
+    } else {
+        use sqlite_read_cli::escaped_display;
+        println!("Name: {}", escaped_display(&site.display_name));
+        println!("Kind: {}", escaped_display(&site.site_kind));
+        println!("Status: {}", site.status);
+        if let Some(description) = &site.description {
+            println!("Description: {}", escaped_display(description));
+        }
+        println!("\nDevices: {}", devices.len());
+        if devices.is_empty() {
+            println!("  No Devices assigned to this Site.");
+        }
+        for device in devices {
+            println!("\n  {}", escaped_display(&device.display_name));
+            println!("    Kind: {}", escaped_display(&device.device_kind));
+            println!("    Status: {}", device.status);
+            println!(
+                "    Expected availability: {}",
+                device.expected_availability
+            );
+        }
+    }
+    Ok(EXIT_OK)
 }
 
 fn show_location(
