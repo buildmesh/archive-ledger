@@ -145,7 +145,11 @@ follow a group to require recent checksum evidence. The Collection is inferred w
 unambiguous; otherwise supply `--collection`.
 
 Generation reads only SQLite, using the same checksum-qualified selection as `file find`.
-It does not scan drives, copy files or record destination presence. All matching paths
+It automatically excludes files recorded present at the destination Location, regardless
+of their verification state or age. This uses the exact destination Location, not every
+Location on its Device. Missing or unknown destination records remain eligible. Files
+already on disk but not recorded in the catalog are still skipped by rsync when run.
+Generation does not scan drives, copy files or record destination presence. All matching paths
 are embedded as a streaming, readable list with one file per line in a quoted data block.
 Ordinary paths appear literally, including spaces and quotes. Backslashes appear as `\\`,
 newlines as `\n`, tabs as `\t`, and carriage returns as `\r`; other non-ASCII/control

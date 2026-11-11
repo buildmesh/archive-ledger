@@ -52,6 +52,8 @@ pub struct CatalogFileFilter {
     pub exact_path: Option<EncodedPath>,
     pub path_prefix: Option<EncodedPath>,
     pub location_groups: Vec<FileLocationGroup>,
+    /// Exclude physical presence at a copy destination, regardless of integrity.
+    pub exclude_present_location_id: Option<String>,
     pub as_of_utc_ms: Option<u64>,
     pub copies_below: Option<u32>,
     pub verified_copies: bool,
@@ -222,6 +224,12 @@ pub fn selection_predicate(
             bind(&mut values, i64::from(threshold))
         ));
     }
+    if let Some(location) = &filter.exclude_present_location_id {
+        clauses.push(format!(
+            "NOT EXISTS (SELECT 1 FROM files destination WHERE destination.object_id=o.object_id AND destination.location_id={} AND destination.presence='present')",
+            bind(&mut values, location.clone())
+        ));
+    }
     if !filter.location_groups.is_empty() {
         clauses.push("o.expected_blake3 IS NOT NULL".into());
     }
@@ -304,6 +312,7 @@ fn filter_hash(filter: &CatalogFileFilter) -> String {
         path(&filter.exact_path),
         path(&filter.path_prefix),
         &filter.location_groups,
+        &filter.exclude_present_location_id,
         filter.copies_below,
         filter.verified_copies,
         filter.copies_verified_within_ms,

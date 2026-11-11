@@ -204,6 +204,55 @@ fn selection_is_read_only_and_cannot_be_widened_beyond_source() {
 }
 
 #[test]
+fn manifest_excludes_destination_presence_independently_of_health_and_filters() {
+    let f = Fixture::new("source", "destination");
+    for name in [
+        "verified",
+        "stale",
+        "unverified",
+        "damaged",
+        "missing",
+        "unknown",
+    ] {
+        f.file(name, name.as_bytes(), &["source", "destination"]);
+    }
+    f.catalog.connection().execute_batch("\
+        UPDATE files SET last_success_time_utc_ms=1 WHERE location_id='destination' AND object_id='stale';
+        UPDATE files SET integrity='unverified',last_check_time_utc_ms=NULL,last_check_result=NULL,last_success_time_utc_ms=NULL WHERE location_id='destination' AND object_id='unverified';
+        UPDATE files SET integrity='damaged',last_check_result='mismatch' WHERE location_id='destination' AND object_id='damaged';
+        UPDATE files SET presence='missing' WHERE location_id='destination' AND object_id='missing';
+        UPDATE files SET presence='unknown' WHERE location_id='destination' AND object_id='unknown';
+    ").unwrap();
+    f.file("new", b"new", &["source"]);
+    f.file("backup", b"backup", &["source", "backup"]);
+    f.file("elsewhere", b"elsewhere", &["source", "other"]);
+    for extra in [vec![], vec!["--in", "Source", "--in", "Destination"]] {
+        let script = f.script(f.command().args(extra));
+        let generated = fs::read_to_string(&script).unwrap();
+        let manifest = generated
+            .split_once("<<'ARCHIVE_LEDGER_PATHS'\n")
+            .unwrap()
+            .1
+            .split_once("\nARCHIVE_LEDGER_PATHS\n")
+            .unwrap()
+            .0;
+        let mut paths: Vec<_> = manifest.lines().collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["backup", "elsewhere", "missing", "new", "unknown"]);
+    }
+    let script = f.script(f.command().args(["--not", "--in", "Backup"]));
+    assert_success(&f.run_script(&script, &[]));
+    // A wrong inclusion would copy these: the fixture deliberately has catalog
+    // presence without physical destination files, proving generation uses SQL.
+    for excluded in ["verified", "stale", "unverified", "damaged", "backup"] {
+        assert!(!f.destination.join(excluded).exists(), "{excluded}");
+    }
+    for included in ["elsewhere", "missing", "new", "unknown"] {
+        assert_eq!(fs::read(f.destination.join(included)).unwrap(), b"payload");
+    }
+}
+
+#[test]
 fn filenames_and_roots_are_data_and_existing_destinations_are_preserved() {
     let f = Fixture::new(
         "source ' $(touch ROOT_INJECTED) `touch ROOT_TICKED`\nend",

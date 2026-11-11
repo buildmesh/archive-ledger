@@ -131,6 +131,7 @@ pub(super) fn execute(
     let filter = CatalogFileFilter {
         collection_id: Some(collection),
         location_groups: groups,
+        exclude_present_location_id: Some(destination.location_id.clone()),
         as_of_utc_ms: Some(now_utc_ms()?),
         ..Default::default()
     };
