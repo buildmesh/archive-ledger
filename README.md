@@ -25,7 +25,9 @@ format**. Their examples later in this document apply only to legacy event-backe
 Archives. Existing Archives retain their legacy format until explicitly migrated;
 opening them does not silently convert or erase their history. Start with
 [From first Archive to routine maintenance](docs/guides/archive-lifecycle.md) for
-the current SQLite workflow. The older [workflow](docs/workflows.md) and
+the current SQLite workflow. For recurring backups, see
+[Rotate backup sets and maintain a carried USB backup](docs/guides/rotating-backups.md).
+The older [workflow](docs/workflows.md) and
 [annex](docs/guides/annex-workflows.md) guides still include legacy-only operations.
 
 To convert an existing event-backed Archive, choose a new destination directory:

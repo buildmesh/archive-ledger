@@ -4,6 +4,9 @@ An Archive is a local SQLite catalog of expected file contents, Locations, and c
 It does not contain your files. This guide creates a Collection, checks its files, makes a backup,
 and backs up the catalog itself.
 
+For the recurring workflow with two offsite backup sets and a carried USB drive, see
+[Rotate backup sets and maintain a carried USB backup](rotating-backups.md).
+
 The examples use documents in `~/Documents`, a backup disk at `/media/backup-disk`, and separate
 storage for catalog backups at `/media/offsite-disk`. Replace these paths and names with your own.
 Every `bash` block runs in order against disposable fixtures in `scripts/test-lifecycle-guide.py`.
