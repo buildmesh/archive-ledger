@@ -89,6 +89,69 @@ The age condition applies to its group. This example accepts a successful backup
 Use `file show <object-id>` for current Location evidence and `file history <object-id>` for checks
 and changes. Obtain IDs with `file find --json`.
 
+### Copy missing backups on the host when container mounts are read-only
+
+This example uses Collection `Files`, with `/var/data` on the host mounted at `/locations`
+inside the container. The source and destination roots on the host are
+`/var/data/disk10/annex/files` and `/var/data/sd03/annex/files`. Configure Compose to select
+your migrated catalog first. Run all commands below from the host's Compose project directory.
+
+Save all paths present on disk10 but absent from the entire backup set:
+
+```text
+docker compose run --rm -T archive file find \
+  --collection "Files" \
+  --in "Files on disk10" \
+  --and --not \
+  --in "Files on sd" \
+  --in "Files on sd02" \
+  --in "Files on sd03" > /tmp/x
+```
+
+The three backup Locations form one OR group, which `--not` excludes. This query uses
+matching, verified checksum evidence without an age limit. It does not scan the drives.
+`-T` disables the container terminal so redirected output is suitable for a file list.
+Check that the command succeeded before copying.
+
+Preview the host-side copy:
+
+```text
+tr '\n' '\0' < /tmp/x |
+  rsync -aL --from0 --files-from=- \
+    --ignore-existing --itemize-changes --dry-run \
+    /var/data/disk10/annex/files/ \
+    /var/data/sd03/annex/files/
+```
+
+Then perform the copy by removing `--dry-run`:
+
+```text
+tr '\n' '\0' < /tmp/x |
+  rsync -aL --from0 --files-from=- \
+    --ignore-existing --itemize-changes \
+    /var/data/disk10/annex/files/ \
+    /var/data/sd03/annex/files/
+```
+
+Rsync preserves relative paths and creates their parent directories. `-L` copies the contents
+of annex symlinks as regular files; ordinary files are copied normally. Broken source symlinks
+produce errors. `--ignore-existing` skips existing destination files, including symlinks;
+it does not verify their contents. Filenames are read as data, so spaces, quotes, backslashes,
+and shell characters do not become executable commands.
+
+The `/tmp/x` example assumes paths without control characters; human output escapes those
+characters, so converting its newlines to NUL does not recover the original names.
+For a lossless list, add `--print0` to the find command and save it to
+`/tmp/x.nul`; replace each `tr ... | rsync` pipeline with `rsync` using
+`--from0 --files-from=/tmp/x.nul` and the same remaining options and roots.
+
+The external copy does not update Archive Ledger. After copying, scan the destination to record
+and verify its files (this reads file contents and can take time):
+
+```text
+docker compose run --rm archive location scan "Files on sd03" --collection "Files"
+```
+
 ## 5. Keep current state and verification evidence up to date
 
 `collection add` checks files under the selected directory without declaring other paths missing.
