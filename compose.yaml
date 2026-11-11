@@ -16,6 +16,9 @@ services:
       XDG_DATA_HOME: /state/data
       # Large SQLite operations can spill beyond the RAM-backed /tmp capacity.
       SQLITE_TMPDIR: /state
+      # Allow --host-script to translate recorded container paths for the host.
+      ARCHIVE_LEDGER_LOCATIONS_DIR: "${ARCHIVE_LEDGER_LOCATIONS_DIR}"
+      ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR: "${ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR:-/locations}"
     read_only: true
     cap_drop:
       - ALL

@@ -147,7 +147,7 @@ fn escaped_display(value: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(escaped)
 }
 
-fn write_path(
+pub(super) fn write_path(
     output: &mut impl Write,
     path: &LosslessPath,
     print0: bool,

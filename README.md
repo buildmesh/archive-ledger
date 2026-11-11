@@ -118,6 +118,56 @@ to its Location group. Copies are Location records, not necessarily independent 
 Use `--print0` with `--collection` for lossless path lists, or `--json` for paginated records.
 These queries read only the catalog and do not check the drives.
 
+### Generate a copy script for the host
+
+When content is mounted read-only inside Docker, generate a self-contained Bash script
+instead of copying inside the container:
+
+```bash
+docker compose run --rm -T archive copy \
+  --from "Files on disk10" --to "Files on sd03" \
+  --collection Files --host-script \
+  --not --in "Files on sd" --in "Files on sd02" > copy.sh
+```
+
+After generation succeeds, preview and then run the script **on the host**:
+
+```bash
+bash copy.sh --dry-run
+bash copy.sh
+```
+
+The source Location is always required. Repeated `--in` flags in a group mean OR;
+`--not` excludes that group, and `--and` starts another group. Start the first extra
+group with `--in` or `--not`, without a leading `--and`. `--verified-within 30d` can
+follow a group to require recent checksum evidence. The Collection is inferred when
+unambiguous; otherwise supply `--collection`.
+
+Generation reads only SQLite, using the same checksum-qualified selection as `file find`.
+It does not scan drives, copy files or record destination presence. All matching paths
+are embedded in the script as a streaming, base64-encoded NUL-separated manifest, so
+spaces, quotes, newlines and Unix filename bytes remain data. A fixed template invokes
+rsync; Location names and filenames are never evaluated as shell commands.
+
+Compose passes `ARCHIVE_LEDGER_LOCATIONS_DIR` (the host root, e.g. `/var/data`) and
+`ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR` (the container root, usually `/locations`)
+to translate the recorded roots. To supply or override the mapping explicitly, add
+`--host-root /var/data --locations-root /locations`. Paths must be inside the recorded
+container prefix; it is matched by path components, not text prefixes. Without a mapping,
+native invocations use the recorded absolute paths. Roots must be UTF-8.
+
+The host needs Bash, rsync and GNU base64. The script preserves relative paths and follows
+source symlinks (including annex links) to copy their contents as regular files. Existing
+destination files are skipped, not verified or overwritten. Existing destination directory
+symlinks are rejected before copying to prevent writes outside the selected root. It supports
+only the optional `--dry-run` argument and never deletes destination files.
+
+After a successful copy, checksum and record the destination files separately:
+
+```bash
+docker compose run --rm archive collection add /locations/sd03/annex/files
+```
+
 ### Read catalog summaries
 
 `archive status`, `archive collection status NAME`, `archive collection show NAME`,

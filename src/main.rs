@@ -33,6 +33,7 @@ use sha2::{Digest as _, Sha256};
 
 mod sqlite_cli;
 mod sqlite_collection_show;
+mod sqlite_host_copy;
 mod sqlite_read_cli;
 mod sqlite_removed_cli;
 mod sqlite_setup_cli;
@@ -888,6 +889,8 @@ struct CopyArgs {
 
 #[derive(Debug, Args)]
 struct CopyMutationArgs {
+    #[command(flatten)]
+    host: HostCopyArgs,
     /// Destination Location name or stable ID.
     #[arg(long)]
     to: Option<String>,
@@ -917,6 +920,33 @@ struct CopyMutationArgs {
     max_items: Option<usize>,
     #[arg(skip)]
     logical_filters: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Default, Args)]
+struct HostCopyArgs {
+    /// Print a self-contained Bash/rsync script to run on the host; does not copy or update the catalog.
+    #[arg(long, requires_all = ["from", "to"], conflicts_with_all = ["paths", "dry_run", "yes", "non_interactive", "job_id", "max_items", "json"])]
+    host_script: bool,
+    /// Host counterpart of --locations-root (or ARCHIVE_LEDGER_LOCATIONS_DIR).
+    #[arg(long, requires = "host_script")]
+    host_root: Option<PathBuf>,
+    /// Container path prefix to replace; defaults to ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR or /locations.
+    #[arg(long, requires = "host_script")]
+    locations_root: Option<PathBuf>,
+    /// Match any Location in this group, in addition to the required --from Location.
+    #[arg(long = "in", action = clap::ArgAction::Append, requires = "host_script")]
+    locations: Vec<String>,
+    /// Start another Location filter group; all groups must match.
+    #[arg(long = "and", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", requires = "host_script")]
+    and_groups: Vec<bool>,
+    /// Negate the next Location group; repeated --in flags within it are alternatives.
+    #[arg(long = "not", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", requires = "host_script")]
+    not_groups: Vec<bool>,
+    /// Require checksum evidence this recent in the current --in group.
+    #[arg(long, action = clap::ArgAction::Append, requires = "host_script")]
+    verified_within: Vec<String>,
+    #[arg(skip)]
+    location_groups: Vec<FileLocationGroup>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2294,6 +2324,28 @@ fn main() -> ExitCode {
                 clap::Error::raw(clap::error::ErrorKind::InvalidValue, message)
             })?;
         }
+        let copy = match &mut cli.command {
+            Command::Copy(args) if args.command.is_none() => Some((
+                &mut args.mutation,
+                matches.subcommand_matches("copy").unwrap(),
+            )),
+            Command::Location {
+                command: LocationCommand::Copy(args),
+            } => Some((
+                args,
+                matches
+                    .subcommand_matches("location")
+                    .unwrap()
+                    .subcommand_matches("copy")
+                    .unwrap(),
+            )),
+            _ => None,
+        };
+        if let Some((args, matches)) = copy {
+            args.host.location_groups = parse_file_location_groups(matches).map_err(|message| {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, message)
+            })?;
+        }
         Ok(cli)
     });
     let mut cli = match parsed {
@@ -2500,6 +2552,9 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
                 print_catalog_backup(&report, cli.json, false)?;
                 return Ok(EXIT_OK);
             }
+            if let Some(args) = sqlite_host_copy::arguments(cli) {
+                return sqlite_host_copy::execute(cli, &catalog, args);
+            }
             if let Some(result) = sqlite_read_cli::execute_read(cli, &catalog)? {
                 return Ok(result);
             }
@@ -2532,6 +2587,11 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         Err(archive_ledger::SqliteCatalogError::Sqlite(_))
             if archive_ledger::is_v2_event_tree(cli.events_path()) => {}
         Err(error) => return Err(error.into()),
+    }
+    if sqlite_host_copy::arguments(cli).is_some() {
+        return Err(AppError::Input(
+            "--host-script requires an authoritative SQLite catalog".into(),
+        ));
     }
     if let Command::File {
         command: FileCommand::Find(args),
@@ -4102,6 +4162,7 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
                         cli,
                         database,
                         &CopyMutationArgs {
+                            host: HostCopyArgs::default(),
                             to: Some(json_string(params, "destination_location_id")?),
                             from: Some(json_string(params, "source_location_id")?),
                             collection: Some(json_string(params, "collection_id")?),
@@ -9690,6 +9751,7 @@ fn execute_v2_job(
                         cli,
                         database,
                         &CopyMutationArgs {
+                            host: HostCopyArgs::default(),
                             to: Some(json_string(&job_params, "to")?),
                             from: Some(json_string(&job_params, "from")?),
                             collection: Some(json_string(&job_params, "collection")?),
