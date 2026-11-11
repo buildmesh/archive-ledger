@@ -182,6 +182,63 @@ After a successful copy, checksum and record the destination files separately:
 docker compose run --rm archive collection add /locations/sd03/annex/files
 ```
 
+### Generate a removal script for a temporary backup
+
+To clear a temporary backup after its files reach another backup Device:
+
+```bash
+archive file remove --host-script --from "Files on usb" \
+  --collection Files \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03" \
+  --verified-within 30d > remove.sh
+```
+
+`--from` identifies the Location to clean. Repeated `--in` flags name alternative
+backup Locations (OR); at least one is required. Each must belong to a known Device
+different from the target Device. These are explicit Locations, not a dynamic Site
+filter. The Collection is inferred when unambiguous. Host path mapping uses the same
+Compose environment or `--host-root` / `--locations-root` flags as copy scripts.
+
+Generation is a read-only SQLite query: it selects verified target files with a matching
+expected BLAKE3 at the same Collection-relative path on at least one named backup.
+Backup verification must be within `--verified-within` (default `30d`); stale, missing,
+unverified, damaged, or future-dated backup evidence does not qualify. It does not
+scan the target or reread backup drives. A saved script expires when the first selected
+file loses its qualifying backup evidence due to age; regenerate it if expired.
+
+Review the readable checksum-and-path list, then preview and explicitly delete:
+
+```bash
+less remove.sh
+bash remove.sh --dry-run  # Also the default with no arguments.
+bash remove.sh --delete
+```
+
+The host needs Bash and, for deletion, `b3sum` (on Debian/Ubuntu: `sudo apt install b3sum`).
+The executable logic is the static `src/host_remove_template.sh`; only the safely quoted
+target root, escaped checksum/path data, and numeric evidence expiry are filled in.
+The filename escaping is shared with copy scripts. No file-list data is evaluated as code.
+
+Before deleting each selected file, the script checks its current BLAKE3 against the
+expected checksum and refuses changed contents. It rejects directories, dangling links,
+and symlinks in directory components; a final symlink to a regular file is checked through
+its target and only the link is removed. It never deletes directories recursively.
+Already absent files are skipped. Run with no other processes changing the target tree:
+these shell checks cannot make concurrent filesystem changes atomic with deletion.
+Errors stop the script, so earlier selected files may already have been removed.
+
+The script never changes the catalog. After any deletion run, including an interrupted
+or failed run, reconcile the target's actual state before doing further backup queries:
+
+```bash
+archive location scan "Files on usb"
+```
+
+The scan records missing paths from the filesystem; it does not assume every planned
+removal succeeded. Use the same `docker compose run --rm archive` prefix for generation
+and reconciliation inside Docker, but run the generated script on the host. The existing
+`archive file removed` command remains a catalog-only declaration and does not delete files.
+
 ### Read catalog summaries
 
 `archive status`, `archive collection status NAME`, `archive collection show NAME`,

@@ -34,6 +34,8 @@ use sha2::{Digest as _, Sha256};
 mod sqlite_cli;
 mod sqlite_collection_show;
 mod sqlite_host_copy;
+mod sqlite_host_remove;
+mod sqlite_host_script;
 mod sqlite_read_cli;
 mod sqlite_removed_cli;
 mod sqlite_setup_cli;
@@ -779,6 +781,8 @@ enum RestoreCommand {
 
 #[derive(Debug, Subcommand)]
 enum FileCommand {
+    /// Generate a host removal script for files verified on another Device.
+    Remove(Box<HostRemoveArgs>),
     /// Mark copies removed in the catalog; never delete archive contents.
     Removed(Box<FileRemovedArgs>),
     /// List all matching logical paths from SQLite; --json returns a detailed page.
@@ -1489,6 +1493,31 @@ struct FileRemovedArgs {
     /// List every affected path without changing the catalog or files.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct HostRemoveArgs {
+    /// Print a reviewable Bash script; never delete files or change the catalog here.
+    #[arg(long, required = true, conflicts_with = "json")]
+    host_script: bool,
+    /// Location to remove files from.
+    #[arg(long)]
+    from: String,
+    /// Collection; inferred when unambiguous.
+    #[arg(long)]
+    collection: Option<String>,
+    /// Backup Location on another Device; repeat for alternatives (OR).
+    #[arg(long = "in", required = true, action = clap::ArgAction::Append)]
+    locations: Vec<String>,
+    /// Maximum age of matching backup checksum evidence.
+    #[arg(long, default_value = "30d", value_parser = parse_file_evidence_age)]
+    verified_within: u64,
+    /// Host counterpart of --locations-root (or ARCHIVE_LEDGER_LOCATIONS_DIR).
+    #[arg(long)]
+    host_root: Option<PathBuf>,
+    /// Container prefix to replace; defaults to /locations or its environment setting.
+    #[arg(long)]
+    locations_root: Option<PathBuf>,
 }
 
 fn parse_file_location_groups(
@@ -2555,6 +2584,12 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             if let Some(args) = sqlite_host_copy::arguments(cli) {
                 return sqlite_host_copy::execute(cli, &catalog, args);
             }
+            if let Command::File {
+                command: FileCommand::Remove(args),
+            } = &cli.command
+            {
+                return sqlite_host_remove::execute(cli, &catalog, args);
+            }
             if let Some(result) = sqlite_read_cli::execute_read(cli, &catalog)? {
                 return Ok(result);
             }
@@ -2588,7 +2623,14 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
             if archive_ledger::is_v2_event_tree(cli.events_path()) => {}
         Err(error) => return Err(error.into()),
     }
-    if sqlite_host_copy::arguments(cli).is_some() {
+    if sqlite_host_copy::arguments(cli).is_some()
+        || matches!(
+            &cli.command,
+            Command::File {
+                command: FileCommand::Remove(_)
+            }
+        )
+    {
         return Err(AppError::Input(
             "--host-script requires an authoritative SQLite catalog".into(),
         ));
@@ -18346,7 +18388,7 @@ fn execute_file(
     as_json: bool,
 ) -> Result<u8, AppError> {
     match command {
-        FileCommand::Removed(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
+        FileCommand::Removed(_) | FileCommand::Remove(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
         FileCommand::Find(args) => {
             let state = database.registry_state(false)?;
             let collection_id = args
@@ -18618,7 +18660,7 @@ fn execute_v2_file(
     as_json: bool,
 ) -> Result<u8, AppError> {
     match command {
-        FileCommand::Removed(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
+        FileCommand::Removed(_) | FileCommand::Remove(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
         FileCommand::Find(args) => {
             let state = database.registry_state(false)?;
             let collection_id = args

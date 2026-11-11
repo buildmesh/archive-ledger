@@ -22,8 +22,8 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: Install host-copy test dependency
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends rsync
+      - name: Install host-script test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends rsync b3sum
 
       - name: Run tests
         run: make test
