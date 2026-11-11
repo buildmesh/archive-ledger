@@ -130,7 +130,8 @@ docker compose run --rm -T archive copy \
   --not --in "Files on sd" --in "Files on sd02" > copy.sh
 ```
 
-After generation succeeds, preview and then run the script **on the host**:
+After generation succeeds, open `copy.sh` to review its roots and complete file list,
+then preview and run it **on the host**:
 
 ```bash
 bash copy.sh --dry-run
@@ -145,9 +146,18 @@ unambiguous; otherwise supply `--collection`.
 
 Generation reads only SQLite, using the same checksum-qualified selection as `file find`.
 It does not scan drives, copy files or record destination presence. All matching paths
-are embedded in the script as a streaming, base64-encoded NUL-separated manifest, so
-spaces, quotes, newlines and Unix filename bytes remain data. A fixed template invokes
-rsync; Location names and filenames are never evaluated as shell commands.
+are embedded as a streaming, readable list with one file per line in a quoted data block.
+Ordinary paths appear literally, including spaces and quotes. Backslashes appear as `\\`,
+newlines as `\n`, tabs as `\t`, and carriage returns as `\r`; other non-ASCII/control
+bytes use `\0ooo` (three octal digits). A path equal to the block's end marker has its
+first letter escaped. The script decodes this single authoritative list into NUL-separated
+paths for rsync; there is no separate hidden list to reconcile with the reviewable one.
+
+Executable logic lives in the static template `src/host_copy_template.sh`. The generator
+fills only two safely quoted root assignments and the escaped file-list data block.
+The quoted block disables shell expansion; a fixed `printf` format decodes the data
+without `eval`, so filenames never become shell commands. Security review can focus on
+this template and the root quoting/path encoding in `src/sqlite_host_copy.rs`.
 
 Compose passes `ARCHIVE_LEDGER_LOCATIONS_DIR` (the host root, e.g. `/var/data`) and
 `ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR` (the container root, usually `/locations`)
@@ -156,7 +166,7 @@ to translate the recorded roots. To supply or override the mapping explicitly, a
 container prefix; it is matched by path components, not text prefixes. Without a mapping,
 native invocations use the recorded absolute paths. Roots must be UTF-8.
 
-The host needs Bash, rsync and GNU base64. The script preserves relative paths and follows
+The host needs Bash and rsync. The script preserves relative paths and follows
 source symlinks (including annex links) to copy their contents as regular files. Existing
 destination files are skipped, not verified or overwritten. Existing destination directory
 symlinks are rejected before copying to prevent writes outside the selected root. It supports

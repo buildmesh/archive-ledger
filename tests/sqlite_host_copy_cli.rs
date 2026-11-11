@@ -218,6 +218,13 @@ fn filenames_and_roots_are_data_and_existing_destinations_are_preserved() {
         b"raw-\xff-name".to_vec(),
         b"nested/file".to_vec(),
         b"$(touch PARENT_INJECTED)/file".to_vec(),
+        b"ARCHIVE_LEDGER_PATHS".to_vec(),
+        b"ARCHIVE_LEDGER_PATHS\ntouch HEREDOC_INJECTED\n#".to_vec(),
+        b"literal-\\n-\\c-\\0377-\\".to_vec(),
+        b"tabs\tand\rcarriage\x1bescape".to_vec(),
+        "caf\u{e9}.txt".as_bytes().to_vec(),
+        // Exercise every possible non-NUL, non-separator filename byte through Bash.
+        (1..=255).filter(|byte| *byte != b'/').collect(),
     ];
     for (i, path) in paths.iter().enumerate() {
         f.file(&format!("file-{i}"), path, &["source"]);
@@ -232,6 +239,40 @@ fn filenames_and_roots_are_data_and_existing_destinations_are_preserved() {
     std::os::unix::fs::symlink("annex-content", f.source.join("annex-link")).unwrap();
     f.object("symlink", b"annex-link", &["source"]);
     let script = f.script(&mut f.command());
+    let generated = fs::read_to_string(&script).unwrap();
+    let manifest = generated
+        .split_once("<<'ARCHIVE_LEDGER_PATHS'\n")
+        .unwrap()
+        .1
+        .split_once("\nARCHIVE_LEDGER_PATHS\n")
+        .unwrap()
+        .0;
+    assert!(manifest.lines().any(|line| line == "nested/file"));
+    assert!(manifest
+        .lines()
+        .any(|line| line == "space and 'quotes\".txt"));
+    assert!(manifest.lines().any(|line| line == r"line\nbreak"));
+    assert!(manifest
+        .lines()
+        .any(|line| line == r"\0101RCHIVE_LEDGER_PATHS"));
+    assert!(manifest
+        .lines()
+        .any(|line| line == r"literal-\\n-\\c-\\0377-\\"));
+    // Only the two root assignments and the manifest data may vary from the
+    // reviewed static template; no filename contributes executable shell logic.
+    let template = include_str!("../src/host_copy_template.sh");
+    let (header, rest) = template.split_once("# ARCHIVE_LEDGER_ROOTS\n").unwrap();
+    let (middle, footer) = rest.split_once("# ARCHIVE_LEDGER_MANIFEST\n").unwrap();
+    assert!(generated.starts_with(header));
+    let after_roots = generated.split_once(middle).unwrap().1;
+    assert_eq!(after_roots, format!("{manifest}\n{footer}"));
+    assert_success(
+        &Command::new("bash")
+            .arg("-n")
+            .arg(&script)
+            .output()
+            .unwrap(),
+    );
     assert!(!f.run_script(&script, &["--delete"]).status.success());
     assert_eq!(fs::read_dir(&f.destination).unwrap().count(), 2);
     assert_success(&f.run_script(&script, &[]));
@@ -268,6 +309,7 @@ fn filenames_and_roots_are_data_and_existing_destinations_are_preserved() {
         "FILE_INJECTED",
         "FILE_TICKED",
         "PARENT_INJECTED",
+        "HEREDOC_INJECTED",
     ] {
         assert!(
             !f.temp.path().join(marker).exists(),
@@ -367,6 +409,7 @@ fn invalid_manifest_paths_and_conflicting_cli_options_are_rejected() {
         b"nul\0name",
     ] {
         let f = Fixture::new("source", "destination");
+        f.file("valid", b"aaa-valid", &["source"]);
         f.object("bad", invalid, &["source"]);
         let output = f.command().output().unwrap();
         assert!(

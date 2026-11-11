@@ -2,8 +2,6 @@
 use super::*;
 use archive_ledger::sqlite_queries::{visit_objects, CatalogFileFilter, CatalogQueryError};
 use archive_ledger::SqliteCatalog;
-use base64::engine::general_purpose::STANDARD;
-use base64::write::EncoderWriter;
 
 const TEMPLATE: &str = include_str!("host_copy_template.sh");
 
@@ -152,36 +150,24 @@ pub(super) fn execute(
         shell_quote(&destination_root)
     )?;
     output.write_all(before_manifest.as_bytes())?;
-    let count = {
-        let mut encoder = EncoderWriter::new(
-            Lines {
-                inner: &mut output,
-                column: 0,
-            },
-            &STANDARD,
-        );
-        let result = visit_objects(catalog.connection(), &filter, |object| {
-            let mut path = Vec::new();
-            super::sqlite_read_cli::write_path(&mut path, &object.relative_path, true)?;
-            // write_path supplies the terminal NUL and rejects embedded NULs.
-            let relative = &path[..path.len() - 1];
-            if relative
-                .split(|byte| *byte == b'/')
-                .any(|part| part.is_empty() || part == b"." || part == b"..")
-            {
-                return Err(CatalogQueryError::InvalidFilter(
-                    "host script requires normalized Collection-relative paths".into(),
-                ));
-            }
-            encoder.write_all(&path)?;
-            Ok(())
-        });
-        encoder.finish()?;
-        result?
-    };
+    let count = visit_objects(catalog.connection(), &filter, |object| {
+        let mut path = Vec::new();
+        super::sqlite_read_cli::write_path(&mut path, &object.relative_path, true)?;
+        // write_path supplies the terminal NUL and rejects embedded NULs.
+        let relative = &path[..path.len() - 1];
+        if relative
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+        {
+            return Err(CatalogQueryError::InvalidFilter(
+                "host script requires normalized Collection-relative paths".into(),
+            ));
+        }
+        write_manifest_path(&mut output, relative)?;
+        Ok(())
+    })?;
     transaction.commit()?;
     // Never emit the executable copy footer until the complete selection succeeds.
-    writeln!(output)?;
     output.write_all(footer.as_bytes())?;
     output.flush()?;
     eprintln!("Selected {count} files from cached checksum evidence; unresolved and unverified source files are excluded.");
@@ -249,27 +235,21 @@ fn recorded_path(
     Ok(mount.join(relative))
 }
 
-// Wrap streaming base64 so Bash does not need to parse one enormous heredoc line.
-struct Lines<W> {
-    inner: W,
-    column: usize,
-}
-impl<W: Write> Write for Lines<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let mut remaining = bytes;
-        while !remaining.is_empty() {
-            let length = remaining.len().min(76 - self.column);
-            self.inner.write_all(&remaining[..length])?;
-            remaining = &remaining[length..];
-            self.column += length;
-            if self.column == 76 {
-                self.inner.write_all(b"\n")?;
-                self.column = 0;
+// Data for a quoted heredoc, decoded by Bash's builtin printf %b, never eval.
+// Every filename occupies one physical line; escape the delimiter itself too.
+fn write_manifest_path(output: &mut impl Write, path: &[u8]) -> std::io::Result<()> {
+    for (index, byte) in path.iter().copied().enumerate() {
+        match byte {
+            b'A' if index == 0 && path == b"ARCHIVE_LEDGER_PATHS" => {
+                output.write_all(b"\\0101")?;
             }
+            b'\\' => output.write_all(b"\\\\")?,
+            b'\n' => output.write_all(b"\\n")?,
+            b'\r' => output.write_all(b"\\r")?,
+            b'\t' => output.write_all(b"\\t")?,
+            b' '..=b'~' => output.write_all(&[byte])?,
+            _ => write!(output, "\\0{byte:03o}")?,
         }
-        Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
+    writeln!(output)
 }
