@@ -63,10 +63,14 @@ pub struct SqliteRegistryState {
 impl SqliteCatalog {
     pub fn registry_state(&self, include_retired: bool) -> Result<SqliteRegistryState> {
         let connection = self.connection();
-        let transaction = connection.unchecked_transaction()?;
+        let _transaction = if connection.is_autocommit() {
+            Some(connection.unchecked_transaction()?)
+        } else {
+            None
+        };
         let entities =
-            load_registry_entities(&transaction, catalog_path(connection), include_retired)?;
-        let revision: u64 = transaction.query_row(
+            load_registry_entities(connection, catalog_path(connection), include_retired)?;
+        let revision: u64 = connection.query_row(
             "SELECT revision FROM catalog_metadata WHERE singleton=1",
             [],
             revision_from_row,

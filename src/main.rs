@@ -32,6 +32,10 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 mod sqlite_cli;
+mod sqlite_collection_show;
+mod sqlite_host_copy;
+mod sqlite_host_remove;
+mod sqlite_host_script;
 mod sqlite_read_cli;
 mod sqlite_removed_cli;
 mod sqlite_setup_cli;
@@ -777,12 +781,20 @@ enum RestoreCommand {
 
 #[derive(Debug, Subcommand)]
 enum FileCommand {
+    /// Generate a host removal script for files verified on another Device.
+    Remove(Box<HostRemoveArgs>),
     /// Mark copies removed in the catalog; never delete archive contents.
     Removed(Box<FileRemovedArgs>),
     /// List all matching logical paths from SQLite; --json returns a detailed page.
     Find(Box<FileFindArgs>),
     /// Show one logical file and all current copy evidence.
-    Show { file_ref_id: String },
+    Show {
+        /// Collection-relative path, absolute filesystem path, or catalog ID.
+        file_ref_id: String,
+        /// Disambiguate a path shared by multiple Collections (SQLite catalogs).
+        #[arg(long)]
+        collection: Option<String>,
+    },
     /// Show check and change history for one logical file.
     History {
         file_ref_id: String,
@@ -887,6 +899,8 @@ struct CopyArgs {
 
 #[derive(Debug, Args)]
 struct CopyMutationArgs {
+    #[command(flatten)]
+    host: HostCopyArgs,
     /// Destination Location name or stable ID.
     #[arg(long)]
     to: Option<String>,
@@ -916,6 +930,33 @@ struct CopyMutationArgs {
     max_items: Option<usize>,
     #[arg(skip)]
     logical_filters: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Default, Args)]
+struct HostCopyArgs {
+    /// Print a self-contained Bash/rsync script to run on the host; does not copy or update the catalog.
+    #[arg(long, requires_all = ["from", "to"], conflicts_with_all = ["paths", "dry_run", "yes", "non_interactive", "job_id", "max_items", "json"])]
+    host_script: bool,
+    /// Host counterpart of --locations-root (or ARCHIVE_LEDGER_LOCATIONS_DIR).
+    #[arg(long, requires = "host_script")]
+    host_root: Option<PathBuf>,
+    /// Container path prefix to replace; defaults to ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR or /locations.
+    #[arg(long, requires = "host_script")]
+    locations_root: Option<PathBuf>,
+    /// Match any Location in this group, in addition to the required --from Location.
+    #[arg(long = "in", action = clap::ArgAction::Append, requires = "host_script")]
+    locations: Vec<String>,
+    /// Start another Location filter group; all groups must match.
+    #[arg(long = "and", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", requires = "host_script")]
+    and_groups: Vec<bool>,
+    /// Negate the next Location group; repeated --in flags within it are alternatives.
+    #[arg(long = "not", action = clap::ArgAction::Append, num_args = 0, default_missing_value = "true", requires = "host_script")]
+    not_groups: Vec<bool>,
+    /// Require checksum evidence this recent in the current --in group.
+    #[arg(long, action = clap::ArgAction::Append, requires = "host_script")]
+    verified_within: Vec<String>,
+    #[arg(skip)]
+    location_groups: Vec<FileLocationGroup>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -986,7 +1027,7 @@ enum CollectionCommand {
         collection: String,
         new_name: String,
     },
-    /// Show a fast SQLite-only Collection summary; infer from cwd when omitted.
+    /// Show copy and Site coverage (30-day verification); omit the name if only one Collection is active.
     Status { collection: Option<String> },
     /// List active Collections.
     #[command(visible_alias = "ls")]
@@ -994,8 +1035,13 @@ enum CollectionCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Show one Collection by name or stable ID.
-    Show { id: String },
+    /// Show file protection by copy count and distinct Sites from the SQLite catalog.
+    Show {
+        id: String,
+        /// Verification age threshold for protection counts (e.g. 30d).
+        #[arg(long, default_value = "30d")]
+        stale_after: String,
+    },
     /// Add present files to this Collection without marking unseen files missing.
     Add(CollectionAddArgs),
     /// Replace user-controlled fields with a complete JSON snapshot.
@@ -1072,8 +1118,13 @@ enum LocationCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Show one Location by name or stable ID.
-    Show { id: String },
+    /// Show Location metadata, file counts, and verification freshness from the catalog.
+    Show {
+        id: String,
+        /// Verification age threshold for the SQLite summary (e.g. 30d).
+        #[arg(long, default_value = "30d")]
+        stale_after: String,
+    },
     /// Low-level compatibility command for registering a Location snapshot.
     #[command(hide = true)]
     Register(Box<RegistryAddArgs>),
@@ -1105,11 +1156,11 @@ struct CollectionAddArgs {
     #[arg(long, value_name = "FILE")]
     accept_changes: Vec<PathBuf>,
     /// Preview without recording anything: with --accept-changes, hash the selected files and
-    /// show the acceptance; otherwise show how disk and catalog differ from metadata only.
+    /// show the acceptance; otherwise list new available files at this Location (SQLite).
     #[arg(long)]
     dry_run: bool,
-    /// List every new-to-Collection or new-to-Location path without hashing content.
-    /// Requires --dry-run; streams results and skips verification-due summaries.
+    /// List new available paths without hashing; already the default SQLite dry-run behavior.
+    /// Requires --dry-run; retained for compatibility with legacy catalogs.
     #[arg(long, requires = "dry_run", conflicts_with = "accept_changes")]
     list_new: bool,
     /// Confirm acceptance of the explicitly selected files.
@@ -1384,6 +1435,16 @@ enum RegistryKind {
 
 #[derive(Debug, Args)]
 struct FileFindArgs {
+    /// List files with fewer than N present copies across all Locations, including zero.
+    #[arg(long, value_name = "N")]
+    copies_below: Option<u32>,
+    /// Count only copies with current matching checksum evidence; requires --copies-below.
+    #[arg(long, requires = "copies_below")]
+    verified_copies: bool,
+    /// Count only verified copies checked within this age (e.g. 30d); implies --verified-copies.
+    #[arg(long, requires = "copies_below", value_parser = parse_copy_evidence_age)]
+    copies_verified_within: Option<u64>,
+
     /// Match any Location in this group (name or stable ID); repeat for alternatives.
     #[arg(long = "in", action = clap::ArgAction::Append)]
     locations: Vec<String>,
@@ -1396,7 +1457,7 @@ struct FileFindArgs {
     /// Require checksum evidence this recent in the current group (e.g. 30d, 12h).
     #[arg(long, action = clap::ArgAction::Append)]
     verified_within: Vec<String>,
-    /// Emit all source-relative paths separated by NUL; requires one source Location.
+    /// Emit NUL-separated paths; requires one source Location, or --collection with --copies-below.
     #[arg(long, conflicts_with_all = ["continuation", "json"])]
     print0: bool,
     #[arg(skip)]
@@ -1438,6 +1499,31 @@ struct FileRemovedArgs {
     /// List every affected path without changing the catalog or files.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct HostRemoveArgs {
+    /// Print a reviewable Bash script; never delete files or change the catalog here.
+    #[arg(long, required = true, conflicts_with = "json")]
+    host_script: bool,
+    /// Location to remove files from.
+    #[arg(long)]
+    from: String,
+    /// Collection; inferred when unambiguous.
+    #[arg(long)]
+    collection: Option<String>,
+    /// Backup Location on another Device; repeat for alternatives (OR).
+    #[arg(long = "in", required = true, action = clap::ArgAction::Append)]
+    locations: Vec<String>,
+    /// Maximum age of matching backup checksum evidence.
+    #[arg(long, default_value = "30d", value_parser = parse_file_evidence_age)]
+    verified_within: u64,
+    /// Host counterpart of --locations-root (or ARCHIVE_LEDGER_LOCATIONS_DIR).
+    #[arg(long)]
+    host_root: Option<PathBuf>,
+    /// Container prefix to replace; defaults to /locations or its environment setting.
+    #[arg(long)]
+    locations_root: Option<PathBuf>,
 }
 
 fn parse_file_location_groups(
@@ -1506,6 +1592,11 @@ fn parse_file_location_groups(
     }
     groups.push(group);
     Ok(groups)
+}
+
+fn parse_copy_evidence_age(value: &str) -> Result<u64, String> {
+    parse_file_evidence_age(value)
+        .map_err(|message| message.replace("--verified-within", "--copies-verified-within"))
 }
 
 fn parse_file_evidence_age(value: &str) -> Result<u64, String> {
@@ -2268,6 +2359,28 @@ fn main() -> ExitCode {
                 clap::Error::raw(clap::error::ErrorKind::InvalidValue, message)
             })?;
         }
+        let copy = match &mut cli.command {
+            Command::Copy(args) if args.command.is_none() => Some((
+                &mut args.mutation,
+                matches.subcommand_matches("copy").unwrap(),
+            )),
+            Command::Location {
+                command: LocationCommand::Copy(args),
+            } => Some((
+                args,
+                matches
+                    .subcommand_matches("location")
+                    .unwrap()
+                    .subcommand_matches("copy")
+                    .unwrap(),
+            )),
+            _ => None,
+        };
+        if let Some((args, matches)) = copy {
+            args.host.location_groups = parse_file_location_groups(matches).map_err(|message| {
+                clap::Error::raw(clap::error::ErrorKind::InvalidValue, message)
+            })?;
+        }
         Ok(cli)
     });
     let mut cli = match parsed {
@@ -2474,6 +2587,15 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
                 print_catalog_backup(&report, cli.json, false)?;
                 return Ok(EXIT_OK);
             }
+            if let Some(args) = sqlite_host_copy::arguments(cli) {
+                return sqlite_host_copy::execute(cli, &catalog, args);
+            }
+            if let Command::File {
+                command: FileCommand::Remove(args),
+            } = &cli.command
+            {
+                return sqlite_host_remove::execute(cli, &catalog, args);
+            }
             if let Some(result) = sqlite_read_cli::execute_read(cli, &catalog)? {
                 return Ok(result);
             }
@@ -2506,6 +2628,28 @@ fn execute(cli: &mut Cli) -> Result<u8, AppError> {
         Err(archive_ledger::SqliteCatalogError::Sqlite(_))
             if archive_ledger::is_v2_event_tree(cli.events_path()) => {}
         Err(error) => return Err(error.into()),
+    }
+    if sqlite_host_copy::arguments(cli).is_some()
+        || matches!(
+            &cli.command,
+            Command::File {
+                command: FileCommand::Remove(_)
+            }
+        )
+    {
+        return Err(AppError::Input(
+            "--host-script requires an authoritative SQLite catalog".into(),
+        ));
+    }
+    if let Command::File {
+        command: FileCommand::Find(args),
+    } = &cli.command
+    {
+        if args.copies_below.is_some() {
+            return Err(AppError::Input(
+                "--copies-below requires an authoritative SQLite catalog".into(),
+            ));
+        }
     }
     if let Command::Events {
         command: EventsCommand::Verify,
@@ -4066,6 +4210,7 @@ fn execute_job(cli: &Cli, database: &ProjectionDb, command: &JobCommand) -> Resu
                         cli,
                         database,
                         &CopyMutationArgs {
+                            host: HostCopyArgs::default(),
                             to: Some(json_string(params, "destination_location_id")?),
                             from: Some(json_string(params, "source_location_id")?),
                             collection: Some(json_string(params, "collection_id")?),
@@ -8040,7 +8185,7 @@ fn execute_v2_registry_command(
                 RegistryKind::Collection,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            CollectionCommand::Show { id } => execute_v2_registry_entity(
+            CollectionCommand::Show { id, .. } => execute_v2_registry_entity(
                 cli,
                 database,
                 RegistryKind::Collection,
@@ -8093,7 +8238,7 @@ fn execute_v2_registry_command(
                 RegistryKind::Location,
                 &RegistryEntityCommand::List { all: *all },
             )?,
-            LocationCommand::Show { id } => execute_v2_registry_entity(
+            LocationCommand::Show { id, .. } => execute_v2_registry_entity(
                 cli,
                 database,
                 RegistryKind::Location,
@@ -9654,6 +9799,7 @@ fn execute_v2_job(
                         cli,
                         database,
                         &CopyMutationArgs {
+                            host: HostCopyArgs::default(),
                             to: Some(json_string(&job_params, "to")?),
                             from: Some(json_string(&job_params, "from")?),
                             collection: Some(json_string(&job_params, "collection")?),
@@ -15402,7 +15548,7 @@ fn plan_filesystem_setup(
         let collection = CollectionSnapshot {
             collection_id: generated_id("collection"),
             display_name: collection_name,
-            description: Some(format!("Files under {}", mounted.path.display())),
+            description: None,
             home_site_id: Some(site.site_id.clone()),
             policy_id: Some(policy.policy_id.clone()),
             status: "active".to_owned(),
@@ -16116,7 +16262,7 @@ fn execute_collection(
             RegistryKind::Collection,
             &RegistryEntityCommand::List { all: *all },
         ),
-        CollectionCommand::Show { id } => execute_registry(
+        CollectionCommand::Show { id, .. } => execute_registry(
             cli,
             database,
             RegistryKind::Collection,
@@ -16254,7 +16400,7 @@ fn execute_location(
             RegistryKind::Location,
             &RegistryEntityCommand::List { all: *all },
         ),
-        LocationCommand::Show { id } => execute_registry(
+        LocationCommand::Show { id, .. } => execute_registry(
             cli,
             database,
             RegistryKind::Location,
@@ -18248,7 +18394,7 @@ fn execute_file(
     as_json: bool,
 ) -> Result<u8, AppError> {
     match command {
-        FileCommand::Removed(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
+        FileCommand::Removed(_) | FileCommand::Remove(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
         FileCommand::Find(args) => {
             let state = database.registry_state(false)?;
             let collection_id = args
@@ -18282,7 +18428,10 @@ fn execute_file(
                 |request| database.find_file_paths(request),
             )?;
         }
-        FileCommand::Show { file_ref_id } => {
+        FileCommand::Show { file_ref_id, collection } => {
+            if collection.is_some() {
+                return Err(AppError::Input("file show --collection requires an authoritative SQLite catalog".into()));
+            }
             let review = database.review_file(file_ref_id)?;
             let policy = database.review_file_policy(file_ref_id, now_utc_ms()?)?;
             if as_json {
@@ -18520,7 +18669,7 @@ fn execute_v2_file(
     as_json: bool,
 ) -> Result<u8, AppError> {
     match command {
-        FileCommand::Removed(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
+        FileCommand::Removed(_) | FileCommand::Remove(_) => return Err(AppError::Input("file removed requires an authoritative SQLite catalog; migrate this legacy catalog first".into())),
         FileCommand::Find(args) => {
             let state = database.registry_state(false)?;
             let collection_id = args
@@ -18554,7 +18703,10 @@ fn execute_v2_file(
                 |request| database.find_file_paths(request),
             )?;
         }
-        FileCommand::Show { file_ref_id } => {
+        FileCommand::Show { file_ref_id, collection } => {
+            if collection.is_some() {
+                return Err(AppError::Input("file show --collection requires an authoritative SQLite catalog".into()));
+            }
             let review = database.review_file(file_ref_id)?;
             if as_json {
                 println!(

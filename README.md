@@ -25,7 +25,9 @@ format**. Their examples later in this document apply only to legacy event-backe
 Archives. Existing Archives retain their legacy format until explicitly migrated;
 opening them does not silently convert or erase their history. Start with
 [From first Archive to routine maintenance](docs/guides/archive-lifecycle.md) for
-the current SQLite workflow. The older [workflow](docs/workflows.md) and
+the current SQLite workflow. For recurring backups, see
+[Rotate backup sets and maintain a carried USB backup](docs/guides/rotating-backups.md).
+The older [workflow](docs/workflows.md) and
 [annex](docs/guides/annex-workflows.md) guides still include legacy-only operations.
 
 To convert an existing event-backed Archive, choose a new destination directory:
@@ -93,6 +95,237 @@ Restore validates the copied catalog but does not activate it or replace the
 current Archive. `fsck` checks catalog integrity; it does not hash archive contents.
 Keep catalog backups on independently protected storage. The old Git checkpoint,
 `db rebuild`, snapshot, and `restore check` workflows below are for legacy Archives.
+
+### Find files with too few copies
+
+For authoritative SQLite catalogs, list every path with fewer than two recorded present
+copies (including zero copies):
+
+```bash
+archive file find --collection Files --copies-below 2
+```
+
+Counts cover all Locations for the same Collection-relative path. Missing and unknown copies
+are excluded; present copies can still be unverified or damaged. For protection checks, count
+only copies with matching checksum evidence, optionally with a verification-age limit:
+
+```bash
+archive file find --collection Files --copies-below 2 --verified-copies
+archive file find --collection Files --copies-below 2 --copies-verified-within 30d
+```
+
+`--copies-verified-within` implies verified-copy counting. Existing `--in` groups filter which
+paths are listed; they do not restrict the Locations counted. `--verified-within` still applies
+to its Location group. Copies are Location records, not necessarily independent Devices or Sites.
+Use `--print0` with `--collection` for lossless path lists, or `--json` for paginated records.
+These queries read only the catalog and do not check the drives.
+
+### Generate a copy script for the host
+
+When content is mounted read-only inside Docker, generate a self-contained Bash script
+instead of copying inside the container:
+
+```bash
+docker compose run --rm -T archive copy \
+  --from "Files on disk10" --to "Files on sd03" \
+  --collection Files --host-script \
+  --not --in "Files on sd" --in "Files on sd02" > copy.sh
+```
+
+After generation succeeds, open `copy.sh` to review its roots and complete file list,
+then preview and run it **on the host**:
+
+```bash
+bash copy.sh --dry-run
+bash copy.sh
+```
+
+The source Location is always required. Repeated `--in` flags in a group mean OR;
+`--not` excludes that group, and `--and` starts another group. Start the first extra
+group with `--in` or `--not`, without a leading `--and`. `--verified-within 30d` can
+follow a group to require recent checksum evidence. The Collection is inferred when
+unambiguous; otherwise supply `--collection`.
+
+Generation reads only SQLite, using the same checksum-qualified selection as `file find`.
+It automatically excludes files recorded present at the destination Location, regardless
+of their verification state or age. This uses the exact destination Location, not every
+Location on its Device. Missing or unknown destination records remain eligible. Files
+already on disk but not recorded in the catalog are still skipped by rsync when run.
+Generation does not scan drives, copy files or record destination presence. All matching paths
+are embedded as a streaming, readable list with one file per line in a quoted data block.
+Ordinary paths appear literally, including spaces and quotes. Backslashes appear as `\\`,
+newlines as `\n`, tabs as `\t`, and carriage returns as `\r`; other non-ASCII/control
+bytes use `\0ooo` (three octal digits). A path equal to the block's end marker has its
+first letter escaped. The script decodes this single authoritative list into NUL-separated
+paths for rsync; there is no separate hidden list to reconcile with the reviewable one.
+
+Executable logic lives in the static template `src/host_copy_template.sh`. The generator
+fills only two safely quoted root assignments and the escaped file-list data block.
+The quoted block disables shell expansion; a fixed `printf` format decodes the data
+without `eval`, so filenames never become shell commands. Security review can focus on
+this template and the root quoting/path encoding in `src/sqlite_host_copy.rs`.
+
+Compose passes `ARCHIVE_LEDGER_LOCATIONS_DIR` (the host root, e.g. `/var/data`) and
+`ARCHIVE_LEDGER_CONTAINER_LOCATIONS_DIR` (the container root, usually `/locations`)
+to translate the recorded roots. To supply or override the mapping explicitly, add
+`--host-root /var/data --locations-root /locations`. Paths must be inside the recorded
+container prefix; it is matched by path components, not text prefixes. Without a mapping,
+native invocations use the recorded absolute paths. Roots must be UTF-8.
+
+The host needs Bash and rsync. The script preserves relative paths and follows
+source symlinks (including annex links) to copy their contents as regular files. Existing
+destination files are skipped, not verified or overwritten. Existing destination directory
+symlinks are rejected before copying to prevent writes outside the selected root. It supports
+only the optional `--dry-run` argument and never deletes destination files.
+
+After a successful copy, checksum and record the destination files separately:
+
+```bash
+docker compose run --rm archive collection add /locations/sd03/annex/files
+```
+
+### Generate a removal script for a temporary backup
+
+To clear a temporary backup after its files reach another backup Device:
+
+```bash
+archive file remove --host-script --from "Files on usb" \
+  --collection Files \
+  --in "Files on sd" --in "Files on sd02" --in "Files on sd03" \
+  --verified-within 30d > remove.sh
+```
+
+`--from` identifies the Location to clean. Repeated `--in` flags name alternative
+backup Locations (OR); at least one is required. Each must belong to a known Device
+different from the target Device. These are explicit Locations, not a dynamic Site
+filter. The Collection is inferred when unambiguous. Host path mapping uses the same
+Compose environment or `--host-root` / `--locations-root` flags as copy scripts.
+
+Generation is a read-only SQLite query: it selects verified target files with a matching
+expected BLAKE3 at the same Collection-relative path on at least one named backup.
+Backup verification must be within `--verified-within` (default `30d`); stale, missing,
+unverified, damaged, or future-dated backup evidence does not qualify. It does not
+scan the target or reread backup drives. A saved script expires when the first selected
+file loses its qualifying backup evidence due to age; regenerate it if expired.
+
+Review the readable checksum-and-path list, then preview and explicitly delete:
+
+```bash
+less remove.sh
+bash remove.sh --dry-run  # Also the default with no arguments.
+bash remove.sh --delete
+```
+
+The host needs Bash and, for deletion, `b3sum` (on Debian/Ubuntu: `sudo apt install b3sum`).
+The executable logic is the static `src/host_remove_template.sh`; only the safely quoted
+target root, escaped checksum/path data, and numeric evidence expiry are filled in.
+The filename escaping is shared with copy scripts. No file-list data is evaluated as code.
+
+Before deleting each selected file, the script checks its current BLAKE3 against the
+expected checksum and refuses changed contents. It rejects directories, dangling links,
+and symlinks in directory components; a final symlink to a regular file is checked through
+its target and only the link is removed. It never deletes directories recursively.
+Already absent files are skipped. Run with no other processes changing the target tree:
+these shell checks cannot make concurrent filesystem changes atomic with deletion.
+Errors stop the script, so earlier selected files may already have been removed.
+
+The script never changes the catalog. After any deletion run, including an interrupted
+or failed run, reconcile the target's actual state before doing further backup queries:
+
+```bash
+archive location scan "Files on usb"
+```
+
+The scan records missing paths from the filesystem; it does not assume every planned
+removal succeeded. Use the same `docker compose run --rm archive` prefix for generation
+and reconciliation inside Docker, but run the generated script on the host. The existing
+`archive file removed` command remains a catalog-only declaration and does not delete files.
+
+### Read catalog summaries
+
+`archive status`, `archive collection status NAME`, `archive collection show NAME`,
+and `archive location show NAME`
+show labeled metadata followed by separate sections for file counts and protection evidence.
+Archive status distinguishes logical file paths from copies across Locations; its verification
+counts include checks of any age. Location and Collection views show a verification window
+(default `30d`, adjustable with `--stale-after`). These are catalog lookups, without drive scans
+or backup-policy evaluation. Internal IDs are omitted from human summaries and retained in
+`--json` output for scripting and disambiguating names.
+
+Use `archive site show Offsite` (or `Home`, `Sam`, or another Site name) to see
+the Devices currently assigned there. Devices appear in a vertical list with kind,
+status, and expected availability; assigned retired Devices are explicitly labeled.
+`device move` is reflected immediately. This reads recorded assignments without
+probing drives. JSON keeps the Site in `items` and adds `devices` and `device_count`.
+
+Collections have no filesystem root: they group logical paths and expected checksums.
+Locations provide the actual filesystem roots. `collection init PATH` registers an initial
+Location; the path belongs to that Location. Older Collections may have a generated
+"Files under ..." description; that is descriptive text, not a path binding.
+
+An empty Location shows `Collection: None tracked yet`: Collection membership in this view
+comes from tracked files. Locations containing several Collections list each one and show
+separate file counts. The verification breakdown distinguishes recent, stale, unverified and
+damaged files; the separate never-verified count can overlap unverified or damaged counts.
+
+### See a Collection's copy and Site coverage
+
+```bash
+archive collection status Files
+archive collection show Files --stale-after 7d --json
+```
+
+Human `collection status` and `collection show` share the same protection view.
+Copy and Site distributions use stacked blocks, with present and recently verified file counts
+on separate lines, so the output reads naturally on narrow screens.
+`collection status` uses a 30-day verification window and can omit the name when there is
+only one active Collection. Use `collection show --stale-after` to customize the window.
+`collection status --json` retains its compact summary; use `collection show --json` for
+structured copy and Site distributions.
+
+The SQLite summary shows total expected files and distributions by number of copies and distinct
+known Sites. Each distribution includes files with zero copies or zero known Sites. Counts and
+percentages compare recorded present copies with copies verified within the shown age threshold
+(default `30d`). Missing, damaged, unverified, stale, and future-dated evidence cannot count as
+recent verified protection. Files without expected checksums remain in the totals.
+
+Several Locations at the same Site count as one Site. Files with copies whose Site is unknown
+are reported separately: unknown Sites do not imply geographic diversity. Site resolution uses
+the Location's recorded Site or its Device's current Site. All counts use catalog evidence,
+including retired Locations, without checking drives or evaluating backup policy.
+
+### Inspect a Location's protection evidence
+
+```bash
+archive location show "Files on disk10"
+archive location show "Files on disk10" --stale-after 7d --json
+```
+
+The SQLite summary shows recorded path, Device/Site, total tracked files, presence counts,
+verified/recent/stale copies, unverified and damaged copies, and a Collection breakdown.
+Stale means a currently verified present copy whose successful check is older than the shown
+threshold (default `30d`). Never-verified files are reported separately; that count can overlap
+unverified or damaged counts. Future-dated evidence is treated as unverified in this summary.
+
+The summary also counts present files without another verified copy within that threshold.
+Another Location can share the same Device or Site, so this is not a policy or disaster-resilience
+assessment. Counts use recorded Location evidence, including retired Locations; no drives are read.
+
+### Preview new files at a Location
+
+```bash
+archive collection add /locations/disk10/annex/media \
+  --collection Media --location "Media on disk10" --dry-run
+```
+
+For SQLite catalogs, a normal add preview lists only available files not already tracked at
+that Location. Files tracked only elsewhere still appear. Already-tracked paths (even those
+marked missing), dropped annex symlinks, indexed regular annex pointer files, and ordinary
+symlinks are omitted. `--list-new` remains a compatibility spelling for this default behavior.
+The preview reads filesystem/Git metadata and bounded pointer-file payloads, but does not
+checksum content or update the catalog. Availability is not proof of integrity; the actual add
+still checksums content and records mismatches. Explicit `--accept-changes --dry-run` continues
+to inspect the selected files, including already-tracked paths.
 
 ## Concepts and relationships
 
@@ -831,9 +1064,25 @@ exit status before using the output; a failed stream can be partial. Paths refer
 to cataloged entries, including annex symlinks, and are not a copy or deletion
 plan.
 
-In authoritative SQLite catalogs, `file show <object-id>` and
-`object show <object-id>` show the same expected path and all its recorded Locations,
-including missing and damaged copies. IDs come from JSON `file find`; they identify
+In authoritative SQLite catalogs, `file show` accepts a Collection-relative path,
+an absolute filesystem path, or an existing catalog ID:
+
+```bash
+archive file show 'documents/notes.txt' --collection Files
+archive file show /locations/disk10/annex/files/documents/notes.txt
+```
+
+An exact Collection-relative match takes precedence. The Collection is inferred
+when the match is unique; ambiguous matches list the choices and require
+`--collection` with the relative path or a catalog ID. Absolute paths use the latest
+recorded Location mount paths for the selected `--host`, even while drives are
+offline. They do not resolve filesystem symlinks; paths containing `..` must be
+rewritten using the recorded path. In Docker, use the container's recorded paths.
+
+`file show` and `object show <object-id>` report the expected checksum/size and all
+recorded Locations, including missing and damaged copies, with Device, Site, and
+UTC check times. The evidence is cached, not a fresh verification. JSON retains
+catalog IDs and numeric timestamps. IDs come from JSON `file find`; they identify
 paths, not content hashes. The identity filter accepts `resolved` for a known
 expected checksum and `unresolved` or `unknown` for no expected checksum;
 unsupported states are rejected. Plain output streams the selection in one read

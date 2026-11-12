@@ -374,7 +374,7 @@ fn add(cli: &Cli, catalog: &mut SqliteCatalog, args: &CollectionAddArgs) -> Resu
         args.job_id.as_deref(),
         args.max_items,
         args.dry_run,
-        args.list_new,
+        args.list_new || args.accept_changes.is_empty(),
     )
 }
 fn scan(cli: &Cli, catalog: &mut SqliteCatalog, args: &LocationScanArgs) -> Result<u8, AppError> {
@@ -537,6 +537,28 @@ fn content_path(
     }
 }
 
+// Preview availability from metadata only. In particular, an ordinary symlink
+// must never be followed just to decide whether it belongs in an import preview.
+fn preview_content_available(
+    root: &Path,
+    path: &Path,
+    annex_root: Option<&Path>,
+) -> Result<bool, AppError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        && (annex_root.is_none()
+            || !archive_ledger::annex::is_annex_link_target(&fs::read_link(path)?)?)
+    {
+        return Ok(false);
+    }
+    match content_path(root, path, annex_root) {
+        Ok(Some(target)) => Ok(fs::symlink_metadata(target)?.is_file()),
+        Ok(None) => Ok(false),
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn run_inventory(
     cli: &Cli,
     catalog: &mut SqliteCatalog,
@@ -587,6 +609,31 @@ fn run_inventory(
         })
         .collect::<Result<BTreeSet<_>, AppError>>()?;
     let mut found_selected = BTreeSet::new();
+    let mut unavailable_pointers = BTreeSet::new();
+    if annex_root.is_some() && dry_run && list_new && selected.is_empty() {
+        let mut error = None;
+        archive_ledger::annex::visit_annex_catalog_entries(&config.path, true, |candidate| {
+            let result = (|| -> Result<(), AppError> {
+                let relative = path_from_encoded(&candidate.path)?;
+                if config.exclusions.iter().any(|p| relative.starts_with(p)) {
+                    return Ok(());
+                }
+                if candidate.is_pointer_file()? {
+                    unavailable_pointers.insert(relative);
+                }
+                Ok(())
+            })();
+            if let Err(failure) = result {
+                error = Some(failure);
+                false
+            } else {
+                true
+            }
+        })?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
     if annex_root.is_some() && selected.is_empty() && !dry_run {
         paused = inventory_annex_entries(
             catalog,
@@ -628,6 +675,9 @@ fn run_inventory(
         if !selected.is_empty() && !selected.contains(&relative) {
             continue;
         }
+        if unavailable_pointers.contains(&relative) {
+            continue;
+        }
         found_selected.insert(relative.clone());
         let physical = config.path.join(&relative);
         if !selected.is_empty() && !fs::symlink_metadata(&physical)?.is_file() {
@@ -638,6 +688,13 @@ fn run_inventory(
             .map_err(|_| AppError::Input("inventory escapes Location".into()))?;
         let path = RegistryPath::from_path(logical);
         let bytes = registry_path_identity_bytes(&path)?;
+        if dry_run && list_new && selected.is_empty() {
+            let known:bool=catalog.connection().prepare_cached("SELECT EXISTS(SELECT 1 FROM objects o JOIN files f ON f.object_id=o.object_id WHERE o.collection_id=?1 AND o.relative_path_encoding=?2 AND o.relative_path_bytes=?3 AND f.location_id=?4)")?.query_row(params![config.collection_id,path.encoding,bytes,config.location_id],|r|r.get(0))?;
+            if known || !preview_content_available(&config.root, &physical, annex_root.as_deref())?
+            {
+                continue;
+            }
+        }
         if annex_root.is_some() && !dry_run && selected.is_empty() {
             let checked:bool=catalog.connection().query_row("SELECT EXISTS(SELECT 1 FROM objects o JOIN catalog_scan_seen s ON s.object_id=o.object_id WHERE s.job_id=?1 AND o.collection_id=?2 AND o.relative_path_encoding=?3 AND o.relative_path_bytes=?4)",params![job_id,config.collection_id,path.encoding,bytes],|r|r.get(0))?;
             if checked {
@@ -658,17 +715,14 @@ fn run_inventory(
             new_work += 1;
         }
         if dry_run {
-            let known:bool=catalog.connection().query_row("SELECT EXISTS(SELECT 1 FROM objects o JOIN files f ON f.object_id=o.object_id WHERE o.collection_id=?1 AND o.relative_path_encoding=?2 AND o.relative_path_bytes=?3 AND f.location_id=?4)",params![config.collection_id,path.encoding,bytes,config.location_id],|r|r.get(0))?;
-            if !list_new || !known {
-                if cli.json {
-                    if !first_dry_path {
-                        print!(",");
-                    }
-                    print!("{}", serde_json::to_string(&path)?);
-                    first_dry_path = false;
-                } else {
-                    println!("{}", path.display.escape_debug());
+            if cli.json {
+                if !first_dry_path {
+                    print!(",");
                 }
+                print!("{}", serde_json::to_string(&path)?);
+                first_dry_path = false;
+            } else {
+                println!("{}", path.display.escape_debug());
             }
             if !selected.is_empty() {
                 let target = content_path(&config.root, &physical, annex_root.as_deref())?
